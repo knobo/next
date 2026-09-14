@@ -1,0 +1,16 @@
+*.db
+*.db-journal
+__pycache__/
+ui/node_modules/
+# Per-installation configuration: hostnames, the owner's name, the cluster context.
+# board.env.example is the checked-in template.
+board.env
+# Per-project consolidation rules for `board simplify`; the example is checked in.
+simplify-rules.yaml
+simplify-rules.yml
+.idea/
+.vscode/
+# ui/package-lock.json IS in the repo on purpose: board.css is a checked-in artifact, and
+# the devDependencies use caret ranges. Without the lockfile the next `npm install` gives a
+# different Tailwind/daisyUI patch and therefore a different board.css — and the diff is
+# minified onto one line, i.e. unreadable. The lockfile is what makes "reproducible" true.

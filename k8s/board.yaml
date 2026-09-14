@@ -1,0 +1,136 @@
+# The board in k3s. board.py is injected as a ConfigMap — no image build, no registry.
+# Deploy with k8s/deploy.sh, which substitutes ${BOARD_HOST} and ${NTFY_URL} from your
+# board.env and then applies this file. Applying it directly with kubectl leaves those
+# placeholders literal, which is why the script exists.
+#
+#   kubectl -n board create secret generic board \
+#     --from-literal=token="$(pass board/token)" \
+#     --from-literal=human_token="$(pass board/human-token)" \
+#     --from-literal=ntfy_auth="Bearer $(pass ntfy/token)"
+#
+#   board.css MUST be in the ConfigMap: the whole map is mounted at /src, and board.py
+#   reads the stylesheet from its own directory. Without it the pages are unstyled (and
+#   board.py says so on stderr).
+# Simplification: one pod, one SQLite file. Do not scale to 2 replicas (DESIGN.md §10).
+apiVersion: v1
+kind: Namespace
+metadata: { name: board }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: board-data, namespace: board }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+# The board-policy ConfigMap is DELIBERATELY not in this file, and is never applied by a
+# deploy. The policy (grants, roles, limits and `budget.<project>.ceilings`) is the
+# owner's LIVING decision surface: it is edited on the host between deploys. A copy here
+# would roll back any ceiling set since the last commit — silently, and for the whole
+# fleet. With the budget line missing the ceiling is 0, and every agent in every project
+# stops at its next status check.
+#   read:   kubectl -n board get cm board-policy -o jsonpath='{.data.board-policy\.json}'
+#   edit:   kubectl -n board edit cm board-policy && \
+#           kubectl -n board rollout restart deploy/board
+#   empty cluster (and ONLY there):
+#           kubectl -n board create configmap board-policy \
+#             --from-file=board-policy.json=k8s/board-policy.bootstrap.json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: board, namespace: board }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: board } }
+  template:
+    metadata: { labels: { app: board } }
+    spec:
+      # The service is called "board", so k8s would otherwise inject BOARD_PORT=tcp://…:80
+      # and override the listening port. Turn the whole injection off rather than rename.
+      enableServiceLinks: false
+      # No in-flight request lasts 30s; waiting for the default grace period only widens
+      # the gap before the new pod is allowed to start.
+      terminationGracePeriodSeconds: 5
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001 }
+      containers:
+        - name: board
+          image: python:3.12-alpine
+          command: ["python3", "/src/board.py"]
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: BOARD_DB
+              value: /data/board.db
+            - name: BOARD_POLICY
+              value: /policy/board-policy.json
+            - name: BOARD_BASE_URL
+              value: https://${BOARD_HOST}
+            # The owner's name on the board: the actor string in events, `answered_by` and
+            # `pinned_by`. Keep it stable for the life of a board — see board.py.
+            - name: BOARD_HUMAN
+              value: ${BOARD_HUMAN}
+            - name: NTFY_URL
+              value: ${NTFY_URL}
+            - name: BOARD_TOKEN
+              valueFrom: { secretKeyRef: { name: board, key: token } }
+            # The human's own token. Authenticates like the agent token AND lets the call
+            # act as the human: pin roles, answer the questions that open the merge gate.
+            # Without it, `by: <human>` is only a claim any agent can write.
+            - name: BOARD_HUMAN_TOKEN
+              valueFrom: { secretKeyRef: { name: board, key: human_token, optional: true } }
+            - name: NTFY_AUTH
+              valueFrom: { secretKeyRef: { name: board, key: ntfy_auth } }
+          ports: [{ containerPort: 8080 }]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          # Recreate + replicas:1 (DESIGN.md §10: one writer, one pod) means the board IS
+          # gone during every deploy. The length of that gap is then all we control, and
+          # most of it was probe waiting: the pod answers in ~1s, but periodSeconds:10 with
+          # no initialDelay meant the first successful probe only landed after ~11s. A tight
+          # probe wins those seconds back; initialDelaySeconds would make it worse.
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 1, failureThreshold: 30 }
+          livenessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 30 }
+          resources: { requests: { cpu: 10m, memory: 64Mi }, limits: { memory: 256Mi } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: src, mountPath: /src }
+            - { name: policy, mountPath: /policy }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: board-data } }
+        - { name: src, configMap: { name: board-src } }
+        - { name: policy, configMap: { name: board-policy } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: board, namespace: board }
+spec:
+  selector: { app: board }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+# A rate limit in front of a bearer-protected API: slows token guessing from outside.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: { name: board-ratelimit, namespace: board }
+spec:
+  rateLimit: { average: 20, burst: 40 }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: board
+  namespace: board
+  annotations:
+    # This setup terminates TLS outside k3s, in front of the cluster, so there is no
+    # cert-manager annotation here. If your cluster terminates TLS itself, add the issuer
+    # annotation and a `tls:` block below.
+    traefik.ingress.kubernetes.io/router.middlewares: board-board-ratelimit@kubernetescrd
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: ${BOARD_HOST}
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: board, port: { number: 80 } } } }

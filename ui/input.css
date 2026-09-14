@@ -1,0 +1,220 @@
+/* The source of board.css. Built with ./build.sh — the CSS is CHECKED IN, so the board
+   has no Node dependency at runtime and no CDN (CSP: default-src 'none'). */
+/* `source(none)` turns OFF Tailwind's automatic content detection. Without it, v4 scans
+   the whole repository in addition to the source below, and any word that happens to be
+   a utility name becomes dead CSS: the word "inline" in a comment in ui/verify.sh put
+   `.inline{display:inline}` into the stylesheet. The comment below said "only board.py is
+   scanned", and that was not true until now. */
+@import "tailwindcss" source(none);
+@plugin "daisyui" { themes: false; }
+
+/* The classes live in Python strings. Tailwind's text extractor reads them THERE, and
+   only there — this is now the only source. */
+@source "../board.py";
+
+/* --- the theme ---------------------------------------------------------------
+   The colours ARE the state machine, not decoration. Three hues, each with ONE meaning:
+     warning  amber  — waiting on you   (questions, test cards, awaiting_human)
+     error    red    — stopped          (blocked, orphaned, a dead agent, over the ceiling)
+     success  green  — landed           (merged, done, under the ceiling)
+   Working states (claimed, in_review, merging) get NO hue. Most tasks are working, and
+   working should not shout. Interaction is marked with an underline and a focus ring,
+   not with a fourth colour.
+   --depth/--noise 0: no shadows, and no data: URI textures to have to let through the
+   CSP. */
+@plugin "daisyui/theme" {
+  name: "board-light";
+  default: true;
+  color-scheme: light;
+  --color-base-100: #e9ece8;
+  --color-base-200: #ffffff;
+  --color-base-300: #c7d0cb;
+  --color-base-content: #0c1b1f;
+  --color-primary: #1f6b52;
+  --color-primary-content: #ffffff;
+  --color-secondary: #24474f;
+  --color-secondary-content: #ffffff;
+  --color-accent: #1f6b52;
+  --color-accent-content: #ffffff;
+  --color-neutral: #24474f;
+  --color-neutral-content: #ffffff;
+  --color-info: #24474f;
+  --color-info-content: #ffffff;
+  --color-success: #1f6b52;
+  --color-success-content: #ffffff;
+  --color-warning: #f0b429;
+  --color-warning-content: #3a2a00;
+  --color-error: #b03325;
+  --color-error-content: #ffffff;
+  --radius-selector: 0.25rem;
+  --radius-field: 0.25rem;
+  --radius-box: 0.375rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+@plugin "daisyui/theme" {
+  name: "board-dark";
+  prefersdark: true;
+  color-scheme: dark;
+  --color-base-100: #0c1b1f;
+  --color-base-200: #122a2f;
+  --color-base-300: #1e3b41;
+  --color-base-content: #dce7e5;
+  --color-primary: #38a57f;
+  --color-primary-content: #04120d;
+  --color-secondary: #9fb8bd;
+  --color-secondary-content: #0c1b1f;
+  --color-accent: #38a57f;
+  --color-accent-content: #04120d;
+  --color-neutral: #1e3b41;
+  --color-neutral-content: #dce7e5;
+  --color-info: #9fb8bd;
+  --color-info-content: #0c1b1f;
+  --color-success: #38a57f;
+  --color-success-content: #04120d;
+  --color-warning: #f0b429;
+  --color-warning-content: #3a2a00;
+  --color-error: #e4574a;
+  --color-error-content: #1a0603;
+  --radius-selector: 0.25rem;
+  --radius-field: 0.25rem;
+  --radius-box: 0.375rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+@theme {
+  /* No web font: the CSP lets no external source in, and a self-hosted file would be
+     another 30 kB in the ConfigMap for too little. A system sans for prose, a real
+     monospace for every machine token (task ids, agent ids, shas, clocks) — those are
+     scanned down columns and copied, so monospace is the functional choice, not a
+     decoration. */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; hanging-punctuation: first last; }
+  body { text-wrap: pretty; }
+  /* Focus must ALWAYS be visible — the pages are driven by keyboard as often as by
+     thumb. */
+  :where(a, button, input, summary):focus-visible {
+    outline: 2px solid var(--color-warning);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
+}
+
+@layer components {
+  /* --- the meter ---------------------------------------------------------
+     This is where all the boldness is spent. Quota is the ONLY thing that stops the
+     fleet, so the ceiling is drawn as a hard line with its own number beside it — not
+     a gradient, not a flourish. daisyUI's `progress` cannot draw a ceiling line, and the
+     ceiling line is exactly the point. */
+  .meter { display: grid; grid-template-columns: 2.75rem minmax(0, 1fr) 2.75rem;
+           align-items: center; gap: .5rem; max-width: 22rem; font-size: .8125rem; }
+  .meter > .k { color: color-mix(in oklab, var(--color-base-content) 60%, transparent);
+                font-family: var(--font-mono); }
+  .meter > .v { text-align: right; font-family: var(--font-mono);
+                font-variant-numeric: tabular-nums; }
+  .track { position: relative; height: .5rem; border-radius: 1px;
+           background: var(--color-base-200);
+           box-shadow: inset 0 0 0 1px var(--color-base-300); }
+  .track > i { position: absolute; inset: 0 auto 0 0; border-radius: 1px;
+               background: var(--color-success); }
+  .track > i.warn { background: var(--color-warning); }
+  .track > i.over { background: var(--color-error); }
+  /* the ceiling: a line through the full height, with the number set right beside it */
+  .track > u { position: absolute; top: -.25rem; bottom: -.25rem; width: 2px;
+               background: var(--color-error); }
+  .track > u::after { content: attr(data-c); position: absolute; left: .3rem; top: -.45rem;
+                      font-size: .625rem; line-height: 1; font-family: var(--font-mono);
+                      color: var(--color-error); white-space: nowrap; }
+
+  /* Agents on the left, tasks on the right. A named component rather than a long
+     arbitrary Tailwind class, deliberately: the previous one was split across two Python
+     string literals, and a split token is NEVER seen by the text extractor. The rule
+     vanished silently, and the meters went page-wide. ui/verify.sh catches that now. */
+  .pane { display: grid; gap: 1.5rem 2.5rem; min-width: 0; container-type: inline-size; }
+  @media (min-width: 64rem) {
+    .pane { grid-template-columns: minmax(14rem, 0.36fr) minmax(0, 1fr); align-items: start; }
+  }
+
+  /* --- the task list -----------------------------------------------------
+     The spine: a left border per row carrying the state colour, so a glance down the
+     column reads state without reading words. */
+  .tasks { border-collapse: collapse; }
+  .tasks tbody td { border-top: 1px solid var(--color-base-300); }
+  /* The border sits on the FIRST CELL, not on the <tr>: a row can only carry a border
+     when border-collapse is `collapse`, and even then browsers draw it differently. The
+     cell is the one place it works everywhere. */
+  .tasks tbody tr.spine > td:first-child { border-left: 3px solid transparent; }
+  .tasks tbody tr.spine-wait > td:first-child { border-left-color: var(--color-warning); }
+  .tasks tbody tr.spine-stop > td:first-child { border-left-color: var(--color-error); }
+  .tasks tbody tr.spine-land > td:first-child { border-left-color: var(--color-success); }
+
+  /* Below 40rem the table becomes cards: six columns on a phone is unreadable, and the
+     pages are opened from push notifications on mobile. The label lives in data-l on each
+     cell, so the markup is ONE, not two. */
+  @media (max-width: 40rem) {
+    .tasks thead { display: none; }
+    .tasks, .tasks tbody, .tasks tr, .tasks td { display: block; width: 100%; }
+    .tasks tbody tr { margin: .55rem 0; padding: .5rem .75rem;
+      border: 1px solid var(--color-base-300); border-left-width: 3px;
+      border-radius: var(--radius-box); background: var(--color-base-200); }
+    /* The card IS the row here, so the colour moves back to the row and off the cell. */
+    .tasks tbody tr.spine > td:first-child { border-left: 0; }
+    .tasks tbody tr.spine-wait { border-left-color: var(--color-warning); }
+    .tasks tbody tr.spine-stop { border-left-color: var(--color-error); }
+    .tasks tbody tr.spine-land { border-left-color: var(--color-success); }
+    /* The row is a grid in card mode, so the title can go FIRST: on a phone you should
+       read what the task is before you read its id. */
+    .tasks tbody tr { display: grid; }
+    .tasks tbody td { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr);
+      gap: .35rem; padding: .15rem 0; border: 0; }
+    .tasks tbody td[data-l="title"] { order: -1; grid-template-columns: minmax(0, 1fr);
+      margin-bottom: .35rem; }
+    .tasks tbody td[data-l="title"]::before { content: none; }
+    /* An empty cell is not information, and must not cost a row on a phone. */
+    .tasks tbody td[data-empty] { display: none; }
+    .tasks tbody td::before { content: attr(data-l); font-size: .75rem;
+      color: color-mix(in oklab, var(--color-base-content) 60%, transparent); }
+  }
+
+  /* The open/close affordance on a project. `<details>` is kept rather than daisyUI's
+     `collapse`: the server renders everything closed, so a closed project never flashes
+     open on a slow phone, and that requires the built-in element behaviour. */
+  .pj > summary > .mark::before { content: "+"; font-weight: 600; }
+  .pj[open] > summary > .mark::before { content: "\2212"; }
+
+  /* The question cards. auto-fill rather than fixed columns: ONE card should take its
+     own width, not sit abandoned in half an empty grid. */
+  .qgrid { display: grid; gap: .75rem; margin-top: .5rem;
+           grid-template-columns: repeat(auto-fill, minmax(min(100%, 26rem), 1fr)); }
+
+  /* --- the timeline ------------------------------------------------------
+     The clock in a fixed monospace column, the text wrapping at reading width beside it. */
+  .trail > li { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr);
+                gap: .25rem 1rem; padding: .5rem 0;
+                border-top: 1px solid var(--color-base-300); }
+  /* The date separator: carries the date once, where it changes. No border above — it
+     belongs to the row below, not between two events. */
+  .trail > li.day { padding: .9rem 0 .1rem; border-top: 0; }
+  .trail > li.day + li { border-top: 0; }
+  @media (max-width: 40rem) { .trail > li { grid-template-columns: minmax(0, 1fr); } }
+}
+
+/* OUTSIDE every layer, deliberately: an unlayered declaration beats a layered one, and
+   this has to beat daisyUI's own. --fx-noise is a data: URI texture on :root. The CSP has
+   no img-src, and default-src 'none' blocks data: too — VERIFIED in Chromium: the browser
+   tried to load it and logged a CSP violation on every page view. The texture is invisible
+   anyway (--noise: 0), so it cost nothing but error messages. */
+:root { --fx-noise: none; }

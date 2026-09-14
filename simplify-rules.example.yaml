@@ -1,0 +1,57 @@
+# simplify-rules.yaml — which tasks `board simplify` should consolidate.
+#
+# Put this file next to project.yaml (or point $BOARD_SIMPLIFY_RULES at it) and drop the
+# `.example`. It is optional: without it, `board simplify` still closes retracted tasks,
+# consolidates the board's own human-test follow-ups, and turns open test cards into one
+# machine-verification task.
+#
+# What belongs here is DOMAIN knowledge — your repo names, your vocabulary, the shape of
+# your backlog. That is why it is a file and not code: the same simplify.py serves every
+# project, and nobody has to edit a script to describe their own queue.
+
+# Words that mark a task a human withdrew. Case-insensitive substring of the title.
+# Write them in whatever language your board is actually used in.
+retracted:
+  title_any: [RETRACTED, WITHDRAWN]
+
+# Follow-ups the board created itself when a human test failed or a default was
+# overridden. The defaults match the strings board.py writes; change them only if you
+# have changed those.
+verification:
+  title_any: ["FAIL from human test", "overridden default on"]
+  title: "consolidated verification of {n} follow-ups ({ids})"
+  prefix: "consolidated verification"     # used to find an already-created consolidation
+  priority: 60
+
+# Open `kind: test` questions, gathered into one task an agent can verify by machine.
+# `env` picks which environment URL from project.yaml goes into the spec.
+test_cards:
+  title: "consolidated machine verification of {n} test cards ({ids})"
+  prefix: "consolidated machine verification"
+  priority: 65
+  env: dev
+
+# Your own clusters, applied in order. A task joins the first cluster that matches it.
+# A cluster with fewer than two matching tasks is reported but never consolidated —
+# merging one task into a "consolidation" only adds a layer.
+clusters:
+  - name: web-stability
+    # {n} = number of tasks, {ids} = their ids
+    title: "web: consolidated error handling and type checks ({ids})"
+    prefix: "web: consolidated error handling"
+    repo: my-web                 # --repo on the consolidated task
+    priority: 48
+    benefit: "One PR instead of five; one review and one gate cycle instead of five."
+    match:
+      repo: my-web               # only tasks in this repo
+      title_any: ["promise.all", "500", "type check"]
+      # text_any: [...]          # same, but searches title + spec
+      # ids: [T-101, T-117]      # always pull these in, whatever they are called
+
+  - name: infrastructure
+    title: "infra: consolidated cluster and network hardening ({ids})"
+    prefix: "infra: consolidated cluster"
+    repo: my-infra
+    priority: 60
+    match:
+      repo: my-infra             # a match block with only `repo` takes every open task there

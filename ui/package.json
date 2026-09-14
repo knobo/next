@@ -1,0 +1,17 @@
+{
+  "name": "tavla-ui",
+  "private": true,
+  "description": "Byggesteg for tavlas stilark. Bare utvikling — board.css er sjekket inn, og tavla er stdlib-only Python i drift.",
+  "license": "ISC",
+  "type": "commonjs",
+  "scripts": {
+    "build": "./build.sh",
+    "verify": "./verify.sh"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "daisyui": "^5.7.32",
+    "playwright": "^1.56.1",
+    "tailwindcss": "^4.3.3"
+  }
+}

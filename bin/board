@@ -1,0 +1,849 @@
+#!/usr/bin/env bash
+# board — CLI against the coordination board (DESIGN.md §4). A 1:1 wrapper over the HTTP API.
+# K6: writes that do not get through are queued in the outbox and return exit 0 — the agent
+# always carries on.
+set -uo pipefail
+
+: "${BOARD_URL:=http://localhost:8080}"
+# The token is fetched from `pass` when it is not in the environment — that spares every
+# session the env plumbing.
+: "${BOARD_TOKEN:=$(pass board/token 2>/dev/null | head -1)}"
+# The harness is DERIVED, never guessed. The policy grants per harness@host, so a guess
+# that misses is a silent privilege escalation: a grok agent that registered as
+# claude-code inherited merge and deploy-dev (§3.7 exists to prevent exactly that).
+if [ -z "${BOARD_HARNESS:-}" ]; then
+  if   [ -n "${CLAUDE_CODE_SESSION_ID:-}" ];                          then BOARD_HARNESS=claude-code
+  elif [ -n "${ANTIGRAVITY_AGENT:-}${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then BOARD_HARNESS=antigravity
+  elif [ -n "${GROK_SESSION_ID:-}${GROK_CLI:-}" ];                    then BOARD_HARNESS=grok
+  elif [ -n "${CODEX_SESSION_ID:-}${CODEX_HOME:-}" ];                  then BOARD_HARNESS=codex
+  elif [ -f "$HOME/.grok/active_sessions.json" ];                     then BOARD_HARNESS=grok
+  elif [ -d "$HOME/.codex" ];                                         then BOARD_HARNESS=codex
+  fi
+fi
+
+# The human token separates "the human says" from "an agent claims the human says"
+# (§3.7). It is fetched ONLY when no harness was derived, i.e. in the human's own shell —
+# an agent must never be able to pick it up from `pass` and pin itself as the human.
+: "${BOARD_HUMAN_TOKEN:=}"
+if [ -z "$BOARD_HUMAN_TOKEN" ] && [ -z "${BOARD_HARNESS:-}" ]; then
+  BOARD_HUMAN_TOKEN=$(pass board/human-token 2>/dev/null | head -1)
+fi
+[ -n "$BOARD_HUMAN_TOKEN" ] && BOARD_TOKEN="$BOARD_HUMAN_TOKEN"
+
+# Identity is per SESSION. Every harness exports its own session id into the shell, so
+# two /next sessions on the same machine each get their own agent id and their own
+# current-task. Without any of them we fall back to one id per harness per machine —
+# worse, but never shared across harnesses, which is the collision that yields the wrong
+# grants.
+if [ -z "${ANTIGRAVITY_CONVERSATION_ID:-}" ] && [ -n "${ANTIGRAVITY_SOURCE_METADATA:-}" ]; then
+  ANTIGRAVITY_CONVERSATION_ID=$(jq -r '.tool.conversationId // empty' <<<"$ANTIGRAVITY_SOURCE_METADATA" 2>/dev/null)
+fi
+: "${BOARD_SESSION:=${ANTIGRAVITY_CONVERSATION_ID:-${CLAUDE_CODE_SESSION_ID:-${GROK_SESSION_ID:-${CODEX_SESSION_ID:-}}}}}"
+[ -z "$BOARD_SESSION" ] && [ -n "${BOARD_HARNESS:-}" ] && BOARD_SESSION="$BOARD_HARNESS-$(hostname -s)"
+# The cache is keyed on the BOARD. Agent id, GET cache and outbox are true only for the
+# board they came from: if you registered against a local test instance, it overwrote the
+# agent id you hold against production — and worse, queued writes in the outbox could be
+# flushed to the wrong board.
+CACHE_ROOT="${BOARD_CACHE:-$HOME/.cache/board}"
+CACHE="$CACHE_ROOT/$(printf '%s' "${BOARD_URL#*://}" | tr -c 'A-Za-z0-9._-' '_')"
+CURRENT="current-task${BOARD_SESSION:+-$BOARD_SESSION}"
+OUTBOX="$CACHE/outbox.jsonl"
+mkdir -p "$CACHE/cache"
+
+die() { echo "board: $*" >&2; exit 2; }
+
+# Reads the file argument of --spec-file/--card-file. `-` means stdin, and it MUST be
+# read into a variable first: otherwise jq shares fd 0 with the here-string that is the
+# JSON input, and both come out empty. An empty file is worse than no file — we get a
+# task with no description that is claimed by somebody who cannot do it — so we die
+# rather than create anything. ALWAYS call it in its own statement with `|| exit 2`:
+# `die` inside $( ) only exits the subshell.
+slurp() {
+  local f=$1 s
+  if [ "$f" = - ]; then s=$(cat)
+  else [ -r "$f" ] || die "cannot find the file, or it is unreadable: $f"; s=$(cat -- "$f")
+  fi
+  [ -n "${s//[[:space:]]/}" ] || die "the file is empty: $f"
+  printf '%s' "$s"
+}
+command -v jq >/dev/null || die "jq is missing"
+
+# The agent id is per SESSION, not per machine: two /next sessions on one host must not
+# share an id. Keyed on the session when it is known (DESIGN.md §3.5), with the
+# per-machine file as a fallback.
+MANIFEST="$(dirname "$(readlink -f "$0")")/manifest.py"
+
+agent_id() {
+  local f="$CACHE/session-${BOARD_SESSION:-}"
+  [ -n "${BOARD_AGENT_ID:-}" ] && { echo "$BOARD_AGENT_ID"; return; }
+  [ -n "${BOARD_SESSION:-}" ] && [ -s "$f" ] && { cat "$f"; return; }
+  [ -s "$CACHE/agent" ] && { cat "$CACHE/agent"; return; }
+  # Migration: sessions that registered before the cache was keyed on the board live in
+  # the root. Only READS fall back there — new ids are always written under the keyed path.
+  [ -n "${BOARD_SESSION:-}" ] && [ -s "$CACHE_ROOT/session-$BOARD_SESSION" ] \
+    && { cat "$CACHE_ROOT/session-$BOARD_SESSION"; return; }
+  cat "$CACHE_ROOT/agent" 2>/dev/null
+}
+
+# ---- flag parsing: --foo bar --no-merge  ->  {"foo":"bar","no_merge":true} ----
+LIST_KEYS='["capabilities","requires","needs_grants","touches","options","cap"]'
+POS=(); JQARGS=()
+parse() {
+  POS=(); JQARGS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --*) k="${1#--}"; k="${k//-/_}"
+           if [ $# -ge 2 ] && [[ "${2:-}" != --* ]]; then JQARGS+=(--arg "$k" "$2"); shift 2
+           else JQARGS+=(--argjson "$k" true); shift; fi ;;
+      *)   POS+=("$1"); shift ;;
+    esac
+  done
+}
+body() {  # extra k=v pairs as arguments: body key val key val
+  local extra=()
+  while [ $# -gt 1 ]; do [ -n "$2" ] && extra+=(--arg "$1" "$2"); shift 2; done
+  jq -nc "${JQARGS[@]}" "${extra[@]}" \
+    "\$ARGS.named
+     | with_entries(. as \$e | if (($LIST_KEYS | index(\$e.key)) and (.value|type==\"string\"))
+                               then .value |= split(\",\") else . end)
+     | if has(\"cap\") then (.capabilities = .cap | del(.cap)) else . end"
+}
+
+req() {  # req METHOD PATH [JSON] [--nocache]
+  local method="$1" path="$2" data="${3:-}" out code
+  flush_outbox
+  out=$(curl -sS -m 5 -w '\n%{http_code}' -X "$method" \
+        -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \
+        ${data:+-d "$data"} "$BOARD_URL/api/v1$path" 2>/dev/null)
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  # A 5xx is the board being down just as much as a broken TCP call: during `rollout
+  # restart` Traefik answers 503 with "no available server" in plain text. Without this
+  # line the agent went past the cache, got non-JSON in its hands and died on the next jq
+  # (T-189).
+  # 502/503/504 = the board is gone (ingress, rollout, timeout). 500 is board.py's own
+  # catch-all for an internal error — the service ANSWERS, and queueing the write would
+  # have lost it: flush_outbox drops everything that is not 000, including the next 500.
+  # Real errors must surface.
+  if [ -z "$code" ] || [ "$code" = 000 ] || ! [[ "$code" =~ ^[0-9]+$ ]] \
+     || [ "$code" = 502 ] || [ "$code" = 503 ] || [ "$code" = 504 ]; then
+    offline "$method" "$path" "$data"; return $?
+  fi
+  # JSON only in the cache. An error page written here would have poisoned every
+  # subsequent offline answer, long after the board was back up.
+  if [ "$method" = GET ] && jq -e . >/dev/null 2>&1 <<<"$out"; then
+    echo "$out" > "$CACHE/cache/$(echo "$path" | md5sum | cut -c1-16).json"
+  fi
+  echo "$out"
+  [ "$code" -lt 300 ] && return 0
+  return 1
+}
+
+# Commands that act ON the board's answer (push, PR, deleting worktrees) must not act on
+# a cached answer: they would then point at an old branch or the wrong worktree. Reads are
+# still never blocking — this applies only to the three that write to disk or to the forge.
+fresh_or_die() {
+  jq -e '.stale // false' >/dev/null 2>&1 <<<"$1" \
+    && die "the board is down (the answer came from cache) — try again when $BOARD_URL responds"
+  jq -e . >/dev/null 2>&1 <<<"$1" || die "unexpected answer from the board: $(head -c 120 <<<"$1")"
+}
+
+offline() {  # the board is not answering
+  local method="$1" path="$2" data="${3:-}"
+  if [ "$method" = GET ]; then
+    local f="$CACHE/cache/$(echo "$path" | md5sum | cut -c1-16).json"
+    if [ -s "$f" ]; then jq -c '. + {stale:true}' "$f"; return 0; fi
+    echo '{"stale":true,"error":"the board is down and there is no cache"}'; return 0
+  fi
+  case "$path" in
+    /roles/*/claim) echo '{"error":"board down — a role claim is never queued (DESIGN §3.8)"}' >&2; return 1;;
+  esac
+  jq -nc --arg m "$method" --arg p "$path" --arg d "$data" '{method:$m,path:$p,body:$d}' >> "$OUTBOX"
+  echo '{"queued":true}'
+}
+
+flush_outbox() {
+  local tmp="$OUTBOX.flushing"
+  # An interrupted flush used to leave a .flushing behind that was never read again — lost writes.
+  [ -s "$tmp" ] && { cat "$tmp" "$OUTBOX" 2>/dev/null > "$OUTBOX.merge"; mv "$OUTBOX.merge" "$OUTBOX"; rm -f "$tmp"; }
+  [ -s "$OUTBOX" ] || return 0
+  # The coordinator and its subagents share $HOME. Without a lock two processes read the
+  # same .flushing and replay everything twice — duplicate tasks and duplicate questions.
+  exec 9>"$OUTBOX.lock"
+  flock -n 9 || return 0
+  mv "$OUTBOX" "$tmp" 2>/dev/null || { flock -u 9; return 0; }
+  local m p d code
+  while read -r line; do
+    [ -n "$line" ] || continue
+    m=$(jq -r .method <<<"$line"); p=$(jq -r .path <<<"$line"); d=$(jq -r .body <<<"$line")
+    code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X "$m" \
+      -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \
+      ${d:+-d "$d"} "$BOARD_URL/api/v1$p" 2>/dev/null)
+    # 000 = never arrived → try again. Everything else is ANSWERED, including 409: a lost
+    # claim must not be replayed forever.
+    [ "$code" = 000 ] && echo "$line" >> "$OUTBOX"
+  done < "$tmp"
+  rm -f "$tmp"; flock -u 9
+}
+
+with_agent() { jq -c --arg a "$(agent_id)" '. + {agent:$a}' <<<"${1:-\{\}}"; }
+
+# A task's `repo` field is often the PROJECT NAME (the board stores that, not a manifest
+# repo) — with the default `repos: [.]` there is no $ROOT/<project> directory.
+# Mirrors worktree_path() in manifest.py exactly: "", "." and $PROJECT are the root
+# itself, a known repo is $ROOT/<repo>, and anything else is an error we SHOUT about — a
+# silent fallback to the first repo produced a PR that checked out the wrong repo with no
+# warning (T-67).
+repo_dir() {
+  local repo="$1" r reposarr
+  case "$repo" in ""|"."|"$PROJECT") echo "$ROOT"; return ;; esac
+  read -ra reposarr <<<"$REPOS"
+  for r in "${reposarr[@]}"; do [ "$r" = "$repo" ] && { echo "$ROOT/$repo"; return; }; done
+  die "unknown repo \"$repo\" — known: $REPOS"
+}
+
+# Writing eval and `|| exit 1` on the same line looks right and is not: the status that
+# gets checked is eval's, and eval on an empty string is 0. Without a manifest the script
+# therefore carried on past the error message and died on `PHASE: unbound variable` (T-67).
+manifest_sh() { local s; s=$("$MANIFEST" --sh) || exit 1; eval "$s"; }
+
+# The project is always what the manifest above cwd says, unless the caller overrides it.
+# Without this, task create / ask / role fail — the whole bootstrap in SKILL.md.
+project_name() {
+  local p="${1:-}"
+  [ -n "$p" ] && { echo "$p"; return; }
+  [ -n "${BOARD_PROJECT:-}" ] && { echo "$BOARD_PROJECT"; return; }
+  "$MANIFEST" 2>/dev/null | jq -r '.project // empty'
+}
+with_project() {  # add `project` from the manifest if it is missing
+  jq -c --arg p "$(project_name "$(jq -r '.project // empty' <<<"${1:-{\}}")")" \
+     'if (.project // "") == "" then .project = $p else . end' <<<"${1:-\{\}}"
+}
+
+cmd="${1:-status}"; shift || true
+
+case "$cmd" in
+simplify)
+  # board simplify [--project <p>] [--apply] [--json]
+  # Analyses and tidies tasks: merges clusters of verification tasks, removes retracted
+  # or invalid tasks, and cleans up the queue.
+  python3 "$(dirname "$(readlink -f "$0")")/simplify.py" "$@" ;;
+start)
+  # board start [role] [--model <model>] [--sh]
+  # One-step bootstrap: detects the project, probes capabilities, registers the agent,
+  # claims a role (coordinator with automatic fallback to implementer), checks the inbox
+  # and fetches the next task.
+  parse "$@"
+  role="${POS[0]:-coordinator}"
+  manifest_sh
+  proj="$PROJECT"
+  [ -n "$proj" ] || die "no project found — run this inside a project that has project.yaml"
+
+  [ -n "${BOARD_HARNESS:-}" ] || {
+    if   [ -n "${CLAUDE_CODE_SESSION_ID:-}" ];                          then BOARD_HARNESS=claude-code
+    elif [ -n "${ANTIGRAVITY_AGENT:-}${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then BOARD_HARNESS=antigravity
+    elif [ -n "${GROK_SESSION_ID:-}${GROK_CLI:-}" ];                    then BOARD_HARNESS=grok
+    elif [ -n "${CODEX_SESSION_ID:-}${CODEX_HOME:-}" ];                  then BOARD_HARNESS=codex
+    fi
+  }
+  [ -n "${BOARD_HARNESS:-}" ] || die "could not work out which harness this is — set BOARD_HARNESS (claude-code|antigravity|grok|codex)."
+
+  model=$(jq -r '.model // empty' <<<"$(body)")
+  if [ -z "$model" ]; then
+    case "$BOARD_HARNESS" in
+      antigravity) model="gemini-3.8-flash" ;;
+      claude-code) model="sonnet" ;;
+      grok)        model="grok" ;;
+      codex)       model="codex" ;;
+      *)           model="unknown" ;;
+    esac
+  fi
+
+  m=$("$MANIFEST" 2>/dev/null) && [ -n "$m" ] && \
+    req POST /projects "$(jq -c --arg h "$(hostname -s)" \
+      '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$m")" >/dev/null
+
+  caps_str=$("$0" probe)
+  b=$(body harness "$BOARD_HARNESS" host "$(hostname -s)" \
+           session "${BOARD_SESSION:-}" project "$proj" model "$model" cap "$caps_str")
+  r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
+  aid=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
+  echo "$aid" > "$CACHE/agent"
+  [ -n "$sess" ] && echo "$aid" > "$CACHE/session-$sess"
+
+  actual_role="$role"
+  if [ "$role" = "coordinator" ]; then
+    claim_res=$(req POST "/roles/coordinator/claim" "$(jq -nc --arg p "$proj" --arg a "$aid" '{project:$p,agent:$a}')" 2>&1) || true
+    if jq -e '.error' >/dev/null 2>&1 <<<"$claim_res"; then
+      actual_role="implementer"
+    fi
+  else
+    req PUT "/roles/$role" "$(jq -nc --arg p "$proj" --arg a "$aid" '{project:$p,agent:$a}')" >/dev/null || true
+  fi
+
+  status_me=$(req GET "/status?project=$proj")
+  agent_row=$(jq -c --arg a "$aid" '[.projects[0].agents[]? | select(.id == $a)][0] // {}' <<<"$status_me")
+  stop_reason=$(jq -r '.stop // empty' <<<"$agent_row")
+  [ -z "$stop_reason" ] && stop_reason=$(jq -r '.projects[0].stop // empty' <<<"$status_me")
+
+  inbox_res=$(req GET "/agents/$aid/inbox?project=$proj" 2>/dev/null || echo '{"questions":[],"messages":[]}')
+
+  next_task="null"
+  if [ -z "$stop_reason" ]; then
+    next_task=$(req GET "/tasks/next?agent=$aid" 2>/dev/null || echo "null")
+    [ "$next_task" = "{}" ] && next_task="null"
+  fi
+
+  if jq -e '.sh' >/dev/null 2>&1 <<<"$(body)"; then
+    echo "ROOT='$ROOT'"
+    echo "PROJECT='$proj'"
+    echo "PHASE='$PHASE'"
+    echo "BOARD_AGENT_ID='$aid'"
+    echo "ROLE='$actual_role'"
+    echo "STOP='${stop_reason:-}'"
+    echo "ONBOARDING='${ONBOARDING:-}'"
+    tid=$(jq -r '.id // empty' <<<"$next_task")
+    echo "NEXT_TASK_ID='$tid'"
+  else
+    jq -nc \
+      --arg root "$ROOT" \
+      --arg proj "$proj" \
+      --arg phase "$PHASE" \
+      --arg aid "$aid" \
+      --arg harness "$BOARD_HARNESS" \
+      --arg model "$model" \
+      --arg role "$actual_role" \
+      --arg stop "$stop_reason" \
+      --arg onboarding "${ONBOARDING:-}" \
+      --argjson inbox "$inbox_res" \
+      --argjson task "$next_task" \
+      '{root:$root, project:$proj, phase:$phase, agent:$aid, harness:$harness, model:$model, role:$role, stop:(if $stop=="" then null else $stop end), onboarding:(if $onboarding=="" then null else $onboarding end), inbox:$inbox, next_task:$task}'
+  fi ;;
+
+register)
+  parse "$@"
+  [ -n "${BOARD_HARNESS:-}" ] || die "could not work out which harness this is — set BOARD_HARNESS (claude-code|antigravity|grok|codex). We do not guess: the policy grants per harness."
+  b=$(body harness "$BOARD_HARNESS" host "$(hostname -s)" \
+           session "${BOARD_SESSION:-}" project "$(project_name "")")
+  # Mirror the manifest BEFORE registering: the phase drives the merge gate, and a board
+  # that does not know the project defaults to `build` — a slacker gate than the truth.
+  m=$("$MANIFEST" 2>/dev/null) && [ -n "$m" ] && \
+    req POST /projects "$(jq -c --arg h "$(hostname -s)" \
+      '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$m")" >/dev/null
+  r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
+  id=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
+  echo "$id" > "$CACHE/agent"
+  [ -n "$sess" ] && echo "$id" > "$CACHE/session-$sess"
+  echo "$r" ;;
+
+heartbeat)
+  # `parse` turns every --flag into a string. --budget is a list, and a string there
+  # would have been silently ignored by the board — the worst failure a quota field can
+  # have. fromjson shouts instead if it is not valid JSON.
+  parse "$@"; req POST "/agents/$(agent_id)/heartbeat" \
+    "$(body | jq -c 'if (.budget|type)=="string" then .budget=(.budget|fromjson) else . end')" ;;
+
+caps)
+  parse "$@"; b=$(body)
+  if [ "${POS[0]:-}" = probe ]; then exec "$0" probe; fi
+  if jq -e 'has("prefer")' >/dev/null <<<"$b"; then
+    req PUT "/agents/$(agent_id)/preference" "$(jq -c '{preference:.prefer}' <<<"$b")"
+  else
+    req PUT "/agents/$(agent_id)/capabilities" "$(jq -c '{add:(.add//[]|if type=="string" then split(",") else . end), remove:(.remove//[]|if type=="string" then split(",") else . end)}' <<<"$b")"
+  fi ;;
+
+finished)
+  parse "$@"; req POST "/agents/$(agent_id)/finished" "$(body)" ;;
+
+inbox)
+  parse "$@"; as=$(jq -r '.as // empty' <<<"$(body)")
+  req GET "/agents/$(agent_id)/inbox${as:+?as=$as}" ;;
+
+project)
+  sub="${1:-}"; shift || true; parse "$@"
+  case "$sub" in
+    detect) "$MANIFEST" --sh ;;
+    show)   "$MANIFEST" ;;
+    init)   "$MANIFEST" --init "${POS[0]:-$(basename "$PWD")}" ;;
+    sync)   # mirror the manifest to the board, so other machines see phase and repos
+            m=$("$MANIFEST") || exit 1
+            req POST /projects "$(jq -c --arg h "$(hostname -s)" \
+              '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$m")" ;;
+    set|use) req POST /projects "$(body)" ;;
+    *) die "board project detect|sh|init|sync|set" ;;
+  esac ;;
+
+caps-probe|probe)
+  # Capabilities are self-declared, but must be VERIFIED (§3.7) — hence the probes.
+  caps=()
+  kubectl --context default get ns >/dev/null 2>&1 && caps+=(kubectl-dev)
+  # --no-install: a probe must never download anything. Without it npx fetches the package.
+  command -v npx >/dev/null && npx --no-install playwright --version >/dev/null 2>&1 \
+    && caps+=(playwright browser-test)
+  { command -v gradle >/dev/null 2>&1 || [ -x ./gradlew ]; } && caps+=(gradle)
+  command -v flutter >/dev/null 2>&1 && caps+=(flutter-build)
+  pass ls >/dev/null 2>&1 && caps+=(pass-secrets)
+  command -v tea >/dev/null 2>&1 && caps+=(forgejo)
+  command -v gh >/dev/null 2>&1 && caps+=(github)
+  [ -t 1 ] && caps+=(interactive)
+  # Does the harness report quota usage? For Claude Code the statusline hook does it. If
+  # it is absent the board knows nothing, and the fallback ceiling applies instead (T-164).
+  [ "${BOARD_HARNESS:-}" = "claude-code" ] && grep -qs 'agents/.*/heartbeat' "$HOME/.claude/statusline-command.sh" && caps+=(reports-quota)
+  (IFS=,; echo "${caps[*]}") ;;
+
+task|tasks)
+  sub="${1:-}"; shift || true; parse "$@"
+  t="${POS[0]:-}"
+  case "$sub" in
+    simplify) python3 "$(dirname "$(readlink -f "$0")")/simplify.py" "$@" ;;
+    create) b=$(body); f=$(jq -r '.spec_file // empty' <<<"$b")
+            if [ -n "$f" ]; then
+              spec=$(slurp "$f") || exit 2
+              b=$(jq -c --arg s "$spec" '.spec=$s|del(.spec_file)' <<<"$b")
+            fi
+            req POST /tasks "$(with_agent "$(with_project "$b")")" ;;
+    next)   p=$(jq -r '.repo // empty' <<<"$(body)")
+            req GET "/tasks/next?agent=$(agent_id)${p:+&repo=$p}" ;;
+    claim)  # `task next` with no hit (or a 409) gives an empty .id -> jq writes "null".
+            # Without this it became `claim null` and a 404 instead of the documented
+            # "409 → step 1".
+            case "$t" in ""|null)
+              echo '{"error":"no task to claim — back to step 1"}'; exit 1 ;; esac
+            r=$(req POST "/tasks/$t/claim" "$(with_agent '{}')")
+            # A queued claim is not an owned claim — do not pretend the task is ours.
+            jq -e '.queued // false' >/dev/null <<<"$r" || echo "$t" > "$CACHE/$CURRENT"
+            echo "$r" ;;
+    progress) b=$(body); [ "${POS[1]:-}" ] && b=$(jq -c --arg n "${POS[1]}" '.note=$n' <<<"$b")
+            req POST "/tasks/$t/progress" "$(with_agent "$b")" ;;
+    blocked) req POST "/tasks/$t/blocked" "$(with_agent "$(body note "${POS[1]:-}")")" ;;
+    review) req POST "/tasks/$t/review" "$(with_agent "$(body)")" ;;
+    merging) eval "$("$MANIFEST" --sh)"
+             # Step 11 used to run `git checkout main && git merge` in $ROOT — the very
+             # working copy the human is typing in. Once, git aborted itself on a dirty
+             # tree and saved 55 uncommitted lines. That was luck, not design: the loop
+             # runs unattended at night. Merging belongs in its own worktree, and a dirty
+             # $ROOT is the proof that somebody else is using the tree.
+             # In a multi-repo project $ROOT is not itself a git repo (repos: [a, b]).
+             # `git -C "$ROOT" status` then failed, `|| true` swallowed the error, dirty
+             # came out empty, and the guard never fired — in exactly the case it exists
+             # to protect. Look at the working copy of the TASK'S repo instead, the same
+             # lookup as worktree/pr/cleanup.
+             repo=$(req GET "/tasks/$t" | jq -r '.repo // empty')
+             wc="$ROOT"; [ -n "$repo" ] && [ "$repo" != "." ] && wc="$ROOT/$repo"
+             # `repo` is free text on the task and does not always match the manifest: if
+             # it says "next" while the manifest says repos: ['.'], $ROOT/next points at
+             # nothing. Fall back to $ROOT before concluding that the guard is blind.
+             git -C "$wc" rev-parse --git-dir >/dev/null 2>&1 || wc="$ROOT"
+             # No `|| true`: if $wc is not a git repo the guard is blind — and a blind
+             # guard must say so loudly, not let the merge through silently.
+             dirty=$(git -C "$wc" status --porcelain 2>&1) \
+               || die "$wc is not a git repo — the guard against a dirty working copy cannot run:
+$dirty"
+             if [ -n "$dirty" ] && [ -z "${BOARD_ALLOW_DIRTY_ROOT:-}" ]; then
+               die "$wc has uncommitted changes — never merge in the tree somebody else is working in.
+Create a dedicated merge worktree:  git worktree add \"\$ROOT/../$PROJECT-worktrees/merge\" main
+and run the merge and push from there. Dirty right now:
+$dirty"
+             fi
+             req POST "/tasks/$t/merge_requested" "$(with_agent "$(body)")" ;;
+    merged) eval "$("$MANIFEST" --sh)"
+            # The sha is computed by the very agent that just merged, and the board has
+            # no working copy to check it against. An aborted merge leaves MW on
+            # origin/main — HEAD is then an ancestor, but the task branch never landed.
+            # Both must be verified (the same predicate as reference/takeover.md).
+            # The git dir is $ROOT/$repo, like worktree/pr/cleanup — not $ROOT.
+            # If the repo is missing: fail closed, never skip.
+            sha=$(jq -r '.sha // empty' <<<"$(body)")
+            [ -n "$sha" ] || die "board task merged $t --sha <sha>"
+            info=$(req GET "/tasks/$t")
+            repo=$(jq -r '.repo // empty' <<<"$info")
+            br=$(jq -r '.branch // empty' <<<"$info"); [ -z "$br" ] && br="task/$t"
+            [ -z "$repo" ] && repo=$(echo "$REPOS" | awk '{print $1}')
+            gitdir="$ROOT/$repo"
+            # The task's `repo` is free text and does not always match the manifest's
+            # `repos`. If $ROOT is itself the repo (repos: ['.']), $ROOT/<name> is a
+            # directory that does not exist — fall back rather than refuse a merge that
+            # did land.
+            git -C "$gitdir" rev-parse --git-dir >/dev/null 2>&1 || gitdir="$ROOT"
+            git -C "$gitdir" rev-parse --git-dir >/dev/null 2>&1 \
+              || die "neither $ROOT/$repo nor $ROOT is a git repo — cannot verify that the merge landed"
+            git -C "$gitdir" fetch -q origin main 2>/dev/null || true
+            git -C "$gitdir" merge-base --is-ancestor "$sha" origin/main 2>/dev/null \
+              || die "$sha is not on origin/main — the merge did not land. Never report merged on a sha you cannot point to; see reference/takeover.md, the re-land section."
+            # The branch is an ancestor only for a merge commit. squash and rebase create
+            # NEW commits, so the ancestor test would have refused every single squash
+            # merge — and squash is the strategy we actually use. The forge, not the
+            # graph, is then the source of truth for whether the PR landed.
+            if ! git -C "$gitdir" merge-base --is-ancestor "$br" origin/main 2>/dev/null; then
+              prnum=$(jq -r '.pr // empty' <<<"$info" | grep -oE '[0-9]+$')
+              state=""
+              # tea/gh need to know which repo: without --repo they fail with "remote
+              # repository required" when we are not standing in the repo, and the guard
+              # would have refused a merge that really landed.
+              # Slug from the git remote: `repo` can be "." (repos: ['.']) and would then
+              # give "org/.", which is no repo at all. The remote is the truth about where
+              # we are.
+              slug=$(git -C "$gitdir" remote get-url origin 2>/dev/null \
+                     | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')
+              [ -n "$slug" ] || slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
+              [ -n "$prnum" ] && case "$FORGE_KIND" in
+                github) state=$(gh pr view "$prnum" --repo "$slug" --json state -q .state 2>/dev/null) ;;
+                *)      # API, not text output: `tea pr` prints "(closed)" for a merged
+                        # PR, so grepping for "merged" misses every squash.
+                        tok=$(python3 -c "import yaml,os,sys
+c=yaml.safe_load(open(os.path.expanduser('~/.config/tea/config.yml')))
+print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude}'), ''))" 2>/dev/null)
+                        [ -n "$tok" ] && [ "$(curl -s -m 10 -H "Authorization: token $tok" \
+                             "$FORGE_URL/api/v1/repos/$slug/pulls/$prnum" \
+                             | jq -r '.merged // false')" = true ] && state=MERGED ;;
+              esac
+              [ "${state^^}" = MERGED ] \
+                || die "$br is neither an ancestor of origin/main nor a merged PR — the merge did not land. See reference/takeover.md, the re-land section."
+            fi
+            req POST "/tasks/$t/merge_verified" "$(with_agent "$(body)")"
+            if git -C "$gitdir" show-ref --verify -q "refs/heads/main" && git -C "$gitdir" show-ref --verify -q "refs/remotes/origin/main"; then
+              cur_b=$(git -C "$gitdir" branch --show-current 2>/dev/null || echo "")
+              if [ "$cur_b" = "main" ]; then
+                git -C "$gitdir" diff --quiet 2>/dev/null && git -C "$gitdir" merge --ff-only origin/main >/dev/null 2>&1 || true
+              else
+                git -C "$gitdir" branch -f main origin/main >/dev/null 2>&1 || true
+              fi
+            fi ;;
+    done)   req POST "/tasks/$t/done" "$(with_agent "$(body)")"; rm -f "$CACHE/$CURRENT" ;;
+    archive) [ -n "$t" ] || die "usage: board task archive <id> [note]"
+            req POST "/tasks/$t/archive" "$(with_agent "$(body note "${POS[1]:-}")")"; rm -f "$CACHE/$CURRENT" ;;
+    release) req POST "/tasks/$t/release" "$(with_agent "$(body)")"; rm -f "$CACHE/$CURRENT" ;;
+    show)   r=$(req GET "/tasks/$t") || { echo "$r"; exit 1; }
+            jq -e '.json' >/dev/null <<<"$(body)" && { echo "$r"; exit 0; }
+            jq -r '
+              def prn:
+                if (.pr // "") == "" then "—"
+                else
+                  .pr as $p |
+                  (if ($p | startswith("http")) or ($p | contains("/"))
+                   then ($p | sub("/$";"") | split("/") | last)
+                   elif ($p | contains("#")) then ($p | split("#") | last)
+                   else $p end) as $n | "#" + $n
+                end;
+              "\(.id)  \(.title // "")",
+              "status=\(.status)  phase=\(.phase // "—")  risk=\(.risk // "normal")  prio=\(.priority // "—")",
+              "owner  \(.owner // "—")  \(.owner_status // "")",
+              "repo   \(.repo // "—")  branch \(.branch // "—")",
+              "PR     \(prn)  review \(.review_open // "—") open / \(.review_fixed // "—") fixed",
+              "merge  \(.merge_sha // "—")",
+              "worktree \(.worktree // "—")",
+              "",
+              "timeline",
+              (if ((.events // []) | length) == 0 then "  (empty)"
+               else .events[] | "  \(.ts)  \(.type)  \(.actor)\(if .note then "  \(.note)" else "" end)"
+               end),
+              "",
+              (if .owner_agent then
+                "owner\n  heartbeat \(.owner_agent.last_seen // "—")\n  ctx \(.owner_agent.ctx_pct // 0)  quota \([(.owner_agent.budget//{})|to_entries[]|"\(.key):\(.value)"]|join(" "))"
+               else "owner  (none)" end)
+            ' <<<"$r" ;;
+    patch)  req PATCH "/tasks/$t" "$(with_agent "$(body)")" ;;
+    deployed) req POST "/tasks/$t/deployed" "$(with_agent "$(body)")" ;;
+    comment) # free text on a task. The human token makes the human the sender.
+            req POST "/tasks/$t/comment" "$(with_agent "$(body text "${POS[1]:-}")")" ;;
+    deploy) # run the manifest's deploy.<env> and report it. No deploy in the manifest: say so.
+            env=$(jq -r '.env // "dev"' <<<"$(body)")
+            c=$("$MANIFEST" | jq -r --arg e "$env" '.deploy[$e] // empty')
+            [ -n "$c" ] || die "the manifest has no deploy.$env"
+            echo "$c" | bash || die "deploy failed — not reported"
+            req POST "/tasks/$t/deployed" "$(with_agent "$(jq -nc --arg e "$env" '{env:$e}')")" ;;
+    search) q_term="${POS[0]:-}"
+            [ -n "$q_term" ] || die "usage: board task search <word>"
+            shift || true
+            "$0" task list --search "$q_term" "$@" ;;
+    list)   b=$(body); p=$(jq -r '.project // empty' <<<"$b"); st=$(jq -r '.status // empty' <<<"$b")
+            q_term=$(jq -r '.search // .q // empty' <<<"$b")
+            all_flag=$(jq -r '.all // empty' <<<"$b")
+            exclude_st=$(jq -r '.exclude_status // .exclude // empty' <<<"$b")
+            [ -z "$p" ] && p=$("$MANIFEST" 2>/dev/null | jq -r '.project // empty')
+            qs="project=$p"
+            [ -n "$st" ] && qs="$qs&status=$st"
+            [ -n "$exclude_st" ] && qs="$qs&exclude_status=$exclude_st"
+            [ -n "$q_term" ] && qs="$qs&q=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$q_term")"
+            [ -n "$all_flag" ] && [ "$all_flag" != "false" ] && qs="$qs&all=1"
+            r=$(req GET "/tasks?$qs")
+            jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
+            # Agent ids are <harness>-<host>-<rand>; the host is noise in a list, so it is
+            # dropped generically rather than by matching one machine's name.
+            jq -r '.tasks[]? | "\(.id) \(.status) \(.owner//"-"|sub("^(?<h>[a-z]{2})-[^-]+-"; .h+"-")) \(if .pr then "#"+(.pr|split("/")|last) else "-" end) \(.title[0:56])"' <<<"$r" ;;
+    worktree)
+            manifest_sh
+            info=$(req GET "/tasks/$t") || { echo "$info"; exit 1; }
+            fresh_or_die "$info"
+            repo=$(jq -r '.repo // empty' <<<"$info")
+            br=$(jq -r '.branch // empty' <<<"$info"); [ -z "$br" ] && br="task/$t"
+            [ -z "$repo" ] && repo=$(echo "$REPOS" | awk '{print $1}')
+            wt=$(python3 -c "
+import importlib.util as u,sys
+s=u.spec_from_file_location('m','$MANIFEST'); m=u.module_from_spec(s); s.loader.exec_module(m)
+print(m.worktree_path(m.load(m.find('$ROOT')), '$repo', '$br'))")
+            rd=$(repo_dir "$repo") || exit 1
+            git -C "$rd" fetch origin >/dev/null 2>&1
+            if git -C "$rd" show-ref --verify -q "refs/heads/main" && git -C "$rd" show-ref --verify -q "refs/remotes/origin/main"; then
+              cur_b=$(git -C "$rd" branch --show-current 2>/dev/null || echo "")
+              if [ "$cur_b" = "main" ]; then
+                git -C "$rd" diff --quiet 2>/dev/null && git -C "$rd" merge --ff-only origin/main >/dev/null 2>&1 || true
+              else
+                git -C "$rd" branch -f main origin/main >/dev/null 2>&1 || true
+              fi
+            fi
+            if [ -d "$wt" ]; then
+              git -C "$wt" fetch origin >/dev/null 2>&1
+              if git -C "$wt" diff --quiet 2>/dev/null && [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+                git -C "$wt" merge origin/main --no-edit >/dev/null 2>&1 || git -C "$wt" merge --abort >/dev/null 2>&1 || true
+              fi
+              echo "{\"worktree\":\"$wt\",\"existing\":true}"
+            else
+              # The path on the board may belong to ANOTHER machine. The directory then
+              # does not exist here, but the work does — it was pushed. Build the worktree
+              # from the branch, not from main: `-b <br> origin/main` gave an empty branch
+              # and silently threw away everything that was on it.
+              if git -C "$rd" show-ref --verify -q "refs/heads/$br"; then
+                git -C "$rd" worktree add "$wt" "$br" >&2 || exit 1; base=local
+              elif git -C "$rd" show-ref --verify -q "refs/remotes/origin/$br"; then
+                git -C "$rd" worktree add --track -b "$br" "$wt" "origin/$br" >&2 || exit 1
+                base=origin
+              else
+                git -C "$rd" worktree add -b "$br" "$wt" origin/main >&2 || exit 1; base=main
+              fi
+              if [ "$base" != "main" ] && git -C "$wt" diff --quiet 2>/dev/null && [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+                git -C "$wt" merge origin/main --no-edit >/dev/null 2>&1 || git -C "$wt" merge --abort >/dev/null 2>&1 || true
+              fi
+              echo "{\"worktree\":\"$wt\",\"branch\":\"$br\",\"base\":\"$base\"}"
+            fi
+            req POST "/tasks/$t/progress" "$(with_agent "$(jq -nc --arg w "$wt" --arg b "$br" \
+              '{worktree:$w, branch:$b, note:"worktree created"}')")" >/dev/null ;;
+    pr)     manifest_sh
+            info=$(req GET "/tasks/$t"); fresh_or_die "$info"
+            repo=$(jq -r '.repo // empty' <<<"$info")
+            wt=$(jq -r '.worktree // empty' <<<"$info"); br=$(jq -r '.branch // empty' <<<"$info")
+            [ -d "$wt" ] || die "no worktree on $t — run board task worktree $t"
+            git -C "$wt" push -u origin "$br" >&2 || exit 1
+            title=$(jq -r '.title' <<<"$info")
+            slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
+            case "$FORGE_KIND" in
+              github) out=$(cd "$wt" && gh pr create ${slug:+--repo "$slug"} --title "$title" --body "$t" --head "$br" 2>&1) ;;
+              *)      out=$(cd "$wt" && tea pr create ${slug:+--repo "$slug"} --title "$title" --description "$t" --head "$br" 2>&1) ;;
+            esac
+            # Without this the error text ("pull request already exists...") ended up in
+            # tasks.pr, and gate/merge went on pointing at a string that is not a URL. A PR
+            # that already exists is moreover the normal case when taking over an orphaned
+            # task — the answer is then the existing URL, not an error.
+            url=$(grep -oE 'https?://[^[:space:]"]+/pulls?/[0-9]+' <<<"$out" | tail -1 || true)
+            if [ -z "$url" ]; then
+              case "$FORGE_KIND" in
+                github) url=$(cd "$wt" && gh pr view "$br" ${slug:+--repo "$slug"} --json url -q .url 2>/dev/null || true) ;;
+                *)      url=$(cd "$wt" && tea pr list ${slug:+--repo "$slug"} --fields head,url --output json 2>/dev/null \
+                              | jq -r --arg b "$br" '.[]|select(.head==$b)|.url' | head -1) ;;
+              esac
+              [ -n "$url" ] || die "could not create or find a PR for $br: $out"
+            fi
+            echo "$url"
+            req POST "/tasks/$t/progress" "$(with_agent "$(jq -nc --arg p "$url" '{pr:$p, note:"PR created"}')")" >/dev/null ;;
+    cleanup)
+            info=$(req GET "/tasks/$t"); fresh_or_die "$info"
+            wt=$(jq -r '.worktree // empty' <<<"$info")
+            br=$(jq -r '.branch // empty' <<<"$info"); sha=$(jq -r '.merge_sha // empty' <<<"$info")
+            [ -n "$sha" ] || die "$t is not merged (merge_sha is missing) — not cleaning up"
+            repo=$(jq -r '.repo // empty' <<<"$info"); manifest_sh
+            rd=$(repo_dir "$repo") || exit 1
+            [ -n "$wt" ] && git -C "$rd" worktree remove --force "$wt" 2>&1
+            [ -n "$br" ] && git -C "$rd" branch -D "$br" 2>&1
+            echo "{\"cleaned\":\"$t\"}" ;;
+    *) die "unknown: board task $sub" ;;
+  esac ;;
+
+gate)
+  what="${1:-merge}"; t="${2:-$(cat "$CACHE/$CURRENT" 2>/dev/null)}"
+  r=$(req GET "/tasks/$t/gate/$what?agent=$(agent_id)"); echo "$r"
+  # A gate answer from cache is not an answer. Everything else in the CLI fails open; this
+  # one fails closed, because the consequence is a merge nobody approved.
+  jq -e '.stale // false' >/dev/null <<<"$r" && { echo "gate: the answer came from cache — refusing" >&2; exit 1; }
+  jq -e '.ok // false' >/dev/null <<<"$r" ;;
+
+ask)
+  parse "$@"
+  b=$(body text "${POS[0]:-}")
+  req POST /questions "$(with_agent "$(with_project "$b")")" ;;
+
+answer)
+  q="${1:?board answer Q-9 \"answer\"}"; a="${2:-}"; shift 2 || true; parse "$@"
+  # BOARD_WHO names the sender. Unset it is the board's human identity (BOARD_HUMAN on the
+  # server, default "human"); an agent answering under its own id sets BOARD_WHO=<agent-id>.
+  req POST "/questions/$q/answer" "$(jq -nc --arg a "$a" --arg by "${BOARD_WHO:-${BOARD_HUMAN:-human}}" \
+    --arg n "$(jq -r '.note // ""' <<<"$(body)")" '{answer:$a,by:$by,note:$n}')" ;;
+
+message)
+  to="${1:?board message <agent> --text \"...\"}"; shift; parse "$@"
+  req POST /messages "$(with_agent "$(body to "$to")")" ;;
+
+test)
+  sub="${1:-}"; shift || true; parse "$@"
+  case "$sub" in
+    request) t="${POS[0]:-}"; f=$(jq -r '.card_file // empty' <<<"$(body)")
+             [ -n "$f" ] || die "board test request T-42 --card-file card.json"
+             card=$(slurp "$f") || exit 2
+             jq -e . >/dev/null 2>&1 <<<"$card" || die "the card file is not valid JSON: $f"
+             req POST /questions "$(jq -c --arg t "$t" --arg a "$(agent_id)" \
+               --arg p "$(project_name "$(jq -r '.project // empty' <<<"$card")")" --argjson c "$card" \
+               '{kind:"test", task:$t, agent:$a, project:$p, card:$c}' <<<'{}')" ;;
+    *) die "board test request T-42 --card-file card.json" ;;
+  esac ;;
+
+test-level)
+  # Phase × change class (DESIGN.md §5). The class is derived from the diff, not from judgement.
+  t="${1:?board test-level T-42}"
+  manifest_sh
+  info=$(req GET "/tasks/$t"); wt=$(jq -r '.worktree // empty' <<<"$info")
+  files=$(git -C "${wt:-$ROOT}" diff --name-only origin/main 2>/dev/null)
+  class=ui
+  grep -qE '\.(ts|kt|java|py|go)$' <<<"$files" && class=logic
+  grep -qE '(openapi|\.proto$|dto|routes?/.*\+server)' <<<"$files" && class=contract
+  grep -qE '(migration|flyway|\.sql$)' <<<"$files" && class=data
+  grep -qE '(helm|k8s|\.ya?ml$|Dockerfile|\.forgejo|\.github)' <<<"$files" && class=infra
+  grep -qiE '(payment|auth|keycloak|billing|stripe)' <<<"$files" && class=money-auth
+  risk=$(jq -r '.risk // "normal"' <<<"$info")
+  case "$PHASE:$class" in
+    idea:*)                      lvl=auto; env=mock ;;
+    build:data|build:money-auth) lvl=human; env=dev ;;
+    build:*)                     lvl=auto; env=dev ;;
+    launch:contract|launch:data|launch:money-auth) lvl=human; env=dev ;;
+    launch:infra)                lvl=human; env=dev ;;
+    launch:*)                    lvl=auto; env=dev ;;
+    live:ui)                     lvl=auto; env=dev ;;
+    live:*)                      lvl=human; env=dev ;;
+  esac
+  [ "$risk" = high ] && [ "$PHASE" != idea ] && lvl=human
+  # Phase×class says what SHOULD be tested. `auto` additionally requires two things the
+  # table knows nothing about: that the agent CAN run it, and that an automatic test for
+  # the surface EXISTS. If either is missing, auto means in practice that nobody looks at
+  # it — and then the answer is human. This holds for every project, not just this one.
+  # HTML/CSS is a surface a human looks at. `how` can prove that the API works, never that
+  # the page looks right — so visual changes always go to a human.
+  diffbody=$(git -C "${wt:-$ROOT}" diff origin/main 2>/dev/null | grep '^[+-]' | head -400)
+  if grep -qE '\.(html|css|scss|svelte|vue|tsx|jsx)$' <<<"$files" \
+     || grep -qE '<style|</?(div|table|form|button|h[1-9])|class=|CSS = ' <<<"$diffbody"; then
+    lvl=human; why="the change touches a visual surface; an automatic test does not cover appearance"
+  fi
+  if [ "$lvl" = auto ]; then
+    # Same fallback as before (env, otherwise mock), but we take the WHOLE environment,
+    # not just .how — `requires` must come from the environment the test actually runs in.
+    envjson=$("$MANIFEST" | jq -c --arg e "$env" \
+      '[.environments[$e], .environments.mock] | map(select(.!=null and .how!=null)) | first // {}')
+    how=$(jq -r '.how // empty' <<<"$envjson")
+    # What the test requires is a property of the TEST, not an assumption in the CLI:
+    # ./conformance.sh needs no browser, `pnpm test:e2e` does. An omitted `requires:`
+    # keeps the old behaviour (browser-test) — T-142.
+    need=$(jq -r '(.requires // ["browser-test"])[]' <<<"$envjson")
+    if [ -z "$how" ]; then lvl=human; why="the manifest does not say how this surface is tested automatically"
+    else
+      have=$(req GET "/status" | jq -r --arg a "$(agent_id)" \
+        '[.projects[].agents[]?|select(.id==$a)|.capabilities]|first // "[]"')
+      for cap in $need; do
+        # playwright counts as browser-test; otherwise the name is the name.
+        case "$cap" in browser-test) pat='browser-test\|playwright' ;; *) pat="$cap" ;; esac
+        grep -q "$pat" <<<"$have" || { lvl=human; why="the agent lacks $cap"; break; }
+      done
+    fi
+  fi
+  jq -nc --arg l "$lvl" --arg c "$class" --arg e "$env" --arg p "$PHASE" \
+     --arg w "${why:-}" --arg h "${how:-}" \
+     '{level:$l, class:$c, env:$e, phase:$p} + (if $w=="" then {} else {why:$w} end)
+      + (if $h=="" then {} else {how:$h} end)' ;;
+
+tests)
+  parse "$@"; p=$(jq -r '.project // empty' <<<"$(body)")
+  req GET "/questions?kind=test&status=open${p:+&project=$p}" ;;
+
+role)
+  sub="${1:-}"; shift || true; parse "$@"
+  role="${POS[0]:-coordinator}"; b=$(body)
+  proj=$(project_name "$(jq -r '.project // empty' <<<"$b")")
+  [ -n "$proj" ] || die "no project found — run this inside a project that has project.yaml, or use --project"
+  case "$sub" in
+    pin)   a=$(jq -r '.agent // empty' <<<"$b"); [ -z "$a" ] && a=$(agent_id)
+           req PUT "/roles/$role" "$(jq -nc --arg p "$proj" --arg a "$a" '{project:$p,agent:$a}')" ;;
+    unpin) req DELETE "/roles/$role?project=$proj" ;;
+    claim) req POST "/roles/$role/claim" "$(jq -nc --arg p "$proj" --arg a "$(agent_id)" '{project:$p,agent:$a}')" ;;
+    recommend) req GET "/roles/recommendation?project=$proj&role=$role" ;;
+    *) die "board role pin|unpin|claim|recommend [role]" ;;
+  esac ;;
+
+pause|resume)
+  parse "$@"; b=$(body)
+  p=$(project_name "$(jq -r '.project // empty' <<<"$b")")
+  [ -n "$p" ] || die "no project found — run this inside a project that has project.yaml, or use --project"
+  req POST "/projects/$p/$cmd" "$(jq -c --arg n "${POS[0]:-}" --arg by "${BOARD_WHO:-${BOARD_HUMAN:-human}}" \
+    '. + {note:$n, by:$by}' <<<"$b")" ;;
+
+status)
+  parse "$@"; b=$(body); p=$(jq -r '.project // empty' <<<"$b")
+  [ -z "$p" ] && p=$("$MANIFEST" 2>/dev/null | jq -r '.project // empty')
+  r=$(req GET "/status${p:+?project=$p}")
+  # Terse is the default (DESIGN.md §6.2 point 3). Full JSON measured 7874 tokens — the
+  # entire per-task budget from §6.5 for ONE status call. One line per row is ~20x smaller.
+  # .me is not terse: the stop rules need budget + the agent's own row as JSON.
+  if ! jq -e '.json // .md // .me' >/dev/null <<<"$b"; then
+    jq -r '.projects[] |
+      "\(.name) \(.phase)\(if .paused then " PAUSED: "+.paused else "" end)",
+      (.agents[]? | "  \(.id) \(.status) \(.model//"?"|sub("claude-";"")) ctx\(.ctx_pct//0|floor) \([(.budget//[])[]|"\(.window):\(.used_pct//0|floor)"]|join(" ")) \(.current_task//"-") \(.roles|join(","))"),
+      (.tasks[]? | select(.status != "done" and .status != "archived") | "  \(.id) \(.status) \(.owner//"-"|sub("^(?<h>[a-z]{2})-[^-]+-"; .h+"-")) \(.title[0:52])"),
+      (.questions[]? | "  ? \(.id) \(.kind) \(.task//"-") \((.text//"test card")[0:52])")' <<<"$r"
+    exit 0
+  fi
+  if jq -e '.md' >/dev/null <<<"$b"; then
+    jq -r '.projects[] | "# \(.name) · phase \(.phase)\n\n\(.goal // "")\n\n## Agents\n\n| agent | status | model | ctx | quota | task |\n|---|---|---|---|---|---|\n" + ([.agents[] | "| \(.id) | \(.status) | \(.model // "") | \(.ctx_pct // "") | \([(.budget//[])[]|"\(.window) \(.used_pct//0)%"]|join(" ")) | \(.current_task // "") |"] | join("\n")) + "\n\n## Tasks\n\n| id | status | repo | owner | title |\n|---|---|---|---|---|\n" + ([.tasks[] | select(.status != "archived") | "| \(.id) | \(.status) | \(.repo // "") | \(.owner // "") | \(.title) |"] | join("\n")) + "\n\n## Open questions\n\n" + ([.questions[] | "- \(.id) (\(.kind)) \(.text // .task)"] | join("\n")) + "\n\n## The board answered itself (can be overridden)\n\n" + ([.questions_defaulted[] | "- \(.id) (\(.kind)) \(.text // .task) → \(.answer)"] | join("\n"))' <<<"$r"
+  elif jq -e '.me' >/dev/null <<<"$b"; then
+    # The stop rules are read from here. `.stop` is the board's finished answer — if it is
+    # set you must stop, and the text is the reason. budget.windows is the HIGHEST per
+    # window name across all agents (quota is per account), budget.ceilings is the human's
+    # ceilings from the policy.
+    # We pick the project the agent is ACTUALLY in, not .projects[0] — without a manifest
+    # (from $HOME, before checkout) projects[0] is merely the alphabetically first. And if
+    # we do not find the agent it must blow up: empty output with exit 0 reads as "no data,
+    # carry on", the most permissive outcome in precisely the command the stop rules rest
+    # on.
+    a=$(agent_id)
+    me=$(jq -c --arg a "$a" 'first(.projects[] | select(.agents|any(.id==$a)))
+      | {project:.name, phase:.phase, budget:.budget,
+         agent:(.agents[]|select(.id==$a))} | .stop = .agent.stop' <<<"$r")
+    [ -n "$me" ] || die "could not find agent '${a:-<no id>}' on the board${p:+ (project $p)} — \
+register with 'board register', or run from a directory that has project.yaml"
+    echo "$me"
+  else echo "$r"; fi ;;
+
+tail)
+  parse "$@"; s=$(jq -r '.since // "0"' <<<"$(body)")
+  req GET "/events?since=$s" ;;
+
+open)
+  qr=false; what=status
+  for a in "$@"; do case "$a" in --qr) qr=true;; *) what="$a";; esac; done
+  url="$BOARD_URL/${what#/}"
+  case "$url" in *\?*) url="$url&t=$BOARD_TOKEN";; *) url="$url?t=$BOARD_TOKEN";; esac
+  # The token is 43 characters — impossible to type on a phone. With qrencode installed
+  # the phone scans the one-time link and gets the cookie for 90 days.
+  if $qr || ! command -v xdg-open >/dev/null; then
+    command -v qrencode >/dev/null || die "qrencode is missing: apt install qrencode"
+    qrencode -t ANSIUTF8 -m 1 "$url"
+    echo "Scan → $BOARD_URL/${what#/} (the one-time token becomes a cookie for 90 days)"
+  else
+    xdg-open "$url" >/dev/null 2>&1 &
+    echo "opening $BOARD_URL/${what#/} (one-time token → cookie for 90 days)"
+  fi ;;
+
+help|-h|--help)
+  if [ -n "${1:-}" ]; then
+    grep -n "^$1)" "$0" >/dev/null && sed -n "/^$1)/,/;;$/p" "$0" | head -20 \
+      || die "unknown command: $1"
+  else
+    sed -n '2,4p' "$0"; echo
+    grep -oP '^[a-z][a-z-]*(?=\)$)' "$0" | tr '\n' ' '; echo
+    echo "board help <command> for details"
+  fi ;;
+*) die "unknown command: $cmd (board help)" ;;
+esac

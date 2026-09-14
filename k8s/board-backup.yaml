@@ -1,0 +1,50 @@
+# Daily backup of the board. One SQLite file on a local PVC is the entire memory for every
+# project: tasks, specs, review findings, questions and the event log. If the node goes, it
+# all goes. DESIGN.md §10 said "copy the file"; this is that copy.
+#
+# `.backup` rather than `cp`: a SQLite file copied while a write is in flight is corrupt.
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: board-backup, namespace: board }
+spec:
+  schedule: "0 3 * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext: { runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001 }
+          containers:
+            - name: backup
+              image: python:3.12-alpine
+              command: ["/bin/sh","-c"]
+              args:
+                - |
+                  set -e
+                  D=$(date -u +%Y%m%d)
+                  python3 -c "
+                  import sqlite3, sys
+                  s = sqlite3.connect('/data/board.db')
+                  d = sqlite3.connect('/backup/board-$D.db')
+                  s.backup(d); d.close(); s.close()
+                  "
+                  gzip -f "/backup/board-$D.db"
+                  # 14 days. The board is small files; it is lost HISTORY that costs.
+                  find /backup -name 'board-*.db.gz' -mtime +14 -delete
+                  ls -la /backup | tail -5
+              volumeMounts:
+                - { name: data, mountPath: /data, readOnly: true }
+                - { name: backup, mountPath: /backup }
+          volumes:
+            - { name: data, persistentVolumeClaim: { claimName: board-data } }
+            - { name: backup, persistentVolumeClaim: { claimName: board-backup } }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: board-backup, namespace: board }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 2Gi } }

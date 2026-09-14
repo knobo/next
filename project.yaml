@@ -1,0 +1,39 @@
+# The project manifest. `/next` finds this by searching upwards from the working
+# directory, exactly as git finds .git — see bin/manifest.py (DESIGN.md §3.2b).
+#
+# This is `next`'s own manifest, so the loop can run on itself. A new project gets one
+# with `board project init`.
+project: next
+# idea | build | launch | live. The phase drives the merge gate, the test level and
+# whether a prod deploy is allowed. It has no default: an agent must not be able to end
+# up with milder rules because something is missing (DESIGN.md §10).
+phase: build
+goal: An agentic development loop plus a coordination board for several AI agents across
+  several machines and several projects.
+entry: docs/next-prompt.md
+docs: docs/
+onboarding: README.md
+forge:
+  # kind: forgejo | github. `board task pr` uses `tea` for forgejo and `gh` for github.
+  kind: github
+  url: https://github.com
+  org: knobo
+  login: knobo
+deploy:
+  # `board task deploy <T>` runs this and records it; `done` is refused without it.
+  # k8s/deploy.sh substitutes the placeholders in k8s/board.yaml from board.env — see
+  # board.env.example. The board-policy ConfigMap is deliberately never applied by a
+  # deploy: it is the owner's living decision surface, hand-edited on the host between
+  # deploys, and a copy in the repo would silently roll back any ceiling set since the
+  # last commit.
+  dev: ./k8s/deploy.sh
+environments:
+  # `how` is the automatic test for this surface. For `next`, conformance.sh IS the
+  # surface: 219 checks against the whole API, and it starts its own instance — it never
+  # touches a running board. Without this line, `board test-level` returns `human` for
+  # every logic change, even though the acceptance criterion is sitting in the repo.
+  mock:
+    how: ./conformance.sh
+  dev:
+    url: https://board.example.com
+    login: 'one-time link: board open'

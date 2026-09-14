@@ -1,0 +1,84 @@
+{
+ "_bootstrap": "Starting point for an EMPTY cluster, not the source of truth. The truth is the ConfigMap in the cluster — a deploy never applies this file. See k8s/board.yaml.",
+ "_comment": "`demo` is the fixture the conformance suite runs against — it must exist in any board the suite is to test. Everything else here is an example: replace the project names with your own.",
+ "grants": {
+  "demo": {
+   "claude-code@*": [
+    "merge",
+    "deploy-dev"
+   ],
+   "antigravity@*": [
+    "merge",
+    "deploy-dev"
+   ],
+   "codex@*": [
+    "deploy-dev"
+   ],
+   "*": []
+  },
+  "_example-project": {
+   "_comment": "Grants are per (harness@host, project). `harness@*` is any machine; `*` is the fallback for everyone else. An agent can never grant itself anything — DESIGN.md §3.7.",
+   "claude-code@my-laptop": [
+    "merge",
+    "deploy-dev"
+   ],
+   "codex@*": [
+    "deploy-dev"
+   ],
+   "*": []
+  },
+  "*": {
+   "*": []
+  }
+ },
+ "limits": {
+  "*": {
+   "unreviewed": 5
+  }
+ },
+ "_budget": "Ceilings per QUOTA WINDOW, using the window name the harness itself reports (5h/7d for Claude Code). The owner's decision — if the ceiling for a window an agent reports is missing, that agent stops. `fallback` applies to harnesses that do not report quota at all: max tasks per session.",
+ "budget": {
+  "demo": {
+   "ceilings": {
+    "5h": 85,
+    "7d": 90
+   },
+   "fallback": {
+    "max_tasks": 5
+   }
+  },
+  "*": {
+   "ceilings": {
+    "5h": 85,
+    "7d": 60
+   },
+   "fallback": {
+    "max_tasks": 5
+   }
+  }
+ },
+ "roles": {
+  "coordinator": {
+   "singleton": true,
+   "requires": [
+    "merge"
+   ],
+   "prefer_model": [
+    "fable",
+    "opus",
+    "sonnet"
+   ]
+  },
+  "reviewer": {
+   "requires": []
+  },
+  "tester": {
+   "requires": [
+    "browser-test"
+   ]
+  },
+  "implementer": {
+   "requires": []
+  }
+ }
+}
