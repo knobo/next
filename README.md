@@ -19,7 +19,7 @@ constraints, and the comments explain *why* each one exists — usually because 
 broke something.
 
 **This is an experiment, not a product.** It runs, it has 219 conformance checks, and it has been
-used in anger — but it is a single-owner research setup that has been generalized for
+doing real work daily — but it is a single-owner research setup that has been generalized for
 publication, not a system with a support commitment. See [Status and honesty](#status-and-honesty).
 
 ---
