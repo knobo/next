@@ -8,6 +8,21 @@ set -uo pipefail
 # The token is fetched from `pass` when it is not in the environment — that spares every
 # session the env plumbing.
 : "${BOARD_TOKEN:=$(pass board/token 2>/dev/null | head -1)}"
+# Is an agent SESSION running here? That is a different question from "which harness is
+# this", and conflating the two broke the human token (T-390).
+#
+# Only an environment variable is evidence that a harness is EXECUTING this: each one
+# exports its own into the shell it runs. The filesystem probes further down are a
+# last-resort fallback for NAMING a harness — `~/.codex` existing means codex is
+# installed, not that codex is running. On a machine with two harnesses installed, those
+# probes matched in the human's own interactive terminal, so `pass board/human-token` was
+# never read and the human token was unreachable from the CLI entirely: every `board
+# answer` came back needs_human_token, and every `board open --qr` handed the phone an
+# agent login that rendered every page and refused every answer.
+#
+# Captured BEFORE the derivation below, which overwrites BOARD_HARNESS.
+AGENT_SESSION="${BOARD_HARNESS:-}${CLAUDE_CODE_SESSION_ID:-}${ANTIGRAVITY_AGENT:-}${ANTIGRAVITY_CONVERSATION_ID:-}${GROK_SESSION_ID:-}${GROK_CLI:-}${CODEX_SESSION_ID:-}${CODEX_HOME:-}"
+
 # The harness is DERIVED, never guessed. The policy grants per harness@host, so a guess
 # that misses is a silent privilege escalation: a grok agent that registered as
 # claude-code inherited merge and deploy-dev (§3.7 exists to prevent exactly that).
@@ -22,10 +37,12 @@ if [ -z "${BOARD_HARNESS:-}" ]; then
 fi
 
 # The human token separates "the human says" from "an agent claims the human says"
-# (§3.7). It is fetched ONLY when no harness was derived, i.e. in the human's own shell —
-# an agent must never be able to pick it up from `pass` and pin itself as the human.
+# (§3.7). It is fetched ONLY when no agent session is running, i.e. in the human's own
+# shell — an agent must never be able to pick it up from `pass` and pin itself as the
+# human. The invariant is unchanged; what changed is the evidence it rests on, which is
+# now a live session rather than an installed tool (see AGENT_SESSION above).
 : "${BOARD_HUMAN_TOKEN:=}"
-if [ -z "$BOARD_HUMAN_TOKEN" ] && [ -z "${BOARD_HARNESS:-}" ]; then
+if [ -z "$BOARD_HUMAN_TOKEN" ] && [ -z "$AGENT_SESSION" ]; then
   BOARD_HUMAN_TOKEN=$(pass board/human-token 2>/dev/null | head -1)
 fi
 [ -n "$BOARD_HUMAN_TOKEN" ] && BOARD_TOKEN="$BOARD_HUMAN_TOKEN"
@@ -823,6 +840,28 @@ tail)
 open)
   qr=false; what=status
   for a in "$@"; do case "$a" in --qr) qr=true;; *) what="$a";; esac; done
+  # WHICH identity this link hands out. The human token is fetched from `pass` only when
+  # no harness was derived (§3.7), so inside an agent session $BOARD_TOKEN is the AGENT
+  # token — and that is the failure this block exists to prevent. A phone logged in with
+  # an agent token renders every page perfectly: status, the test queue, the answer
+  # buttons. Only when you press one does it refuse, with a raw 403, on a phone. The
+  # login looks like it worked for as long as you are not trying to do anything.
+  if [ -n "$BOARD_HUMAN_TOKEN" ]; then
+    ident="${BOARD_HUMAN:-human} (human — can answer questions and approve merges)"
+  else
+    ident="an agent (read-only for anything that needs a human)"
+  fi
+  # --qr exists for ONE purpose: provisioning a human's phone. An agent has no phone, so
+  # a QR carrying an agent token is never what anyone wanted. Refuse rather than print a
+  # trap. No --force: an escape hatch here would just recreate the trap it prevents, and
+  # the fix is four words long — run it in your own shell.
+  if $qr && [ -z "$BOARD_HUMAN_TOKEN" ]; then
+    die "--qr would hand out $ident.
+A phone logged in as an agent shows every page and refuses every answer.
+Run this in your OWN shell (not inside ${BOARD_HARNESS:-an agent session}), where the
+human token is read from \`pass board/human-token\`:
+    board open ${what#/} --qr"
+  fi
   url="$BOARD_URL/${what#/}"
   case "$url" in *\?*) url="$url&t=$BOARD_TOKEN";; *) url="$url?t=$BOARD_TOKEN";; esac
   # The token is 43 characters — impossible to type on a phone. With qrencode installed
@@ -830,10 +869,12 @@ open)
   if $qr || ! command -v xdg-open >/dev/null; then
     command -v qrencode >/dev/null || die "qrencode is missing: apt install qrencode"
     qrencode -t ANSIUTF8 -m 1 "$url"
-    echo "Scan → $BOARD_URL/${what#/} (the one-time token becomes a cookie for 90 days)"
+    echo "Scan → $BOARD_URL/${what#/}"
+    echo "Signs in as: $ident. The one-time token becomes a cookie for 90 days."
   else
     xdg-open "$url" >/dev/null 2>&1 &
-    echo "opening $BOARD_URL/${what#/} (one-time token → cookie for 90 days)"
+    echo "opening $BOARD_URL/${what#/}"
+    echo "Signs in as: $ident. The one-time token becomes a cookie for 90 days."
   fi ;;
 
 help|-h|--help)

@@ -150,6 +150,42 @@ check "find() from a worktree gives the primary checkout, and the path does not 
   "$(jq -nc --arg o "$WTROOT" '{o:$o}')" \
   '.o=="'"$TMP/mfroot/project.yaml $TMP/mfroot-worktrees/task/T-2"'"'
 
+# T-390: the human token has to be reachable in the human's own shell. It hung on
+# BOARD_HARNESS, which is also derived from FILES ON DISK (~/.codex, ~/.grok) — so on any
+# machine with a second harness installed, the human's own terminal looked like an agent
+# session and `pass board/human-token` was never read. The invariant (an agent can never
+# reach the human token) has to hold on evidence of a live SESSION, not of an install.
+echo "== the human token hangs on a live session, not on an installed tool (T-390) =="
+HSDIR="$TMP/harness-home"; mkdir -p "$HSDIR/.codex" "$HSDIR/.grok"
+echo '{}' > "$HSDIR/.grok/active_sessions.json"
+agent_session_of() {  # env assignments -> the AGENT_SESSION the CLI would compute
+  env -u CLAUDE_CODE_SESSION_ID -u ANTIGRAVITY_AGENT -u ANTIGRAVITY_CONVERSATION_ID \
+      -u GROK_SESSION_ID -u GROK_CLI -u CODEX_SESSION_ID -u CODEX_HOME -u BOARD_HARNESS \
+      HOME="$HSDIR" "$@" bash -c '
+        AGENT_SESSION="${BOARD_HARNESS:-}${CLAUDE_CODE_SESSION_ID:-}${ANTIGRAVITY_AGENT:-}${ANTIGRAVITY_CONVERSATION_ID:-}${GROK_SESSION_ID:-}${GROK_CLI:-}${CODEX_SESSION_ID:-}${CODEX_HOME:-}"
+        [ -n "$AGENT_SESSION" ] && echo agent || echo human'
+}
+[ "$(agent_session_of)" = human ] \
+  && ok "installed ~/.codex and ~/.grok do NOT make the human's shell an agent session" \
+  || no "an installed harness still hides the human token" "$(agent_session_of)"
+[ "$(agent_session_of CLAUDE_CODE_SESSION_ID=x)" = agent ] \
+  && ok "a live claude-code session IS an agent session" || no "live session not detected" ""
+[ "$(agent_session_of CODEX_SESSION_ID=x)" = agent ] \
+  && ok "a live codex session IS an agent session" || no "live codex session not detected" ""
+[ "$(agent_session_of BOARD_HARNESS=grok)" = agent ] \
+  && ok "an explicitly declared harness IS an agent session" || no "explicit harness not detected" ""
+# And the derivation itself must still NAME the harness from those files, so an agent
+# without env vars registers as what it is rather than as nothing.
+DERIVED=$(env -u CLAUDE_CODE_SESSION_ID -u CODEX_SESSION_ID -u CODEX_HOME -u GROK_SESSION_ID \
+  -u GROK_CLI -u BOARD_HARNESS HOME="$HSDIR" bash -c '
+    if [ -z "${BOARD_HARNESS:-}" ]; then
+      if [ -f "$HOME/.grok/active_sessions.json" ]; then BOARD_HARNESS=grok
+      elif [ -d "$HOME/.codex" ]; then BOARD_HARNESS=codex; fi
+    fi; echo "${BOARD_HARNESS:-none}"')
+[ "$DERIVED" = grok ] \
+  && ok "the filesystem probes still name a harness for an agent without env vars" \
+  || no "harness naming regressed" "$DERIVED"
+
 echo "== board without a manifest dies with a message, not unbound variable (T-67) =="
 NOMAN=$(cd "$TMP" && "$SRC/bin/board" test-level T-1 2>&1; echo "rc=$?")
 check "test-level without a manifest: a message, no unbound variable" \
@@ -882,6 +918,31 @@ for p in "/status?t=$TOKEN" "/tests" ${QID:+"/q/$QID"} ${TID:+"/t/$TID"}; do
 done
 code=$(curl -so /dev/null -w '%{http_code}' "$BOARD_URL/status")
 [ "$code" = 401 ] && ok "without a token: 401" || no "without a token it must be 401" "HTTP $code"
+
+# T-390: a page rendered with an agent token looks identical to one rendered with the
+# human token, and then refuses every answer. The identity has to be ON the page, and a
+# refused form has to be a page rather than a JSON blob on a phone.
+AGP=$(curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status")
+grep -q '>agent<' <<<"$AGP" \
+  && ok "an agent-token page says it is signed in as an agent" \
+  || no "the agent-token page does not say which identity it carries" "$(grep -o 'badge-[a-z]*' <<<"$AGP" | sort -u | tr '\n' ' ')"
+if [ "$OWN_SERVER" = 1 ]; then
+  AQ=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"identitet?\"}" | jq -r .id)
+  FORM=$(curl -s -o "$TMP/refused" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+         -H 'Content-Type: application/x-www-form-urlencoded' \
+         -X POST -d 'answer=yes' "$BOARD_URL/q/$AQ/answer")
+  [ "$FORM" = 403 ] && grep -q 'board open' "$TMP/refused" \
+    && ok "a refused form answer is an HTML page that says how to fix it, not JSON" \
+    || no "refused form answer" "HTTP $FORM: $(head -c 120 "$TMP/refused")"
+  grep -q '{"error"' "$TMP/refused" \
+    && no "the refused form still returns raw JSON" "$(head -c 80 "$TMP/refused")" \
+    || ok "the refused form returns no raw JSON"
+  hum POST "/questions/$AQ/answer" '{"answer":"yes","by":"human"}' >/dev/null
+  HP=$(curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status")
+  grep -q ">$(printf %s "${BOARD_HUMAN:-human}")<" <<<"$HP" \
+    && ok "a human-token page says it is signed in as the human" \
+    || no "the human-token page does not name the human" "$(grep -o 'badge-sm badge-[a-z]*>[a-z]*' <<<"$HP" | head -3)"
+fi
 TH=$(curl -sL -c "$J" -b "$J" "$BOARD_URL/t/$TID")
 if grep -q "$TID" <<<"$TH" && grep -q "timeline" <<<"$TH" && grep -q "the owner.s state" <<<"$TH" && grep -q "#201" <<<"$TH"; then
   ok "GET /t/<id> is a task page with a PR number and a timeline"

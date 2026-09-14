@@ -1539,14 +1539,47 @@ def page(title, body):
             "<div class='%s'>%s</div>" % (escape(title), CSS_URL, WRAP, body))
 
 
-def head(title, right="", nav=(("/status", "board"),)):
+def whoami(human):
+    """Which identity the cookie in this browser carries.
+
+    A page rendered with an agent token looks exactly like one rendered with the human
+    token — the same tasks, the same test cards, the same answer buttons — and then
+    refuses every answer. The login appears to have worked right up until the moment you
+    try to use it, which is the worst possible place to find out. So the page says it,
+    always, on the surface where the confusion happens: the phone."""
+    if human:
+        return ("<span class='badge badge-sm badge-ghost'>%s</span>" % escape(HUMAN))
+    return ("<span class='badge badge-sm badge-warning' "
+            "title='signed in as an agent: answers will be refused'>agent</span>")
+
+
+def head(title, right="", nav=(("/status", "board"),), human=False):
     return ("<header class='flex flex-wrap items-baseline gap-x-3 gap-y-1 "
             "border-b-2 border-base-300 pb-3'>"
             "<h1 class='text-xl font-semibold tracking-tight sm:text-2xl'>%s</h1>%s"
-            "<nav class='ml-auto flex gap-4 text-sm'>%s</nav></header>" % (
+            "<nav class='ml-auto flex items-baseline gap-4 text-sm'>%s%s</nav></header>" % (
                 escape(title), right,
                 "".join("<a class='%s' href='%s'>%s</a>" % (LINK, u, escape(t))
-                        for u, t in nav)))
+                        for u, t in nav),
+                whoami(human)))
+
+
+def not_human_page(what):
+    """A refused human action, rendered as a page rather than as raw JSON.
+
+    The API answers `needs_human_token` and that is right for an agent. But /q/<id>/answer
+    and /t/<id>/comment are HTML forms pressed by a person on a phone, and a JSON blob
+    tells them nothing they can act on. Say what is wrong and the one command that fixes
+    it."""
+    return page("signed in as an agent", head("signed in as an agent") + (
+        "<div class='mt-5 max-w-[42rem] rounded-box border border-base-300 border-l-4 "
+        "border-l-warning bg-base-200 p-4'>"
+        "<p class='max-w-[68ch] text-lg leading-snug'>This browser is signed in as an "
+        "<b class='font-semibold'>agent</b>, so %s was refused.</p>"
+        "<p class='%s mt-3 text-sm'>Everything renders, but only %s can answer. Run this "
+        "in your own shell — not inside an agent session — and scan the code again:</p>"
+        "<p class='mt-2'><code class='rounded bg-base-100 px-1 font-mono text-sm'>"
+        "board open tests --qr</code></p></div>" % (escape(what), DIM, escape(HUMAN))))
 
 
 def meter(label, pct, ceiling=None):
@@ -1783,11 +1816,11 @@ def q_card(q, answer=None):
                 escape(q["text"] or "")))
 
 
-def html_status(project, token=""):
+def html_status(project, token="", human=False):
     s = status(project)
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
         MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")),
-        (("/tests", "test queue"),))]
+        (("/tests", "test queue"),), human)]
     if not s["projects"]:
         h.append("<div class='mt-8 rounded-box border border-dashed border-base-300 "
                  "px-4 py-10 text-center %s'>No projects yet.<br>"
@@ -1851,7 +1884,7 @@ def html_status(project, token=""):
     return page("board", "".join(h))
 
 
-def html_task(tid, token=""):
+def html_task(tid, token="", human=False):
     d = task_show(tid)
     st = d.get("status") or ""
     owner = d.get("owner") or "—"
@@ -1925,7 +1958,7 @@ def html_task(tid, token=""):
           <button class='btn btn-primary mt-3 min-h-12'>Comment</button>
         </form>""" % (
         head(d["id"], "<span class='badge badge-sm %s'>%s</span>" % (
-            BADGE.get(st, "badge-ghost"), escape(st))),
+            BADGE.get(st, "badge-ghost"), escape(st)), human=human),
         escape(d.get("title") or ""),
         "".join("<dt class='%s'>%s<dd class='m-0 [overflow-wrap:anywhere]'>%s" % (DIM, k, v)
                 for k, v in facts),
@@ -1970,27 +2003,27 @@ def test_card(q):
         steps, q["id"], LBL, q["id"], q["id"]))
 
 
-def html_tests(project, token=""):
+def html_tests(project, token="", human=False):
     cards = [test_card(q) for q in tests_open(project)]
     body = ("<div class='mt-5 grid gap-4 md:grid-cols-2'>%s</div>" % "".join(cards) if cards
             else "<div class='mt-8 rounded-box border border-dashed border-base-300 px-4 "
                  "py-10 text-center %s'>No tests are waiting.<br>Cards show up here when an "
                  "agent needs you to try something yourself.</div>" % DIM)
-    return page("test queue", head("test queue") + body)
+    return page("test queue", head("test queue", human=human) + body)
 
 
-def html_question(qid, token=""):
+def html_question(qid, token="", human=False):
     q = db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     if not q:
         raise Err(404, "unknown question")
     if q["status"] not in ("open", "defaulted"):
-        return page(qid, head(qid) + (
+        return page(qid, head(qid, human=human) + (
             "<div class='mt-5 max-w-[42rem] rounded-box border border-base-300 bg-base-200 p-4'>"
             "<p class='text-lg'>Answered: <b class='font-semibold'>%s</b></p>"
             "<p class='%s mt-1 text-sm'>%s</p></div>" % (
                 escape(q["answer"] or ""), DIM, escape(q["status"]))))
     if q["kind"] == "test":
-        return html_tests(q["project"], token)
+        return html_tests(q["project"], token, human)
     opts = "".join("<button class='btn btn-primary min-h-12 flex-1' name=answer value='%s'>%s"
                    "</button>" % (escape(o), escape(o)) for o in jl(q["options"]))
     # defaulted = the board answered itself when the deadline ran out — but a human can
@@ -2019,7 +2052,7 @@ def html_question(qid, token=""):
         # project name with & or < was then double-escaped and shown as "A&amp;amp;B" in
         # the browser. Project names are not validated, so it really can happen.
         head(q["project"], "<span class='%s %s text-xs'>%s</span>" % (
-            MONO, DIM, escape(q["task"] or ""))),
+            MONO, DIM, escape(q["task"] or "")), human=human),
         escape(q["text"] or ""), qid, opts, LBL, foot))
 
 
@@ -2281,16 +2314,20 @@ class Handler(BaseHTTPRequestHandler):
             # view.
             return self.send(200, CSS_BYTES.decode("utf-8"), "text/css",
                              extra=[("Cache-Control", "public, max-age=31536000, immutable")])
+        # Whether the cookie in this browser is the human's. Every HTML page says so, on
+        # the surface where it matters — an agent-token session renders identically and
+        # then refuses every answer (T-390).
+        human = getattr(self, "is_human", False)
         if path in ("/", "/status"):
-            return html_status(q.get("project", [None])[0], token)
+            return html_status(q.get("project", [None])[0], token, human)
         if path == "/tests":
-            return html_tests(q.get("project", [None])[0], token)
+            return html_tests(q.get("project", [None])[0], token, human)
         m = re.match(r"^/q/([^/]+)$", path)
         if m and method == "GET":
-            return html_question(m.group(1), token)
+            return html_question(m.group(1), token, human)
         m = re.match(r"^/t/([^/]+)$", path)
         if m and method == "GET":
-            return html_task(m.group(1), token)
+            return html_task(m.group(1), token, human)
         m = re.match(r"^/t/([^/]+)/comment$", path)
         if m and method == "POST":
             task_comment(m.group(1), body)
@@ -2300,6 +2337,12 @@ class Handler(BaseHTTPRequestHandler):
             ans = body.get("answer", "")
             if ans == "fail" and body.get("note"):
                 ans = "fail: " + body["note"]
+            # A form pressed by a person, so a refusal is a page, not a JSON blob on a
+            # phone. Only this one shape — anything else is a real error and belongs in
+            # the ordinary handler.
+            if not human:
+                return self.send(403, not_human_page("answering %s" % m.group(1)),
+                                 "text/html")
             question_answer(m.group(1), ans, HUMAN, body.get("note", ""), body)
             return page("answer saved", "<div class=top><h1>The answer is saved</h1></div>"
                                         "<div class=card><p>The agent carries on."
