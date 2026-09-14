@@ -1564,6 +1564,35 @@ def head(title, right="", nav=(("/status", "board"),), human=False):
                 whoami(human)))
 
 
+def answer_saved_page(qid, human):
+    """What you see the instant after answering, on a phone, one-handed.
+
+    It used to be three lines of markup using a `.top` class that does not exist in the
+    stylesheet — so the one page reached by pressing the one button rendered unstyled.
+    ui/verify.sh never caught it because verify never POSTs an answer, so the class
+    checker never saw this markup. Rendered pages are now part of that check.
+
+    The links matter more than the styling. After answering you are either done (back to
+    the board) or you have more cards waiting (back to the queue), and if the question
+    belonged to a task you usually want to see what it was about. Landing on a dead end
+    means finding your way back by typing a URL on a phone."""
+    q = db.execute("SELECT project, task, kind FROM questions WHERE id=?", (qid,)).fetchone()
+    task_link = ""
+    if q and q["task"]:
+        task_link = ("<a class='btn btn-outline min-h-12 flex-1' href='/t/%s'>Task %s</a>"
+                     % (escape(q["task"]), escape(q["task"])))
+    return page("answer saved", head("answer saved", human=human) + (
+        "<div class='mt-5 max-w-[42rem] rounded-box border border-base-300 border-l-4 "
+        "border-l-success bg-base-200 p-4'>"
+        "<p class='text-lg leading-snug'>The answer is saved.</p>"
+        "<p class='%s mt-1 text-sm'>The agent picks it up in its inbox and carries on. "
+        "Nothing is waiting on you for this one.</p>"
+        "<div class='mt-4 flex flex-wrap gap-3'>"
+        "<a class='btn btn-primary min-h-12 flex-1' href='/tests'>Test queue</a>"
+        "<a class='btn btn-outline min-h-12 flex-1' href='/status'>The board</a>"
+        "%s</div></div>" % (DIM, task_link)))
+
+
 def not_human_page(what):
     """A refused human action, rendered as a page rather than as raw JSON.
 
@@ -2344,9 +2373,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(403, not_human_page("answering %s" % m.group(1)),
                                  "text/html")
             question_answer(m.group(1), ans, HUMAN, body.get("note", ""), body)
-            return page("answer saved", "<div class=top><h1>The answer is saved</h1></div>"
-                                        "<div class=card><p>The agent carries on."
-                                        "<p><a href='/tests'>Back to the test queue</a></div>")
+            return answer_saved_page(m.group(1), human)
         for mth, pat, fn in ROUTES:
             mm = pat.match(path)
             if mm and mth == method:
