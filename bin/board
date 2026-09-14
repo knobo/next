@@ -641,7 +641,16 @@ print(m.worktree_path(m.load(m.find('$ROOT')), '$repo', '$br'))")
             [ -d "$wt" ] || die "no worktree on $t — run board task worktree $t"
             git -C "$wt" push -u origin "$br" >&2 || exit 1
             title=$(jq -r '.title' <<<"$info")
-            slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
+            # The slug comes from the REMOTE, not from the manifest. `repo` is free text on
+            # the task and is "." for a single-repo project, so `$FORGE_ORG/$repo` built
+            # "<org>/." — not a repository, and `gh pr create` refused with "Could not
+            # resolve to a Repository". The manifest describes the project's shape; git
+            # already knows where this checkout actually pushes, and that is the thing a PR
+            # has to be opened against. `task merged` has always done it this way; `pr` had
+            # not, so the two disagreed about the same repository.
+            slug=$(git -C "$wt" remote get-url origin 2>/dev/null \
+                   | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')
+            [ -n "$slug" ] || slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
             case "$FORGE_KIND" in
               github) out=$(cd "$wt" && gh pr create ${slug:+--repo "$slug"} --title "$title" --body "$t" --head "$br" 2>&1) ;;
               *)      out=$(cd "$wt" && tea pr create ${slug:+--repo "$slug"} --title "$title" --description "$t" --head "$br" 2>&1) ;;
