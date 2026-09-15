@@ -244,13 +244,15 @@
         "defaults": {
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 15
-          }
+            "fillOpacity": 15,
+            "spanNulls": true
+          },
+          "unit": "short"
         }
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 7,
         "x": 0,
         "y": 16
       },
@@ -303,7 +305,7 @@
       "gridPos": {
         "h": 8,
         "w": 6,
-        "x": 12,
+        "x": 13,
         "y": 16
       },
       "id": 11,
@@ -350,8 +352,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 18,
+        "w": 5,
+        "x": 19,
         "y": 16
       },
       "id": 12,
@@ -384,7 +386,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (repo, status) (board_tasks_total{project=~\"$project\"})",
+          "expr": "sum by (repo, status) (board_tasks_total{project=~\"$project\", status!=\"archived\"})",
           "legendFormat": "{{repo}} - {{status}}",
           "refId": "A"
         }
@@ -401,7 +403,8 @@
         "defaults": {
           "custom": {
             "drawStyle": "points",
-            "pointSize": 6
+            "pointSize": 6,
+            "spanNulls": true
           }
         }
       },
@@ -436,7 +439,8 @@
         "defaults": {
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10
+            "fillOpacity": 10,
+            "spanNulls": true
           }
         }
       },
@@ -637,6 +641,44 @@
         }
       ],
       "type": "table"
+    },
+    {
+      "id": 13,
+      "title": "Tokenforbruk per Rolle (Implementer vs Reviewer)",
+      "type": "piechart",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 7,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "targets": [
+        {
+          "expr": "sum by (role) (board_task_dispatch_tokens_total{project=~\"$project\"})",
+          "legendFormat": "{{role}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "pieType": "donut"
+      }
     }
   ],
   "refresh": "15s",
@@ -650,30 +692,30 @@
   "templating": {
     "list": [
       {
-        "name": "project",
-        "type": "query",
-        "datasource": {
-          "type": "prometheus",
-          "uid": "PBFA97CFB590B2093"
-        },
-        "query": "label_values(board_tasks_total, project)",
-        "includeAll": true,
         "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
           "value": "$__all"
         },
-        "refresh": 1
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "includeAll": true,
+        "name": "project",
+        "query": "label_values(board_tasks_total, project)",
+        "refresh": 1,
+        "type": "query"
       }
     ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
   },
   "timezone": "browser",
   "title": "AI Agents & /next Coordination Swarm",
   "uid": "ai-agents-board",
-  "version": 3,
-  "time": {
-    "from": "now-1h",
-    "to": "now"
-  }
+  "version": 4
 }
