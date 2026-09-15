@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS roles (
   project TEXT, role TEXT, agent TEXT, source TEXT, pinned_by TEXT, since TEXT, lease_until TEXT,
   PRIMARY KEY (project, role, agent));
 CREATE UNIQUE INDEX IF NOT EXISTS roles_singleton ON roles(project, role) WHERE role = 'coordinator';
+CREATE TABLE IF NOT EXISTS routines (
+  project TEXT, name TEXT, title TEXT, spec TEXT, interval TEXT, deadline TEXT,
+  repo TEXT, priority INTEGER, role TEXT, last_run TEXT, next_due TEXT, status TEXT,
+  PRIMARY KEY (project, name));
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY, project TEXT, to_agent TEXT, from_agent TEXT,
   text TEXT, task TEXT, read INTEGER DEFAULT 0, ts TEXT);
@@ -86,7 +90,9 @@ db.row_factory = sqlite3.Row
 db.create_function("ulower", 1, lambda v: v.lower() if isinstance(v, str) else v)
 db.executescript(SCHEMA)
 for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
-                          ("agents", "budget", "TEXT")):   # T-164
+                          ("agents", "budget", "TEXT"),
+                          ("tasks", "routine", "TEXT")):
+
     try:                                # database from before the column existed
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
     except sqlite3.OperationalError:
@@ -117,6 +123,18 @@ def ts(s):
         return None
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
+
+
+def parse_interval(s):
+    if not s: return None
+    s = s.strip().lower()
+    try:
+        if s.endswith("d"): return timedelta(days=float(s[:-1]))
+        elif s.endswith("h"): return timedelta(hours=float(s[:-1]))
+        elif s.endswith("m"): return timedelta(minutes=float(s[:-1]))
+    except (ValueError, TypeError):
+        pass
+    return None
 
 def mins_since(s):
     return 1e9 if not s else (datetime.now(timezone.utc) - ts(s)).total_seconds() / 60
@@ -436,12 +454,62 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
         row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
     if phase and phase != row["phase"]:
         db.execute("UPDATE projects SET phase=?, updated=? WHERE name=?", (phase, now(), name))
+    if manifest:
+        m_dict = json.loads(manifest) if isinstance(manifest, str) else manifest
+        routines = m_dict.get("routines", {})
+        existing = db.execute("SELECT name FROM routines WHERE project=?", (name,)).fetchall()
+        for row in existing:
+            if row["name"] not in routines:
+                db.execute("DELETE FROM routines WHERE project=? AND name=?", (name, row["name"]))
+        for r_id, r_def in routines.items():
+            title = r_def.get("title", "")
+            spec = r_def.get("spec", r_def.get("description", ""))
+            interval = r_def.get("interval", "")
+            deadline = r_def.get("deadline", "")
+            repo = r_def.get("repo", "")
+            priority = int(r_def.get("priority", 50))
+            role = r_def.get("role", "")
+            
+            exists = db.execute("SELECT name, last_run, next_due FROM routines WHERE project=? AND name=?", (name, r_id)).fetchone()
+            if exists:
+                db.execute("UPDATE routines SET title=?, spec=?, interval=?, deadline=?, repo=?, priority=?, role=? WHERE project=? AND name=?",
+                           (title, spec, interval, deadline, repo, priority, role, name, r_id))
+            else:
+                db.execute("INSERT INTO routines (project, name, title, spec, interval, deadline, repo, priority, role, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (name, r_id, title, spec, interval, deadline, repo, priority, role, "open"))
+                   
+
         ev(name, "project", "project.phase_set", HUMAN, phase=phase)
     if goal or manifest:
         db.execute("UPDATE projects SET goal=COALESCE(?,goal), manifest=COALESCE(?,manifest),"
                    " manifest_host=COALESCE(?,manifest_host), manifest_path=COALESCE(?,manifest_path),"
                    " updated=? WHERE name=?",
                    (goal, json.dumps(manifest) if manifest else None, host, path, now(), name))
+    if manifest:
+        m_dict = json.loads(manifest) if isinstance(manifest, str) else manifest
+        routines = m_dict.get("routines", {})
+        existing = db.execute("SELECT name FROM routines WHERE project=?", (name,)).fetchall()
+        for row in existing:
+            if row["name"] not in routines:
+                db.execute("DELETE FROM routines WHERE project=? AND name=?", (name, row["name"]))
+        for r_id, r_def in routines.items():
+            title = r_def.get("title", "")
+            spec = r_def.get("spec", r_def.get("description", ""))
+            interval = r_def.get("interval", "")
+            deadline = r_def.get("deadline", "")
+            repo = r_def.get("repo", "")
+            priority = int(r_def.get("priority", 50))
+            role = r_def.get("role", "")
+            
+            exists = db.execute("SELECT name, last_run, next_due FROM routines WHERE project=? AND name=?", (name, r_id)).fetchone()
+            if exists:
+                db.execute("UPDATE routines SET title=?, spec=?, interval=?, deadline=?, repo=?, priority=?, role=? WHERE project=? AND name=?",
+                           (title, spec, interval, deadline, repo, priority, role, name, r_id))
+            else:
+                db.execute("INSERT INTO routines (project, name, title, spec, interval, deadline, repo, priority, role, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (name, r_id, title, spec, interval, deadline, repo, priority, role, "open"))
+                   
+
     return db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
 
 
@@ -553,11 +621,11 @@ def task_create(b, actor):
         check_repo(project, b.get("repo"))
     tid = next_id("T-", "tasks")
     db.execute("""INSERT INTO tasks (id,project,repo,title,spec,status,requires,needs_grants,touches,
-                  risk,review_open,created,updated,priority) VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?)""",
+                  risk,review_open,created,updated,priority,routine) VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?,?)""",
                (tid, project, b.get("repo"), b["title"], b.get("spec"),
                 json.dumps(b.get("requires", [])), json.dumps(b.get("needs_grants", [])),
                 json.dumps(b.get("touches", [])), b.get("risk", "normal"), now(), now(),
-                int(b.get("priority", 50))))
+                int(b.get("priority", 50)), b.get("routine")))
     ev(project, "task/" + tid, "task.created", actor, title=b["title"], repo=b.get("repo"),
        risk=b.get("risk", "normal"), from_project=b.get("from_project"))
     return {"id": tid, "status": "open"}
@@ -652,6 +720,23 @@ def brief(t):
         d["spec"] = "(%d chars — board task show %s)" % (len(d["spec"]), d["id"])
     return d
 
+
+
+def routine_list(q):
+    project = q.get("project", [None])[0]
+    st = q.get("status", [None])[0]
+    
+    query = "SELECT * FROM routines WHERE 1=1"
+    args = []
+    if project:
+        query += " AND project=?"
+        args.append(project)
+    if st:
+        query += " AND status=?"
+        args.append(st)
+        
+    rows = [dict(r) for r in db.execute(query, args).fetchall()]
+    return {"routines": rows}
 
 def task_list(q):
     where, args = ["1=1"], []
@@ -1039,7 +1124,19 @@ def task_done(tid, aid, b):
                            "out by hand." % (tid, tid), needs_deploy=True)
     db.execute("UPDATE tasks SET status='done', owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (now(), tid))
+    
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+    
+    if dict(t).get("routine"):
+        r = db.execute("SELECT * FROM routines WHERE project=? AND name=?", (t["project"], t["routine"])).fetchone()
+        if r:
+            last_run = now()
+            interval = parse_interval(r["interval"])
+            next_due = (datetime.fromisoformat(last_run.replace("Z", "+00:00")) + interval).isoformat().replace("+00:00", "Z") if interval else None
+            db.execute("UPDATE routines SET last_run=?, next_due=? WHERE project=? AND name=?",
+                       (last_run, next_due, t["project"], t["routine"]))
+
+
     ev(t["project"], "task/" + tid, "task.done", aid, sha=t["merge_sha"])
     return {"ok": True}
 
@@ -1052,7 +1149,10 @@ def task_archive(tid, aid, b):
                        "worked on" % t["owner"])
     db.execute("UPDATE tasks SET status='archived', owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (now(), tid))
+    
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+    
+
     ev(t["project"], "task/" + tid, "task.archived", aid, note=b.get("note"))
     return {"ok": True}
 
@@ -1070,7 +1170,10 @@ def release(tid, aid, b):
     keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "open"
     db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (keep, now(), tid))
+    
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+    
+
     ev(t["project"], "task/" + tid, "task.released", aid, note=b.get("note"))
     return {"ok": True}
 
@@ -1442,6 +1545,28 @@ def reap():
             ntfy("⏱ %s: the board answered %r on %s" % (q["project"], q["default_answer"], q["id"]),
                  "the deadline passed — you can still override the answer",
                  "%s/q/%s" % (BASE_URL, q["id"]))
+    
+    for r in db.execute("SELECT * FROM routines WHERE status='open'").fetchall():
+        is_due = False
+        if r["next_due"] and mins_since(r["next_due"]) >= 0:
+            is_due = True
+        elif not r["next_due"] and not r["last_run"]:
+            is_due = True
+        
+        if is_due:
+            open_task = db.execute("SELECT id FROM tasks WHERE project=? AND routine=? AND status NOT IN ('done','archived','orphaned')", (r["project"], r["name"])).fetchone()
+            if not open_task:
+                b = {
+                    "project": r["project"],
+                    "title": r["title"],
+                    "spec": r["spec"],
+                    "repo": r["repo"],
+                    "priority": r["priority"],
+                    "routine": r["name"]
+                }
+                tid = task_create(b, "board")["id"]
+                ntfy("⏰ %s: routine %s is due" % (r["project"], r["title"]), "Spawned task %s" % tid, "%s/t/%s" % (BASE_URL, tid))
+
     db.commit()
     return {"ok": True}
 
@@ -2037,6 +2162,7 @@ ROUTES = [
         b["project"], b.get("phase"), b.get("goal"), b.get("manifest"), b.get("host"), b.get("path")))),
     ("POST",   r"/tasks$",                      lambda h, m, b, q: task_create(b, actor(q, b))),
     ("GET",    r"/tasks/next$",                 lambda h, m, b, q: task_next(q["agent"][0], q)),
+        ("GET",    r"/routines$",                   lambda h, m, b, q: routine_list(q)),
     ("GET",    r"/tasks$",                      lambda h, m, b, q: task_list(q)),
     ("GET",    r"/tasks/([^/]+)$",              lambda h, m, b, q: task_show(m[0])),
     ("PATCH",  r"/tasks/([^/]+)$",              lambda h, m, b, q: task_patch(m[0], actor(q, b), b)),
@@ -2182,6 +2308,38 @@ def prometheus_metrics():
         for r in tasks_rows
     ]
     add_metric("board_tasks_total", "gauge", tasks_samples)
+    rt_total = {}
+    rt_overdue = []
+    rt_last_run = []
+    rt_deadline = []
+    
+    for r in db.execute("SELECT * FROM routines").fetchall():
+        p = r["project"].replace('"', '\\"')
+        st = r["status"].replace('"', '\\"')
+        rt = r["name"].replace('"', '\\"')
+        
+        rt_total[(p, st)] = rt_total.get((p, st), 0) + 1
+        
+        is_overdue = 1 if r["next_due"] and mins_since(r["next_due"]) > 0 else 0
+        rt_overdue.append('board_routine_overdue{project="%s",routine="%s"} %d' % (p, rt, is_overdue))
+        
+        if r["last_run"]:
+            ts_sec = ts(r["last_run"]).timestamp()
+            rt_last_run.append('board_routine_last_run_timestamp_seconds{project="%s",routine="%s"} %f' % (p, rt, ts_sec))
+            
+        if r["next_due"]:
+            ts_sec = ts(r["next_due"]).timestamp()
+            rt_deadline.append('board_routine_deadline_timestamp_seconds{project="%s",routine="%s"} %f' % (p, rt, ts_sec))
+            
+    add_metric("board_routines_total", "gauge", [
+        'board_routines_total{project="%s",status="%s"} %d' % (p, st, cnt)
+        for (p, st), cnt in rt_total.items()
+    ])
+    add_metric("board_routine_overdue", "gauge", rt_overdue)
+    add_metric("board_routine_last_run_timestamp_seconds", "gauge", rt_last_run)
+    add_metric("board_routine_deadline_timestamp_seconds", "gauge", rt_deadline)
+
+
 
     # Event counters for task lifecycle:
     # 3. board_tasks_created_total

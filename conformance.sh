@@ -1239,3 +1239,32 @@ echo
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
 exit $((FAIL > 0))
+
+# -----------------------------------------------------------------------------
+# routines
+# -----------------------------------------------------------------------------
+echo "### Routines"
+
+req POST /projects '{"project": "rt-test", "manifest": {"routines": {"clean": {"title": "Clean logs", "interval": "1d", "priority": 10}}}}'
+ok
+r=$(req GET "/routines?project=rt-test")
+echo "$r" | jq -e '.routines[0].name == "clean"' >/dev/null || fail "routine not created"
+
+req POST /tasks '{"project": "rt-test", "title": "Run clean", "routine": "clean"}'
+ok
+tid=$(echo "$r" | jq -r .id)
+
+req POST "/tasks/$tid/claim" '{"agent": "a1"}'
+req POST "/tasks/$tid/done" '{"agent": "a1", "no_merge": true}'
+ok
+
+r=$(req GET "/routines?project=rt-test")
+echo "$r" | jq -e '.routines[0].last_run != null' >/dev/null || fail "routine last_run not updated"
+
+# metrics
+r=$(curl -s http://localhost:8080/metrics)
+echo "$r" | grep -q 'board_routines_total{project="rt-test",status="open"}' || fail "metrics missing routines"
+echo "$r" | grep -q 'board_routine_last_run_timestamp_seconds{project="rt-test",routine="clean"}' || fail "metrics missing last_run"
+
+echo "PASS routines"
+
