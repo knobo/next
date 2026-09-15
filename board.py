@@ -2313,6 +2313,44 @@ def prometheus_metrics():
     ]
     add_metric("board_events_total", "counter", ev_samples)
 
+    # 15. board_task_review_findings_total{project="...",repo="...",status="open|fixed"}
+    findings_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(repo, '') AS repo, "
+        "SUM(COALESCE(review_open, 0)) AS s_open, SUM(COALESCE(review_fixed, 0)) AS s_fixed "
+        "FROM tasks GROUP BY project, repo"
+    ).fetchall()
+    findings_samples = []
+    for r in findings_rows:
+        findings_samples.append('board_task_review_findings_total{project="%s",repo="%s",status="open"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), r["s_open"]))
+        findings_samples.append('board_task_review_findings_total{project="%s",repo="%s",status="fixed"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), r["s_fixed"]))
+    add_metric("board_task_review_findings_total", "counter", findings_samples)
+
+    # 16. board_roles_active{project="...",role="...",agent="..."} (gauge)
+    role_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(role, '') AS role, COALESCE(agent, '') AS agent "
+        "FROM roles"
+    ).fetchall()
+    role_samples = [
+        'board_roles_active{project="%s",role="%s",agent="%s"} 1' % (
+            prom_esc(r["project"]), prom_esc(r["role"]), prom_esc(r["agent"]))
+        for r in role_rows
+    ]
+    add_metric("board_roles_active", "gauge", role_samples)
+
+    # 17. board_tasks_by_risk_total{project="...",risk="..."} (gauge)
+    risk_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(risk, 'normal') AS risk, COUNT(*) AS cnt "
+        "FROM tasks GROUP BY project, risk"
+    ).fetchall()
+    risk_samples = [
+        'board_tasks_by_risk_total{project="%s",risk="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["risk"]), r["cnt"])
+        for r in risk_rows
+    ]
+    add_metric("board_tasks_by_risk_total", "gauge", risk_samples)
+
     return "\n".join(out) + "\n"
 
 
