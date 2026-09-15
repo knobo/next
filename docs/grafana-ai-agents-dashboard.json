@@ -63,7 +63,7 @@
       },
       "targets": [
         {
-          "expr": "sum(board_agents_total{status=\"alive\", project=~\"\"}) or vector(0)",
+          "expr": "sum(board_agents_total{status=\"alive\", project=~\"$project\"}) or vector(0)",
           "refId": "A"
         }
       ],
@@ -107,7 +107,7 @@
       },
       "targets": [
         {
-          "expr": "sum(board_tasks_total{status=~\"claimed|merging\", project=~\"\"}) or vector(0)",
+          "expr": "sum(board_tasks_total{status=~\"claimed|merging\", project=~\"$project\"}) or vector(0)",
           "refId": "A"
         }
       ],
@@ -146,7 +146,7 @@
       },
       "targets": [
         {
-          "expr": "sum(board_tasks_total{status=\"in_review\", project=~\"\"}) or vector(0)",
+          "expr": "sum(board_tasks_total{status=\"in_review\", project=~\"$project\"}) or vector(0)",
           "refId": "A"
         }
       ],
@@ -189,7 +189,7 @@
       },
       "targets": [
         {
-          "expr": "sum(board_tasks_total{status=\"blocked\", project=~\"\"}) or vector(0)",
+          "expr": "sum(board_tasks_total{status=\"blocked\", project=~\"$project\"}) or vector(0)",
           "refId": "A"
         }
       ],
@@ -228,7 +228,7 @@
       },
       "targets": [
         {
-          "expr": "sum(board_tasks_completed_total{project=~\"\"}) or vector(0)",
+          "expr": "sum(board_tasks_completed_total{project=~\"$project\"}) or vector(0)",
           "refId": "A"
         }
       ],
@@ -257,7 +257,7 @@
       "id": 10,
       "targets": [
         {
-          "expr": "sum by (model) (board_task_dispatch_tokens_total{project=~\"\"})",
+          "expr": "sum by (model) (board_task_dispatch_tokens_total{project=~\"$project\"})",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
@@ -384,7 +384,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (repo, status) (board_tasks_total{project=~\"\"})",
+          "expr": "sum by (repo, status) (board_tasks_total{project=~\"$project\"})",
           "legendFormat": "{{repo}} - {{status}}",
           "refId": "A"
         }
@@ -414,12 +414,12 @@
       "id": 21,
       "targets": [
         {
-          "expr": "sum by (repo) (board_task_review_findings_total{project=~\"\", status=\"open\"})",
+          "expr": "sum by (repo) (board_task_review_findings_total{project=~\"$project\", status=\"open\"})",
           "legendFormat": "{{repo}} (open)",
           "refId": "A"
         },
         {
-          "expr": "sum by (repo) (board_task_review_findings_total{project=~\"\", status=\"fixed\"})",
+          "expr": "sum by (repo) (board_task_review_findings_total{project=~\"$project\", status=\"fixed\"})",
           "legendFormat": "{{repo}} (fixed)",
           "refId": "B"
         }
@@ -449,7 +449,7 @@
       "id": 30,
       "targets": [
         {
-          "expr": "sum by (type) (increase(board_events_total{project=~\"\"}[1h]))",
+          "expr": "sum by (type) (increase(board_events_total{project=~\"$project\"}[1h]))",
           "legendFormat": "{{type}}",
           "refId": "A"
         }
@@ -497,7 +497,7 @@
       },
       "targets": [
         {
-          "expr": "sum(board_questions_total{project=~\"\", status=\"open\"}) or vector(0)",
+          "expr": "sum(board_questions_total{project=~\"$project\", status=\"open\"}) or vector(0)",
           "legendFormat": "Ubesvarte Sp\u00f8rsm\u00e5l",
           "refId": "A"
         }
@@ -506,29 +506,9 @@
       "type": "stat"
     },
     {
-      "id": 40,
-      "title": "Tilgjengelige Oppgaver i K\u00f8 (Open per Prosjekt)",
-      "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 12,
-        "x": 0,
-        "y": 4
-      },
       "datasource": {
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
-      },
-      "targets": [
-        {
-          "expr": "sum by (project) (board_tasks_total{status=\"open\", project=~\"\"})",
-          "legendFormat": "{{project}}",
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none"
       },
       "fieldConfig": {
         "defaults": {
@@ -544,59 +524,78 @@
             ]
           }
         }
-      }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 40,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum by (project) (board_tasks_total{status=\"open\", project=~\"$project\"})",
+          "legendFormat": "{{project}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Tilgjengelige Oppgaver i K\u00f8 (Open per Prosjekt)",
+      "type": "stat"
     },
     {
-      "id": 41,
-      "title": "Oppgaver per Prosjekt fordelt p\u00e5 Status (Aktiv K\u00f8)",
-      "type": "barchart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
         "y": 4
       },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+      "id": 41,
+      "options": {
+        "barWidth": 0.8,
+        "groupWidth": 0.7,
+        "stacking": {
+          "mode": "normal"
+        }
       },
       "targets": [
         {
-          "expr": "sum by (project, status) (board_tasks_total{project=~\"\", status!=\"archived\"})",
+          "expr": "sum by (project, status) (board_tasks_total{project=~\"$project\", status!=\"archived\"})",
           "legendFormat": "{{project}} - {{status}}",
           "refId": "A"
         }
       ],
-      "options": {
-        "stacking": {
-          "mode": "normal"
-        },
-        "groupWidth": 0.7,
-        "barWidth": 0.8
-      }
+      "title": "Oppgaver per Prosjekt fordelt p\u00e5 Status (Aktiv K\u00f8)",
+      "type": "barchart"
     },
     {
-      "id": 42,
-      "title": "Oversiktstabell: Oppgaver per Prosjekt, Repo & Status",
-      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
         "y": 8
       },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
+      "id": 42,
       "targets": [
         {
-          "expr": "board_tasks_total{project=~\"\"}",
+          "expr": "board_tasks_total{project=~\"$project\"}",
           "format": "table",
           "instant": true,
           "refId": "A"
         }
       ],
+      "title": "Oversiktstabell: Oppgaver per Prosjekt, Repo & Status",
       "transformations": [
         {
           "id": "filterFieldsByName",
@@ -615,10 +614,10 @@
           "id": "organize",
           "options": {
             "renameByName": {
+              "Value": "Antall Oppgaver",
               "project": "Prosjekt",
               "repo": "Repository",
-              "status": "Status",
-              "Value": "Antall Oppgaver"
+              "status": "Status"
             }
           }
         },
@@ -636,7 +635,8 @@
             ]
           }
         }
-      ]
+      ],
+      "type": "table"
     }
   ],
   "refresh": "15s",
@@ -650,26 +650,30 @@
   "templating": {
     "list": [
       {
-        "allValue": ".*",
-        "current": {
-          "selected": true,
-          "text": "All",
-          "value": ".*"
-        },
+        "name": "project",
+        "type": "query",
         "datasource": {
           "type": "prometheus",
           "uid": "PBFA97CFB590B2093"
         },
-        "includeAll": true,
-        "name": "project",
         "query": "label_values(board_tasks_total, project)",
-        "refresh": 1,
-        "type": "query"
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 1
       }
     ]
   },
   "timezone": "browser",
   "title": "AI Agents & /next Coordination Swarm",
   "uid": "ai-agents-board",
-  "version": 2
+  "version": 3,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  }
 }
