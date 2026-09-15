@@ -8,20 +8,36 @@ set -uo pipefail
 # The token is fetched from `pass` when it is not in the environment — that spares every
 # session the env plumbing.
 : "${BOARD_TOKEN:=$(pass board/token 2>/dev/null | head -1)}"
-# Is an agent SESSION running here? That is a different question from "which harness is
-# this", and conflating the two broke the human token (T-390).
+# Is an agent running this shell? The human token hangs on the answer, so being wrong
+# costs in both directions: withhold it from the human and they cannot answer anything
+# (T-390, the bug this block was written for); hand it to an agent and §3.7 is void.
 #
-# Only an environment variable is evidence that a harness is EXECUTING this: each one
-# exports its own into the shell it runs. The filesystem probes further down are a
-# last-resort fallback for NAMING a harness — `~/.codex` existing means codex is
-# installed, not that codex is running. On a machine with two harnesses installed, those
-# probes matched in the human's own interactive terminal, so `pass board/human-token` was
-# never read and the human token was unreachable from the CLI entirely: every `board
-# answer` came back needs_human_token, and every `board open --qr` handed the phone an
-# agent login that rendered every page and refused every answer.
+# There are two kinds of evidence and NEITHER is sufficient on its own:
+#
+#   environment — reliable when a harness exports one. Claude Code sets
+#                 CLAUDE_CODE_SESSION_ID. Codex does not set CODEX_SESSION_ID at all (it
+#                 is an open feature request, not a shipped variable), and CODEX_HOME is a
+#                 persistent config override its own docs recommend for CI and container
+#                 setups — so a human may well carry it in their profile. Trusting only
+#                 this let a real codex agent through with the human token.
+#   filesystem  — `~/.codex` existing means codex is INSTALLED. That is equally true in
+#                 the owner's own terminal, which is how the original bug happened.
+#
+# On a machine where an agent and its owner run as the same user, with the same $HOME and
+# the same password store, nothing separates them reliably. So this FAILS CLOSED: any
+# evidence at all withholds the token, and the owner asks for it explicitly with
+# BOARD_AS_HUMAN=1 — once per device, for `board open --qr`.
+#
+# Be clear about what this is. An agent with a shell can run `pass board/human-token`
+# itself, and no amount of sniffing here prevents that. What this prevents is the CLI
+# handing an agent the human identity BY ACCIDENT, which is the failure that actually
+# occurred. Do NOT export BOARD_AS_HUMAN from a shell profile: an agent started from that
+# profile inherits it, and the guardrail is gone.
 #
 # Captured BEFORE the derivation below, which overwrites BOARD_HARNESS.
 AGENT_SESSION="${BOARD_HARNESS:-}${CLAUDE_CODE_SESSION_ID:-}${ANTIGRAVITY_AGENT:-}${ANTIGRAVITY_CONVERSATION_ID:-}${GROK_SESSION_ID:-}${GROK_CLI:-}${CODEX_SESSION_ID:-}${CODEX_HOME:-}"
+[ -z "$AGENT_SESSION" ] && [ -f "$HOME/.grok/active_sessions.json" ] && AGENT_SESSION=grok-installed
+[ -z "$AGENT_SESSION" ] && [ -d "$HOME/.codex" ] && AGENT_SESSION=codex-installed
 
 # The harness is DERIVED, never guessed. The policy grants per harness@host, so a guess
 # that misses is a silent privilege escalation: a grok agent that registered as
@@ -37,12 +53,11 @@ if [ -z "${BOARD_HARNESS:-}" ]; then
 fi
 
 # The human token separates "the human says" from "an agent claims the human says"
-# (§3.7). It is fetched ONLY when no agent session is running, i.e. in the human's own
-# shell — an agent must never be able to pick it up from `pass` and pin itself as the
-# human. The invariant is unchanged; what changed is the evidence it rests on, which is
-# now a live session rather than an installed tool (see AGENT_SESSION above).
+# (§3.7). Fetched when nothing suggests an agent is running, or when the owner says so
+# outright with BOARD_AS_HUMAN=1. Already having it in the environment always wins — that
+# is how the conformance suite and a deliberate caller pass it in.
 : "${BOARD_HUMAN_TOKEN:=}"
-if [ -z "$BOARD_HUMAN_TOKEN" ] && [ -z "$AGENT_SESSION" ]; then
+if [ -z "$BOARD_HUMAN_TOKEN" ] && { [ -z "$AGENT_SESSION" ] || [ -n "${BOARD_AS_HUMAN:-}" ]; }; then
   BOARD_HUMAN_TOKEN=$(pass board/human-token 2>/dev/null | head -1)
 fi
 [ -n "$BOARD_HUMAN_TOKEN" ] && BOARD_TOKEN="$BOARD_HUMAN_TOKEN"
@@ -501,7 +516,11 @@ $dirty"
               # we are.
               slug=$(git -C "$gitdir" remote get-url origin 2>/dev/null \
                      | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')
-              [ -n "$slug" ] || slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
+              # Same shape check as `pr` above: an unmatched URL passes through sed
+              # unchanged, so emptiness is not the test. The two must agree about the
+              # repository or they disagree about the same task.
+              printf '%s' "$slug" | grep -qE '^[^/[:space:]]+/[^/[:space:]]+$' \
+                || slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
               [ -n "$prnum" ] && case "$FORGE_KIND" in
                 github) state=$(gh pr view "$prnum" --repo "$slug" --json state -q .state 2>/dev/null) ;;
                 *)      # API, not text output: `tea pr` prints "(closed)" for a merged
@@ -650,7 +669,12 @@ print(m.worktree_path(m.load(m.find('$ROOT')), '$repo', '$br'))")
             # not, so the two disagreed about the same repository.
             slug=$(git -C "$wt" remote get-url origin 2>/dev/null \
                    | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')
-            [ -n "$slug" ] || slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
+            # sed leaves a URL it does not match UNTOUCHED, and untouched is not empty —
+            # so a shape we did not anticipate (a nested subgroup path, say) would sail
+            # past an emptiness test and be handed to the forge as --repo. Require the
+            # shape we actually want, and fall back when it is not that.
+            printf '%s' "$slug" | grep -qE '^[^/[:space:]]+/[^/[:space:]]+$' \
+              || slug="${FORGE_ORG:+$FORGE_ORG/}$repo"
             case "$FORGE_KIND" in
               github) out=$(cd "$wt" && gh pr create ${slug:+--repo "$slug"} --title "$title" --body "$t" --head "$br" 2>&1) ;;
               *)      out=$(cd "$wt" && tea pr create ${slug:+--repo "$slug"} --title "$title" --description "$t" --head "$br" 2>&1) ;;
@@ -867,9 +891,9 @@ open)
   if $qr && [ -z "$BOARD_HUMAN_TOKEN" ]; then
     die "--qr would hand out $ident.
 A phone logged in as an agent shows every page and refuses every answer.
-Run this in your OWN shell (not inside ${BOARD_HARNESS:-an agent session}), where the
-human token is read from \`pass board/human-token\`:
-    board open ${what#/} --qr"
+This shell looks like an agent's (${AGENT_SESSION:-unknown evidence}). If it is yours, say
+so once — do not put it in a shell profile, an agent started from that profile inherits it:
+    BOARD_AS_HUMAN=1 board open ${what#/} --qr"
   fi
   url="$BOARD_URL/${what#/}"
   case "$url" in *\?*) url="$url&t=$BOARD_TOKEN";; *) url="$url?t=$BOARD_TOKEN";; esac

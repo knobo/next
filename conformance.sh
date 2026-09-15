@@ -150,41 +150,83 @@ check "find() from a worktree gives the primary checkout, and the path does not 
   "$(jq -nc --arg o "$WTROOT" '{o:$o}')" \
   '.o=="'"$TMP/mfroot/project.yaml $TMP/mfroot-worktrees/task/T-2"'"'
 
-# T-390: the human token has to be reachable in the human's own shell. It hung on
-# BOARD_HARNESS, which is also derived from FILES ON DISK (~/.codex, ~/.grok) — so on any
-# machine with a second harness installed, the human's own terminal looked like an agent
-# session and `pass board/human-token` was never read. The invariant (an agent can never
-# reach the human token) has to hold on evidence of a live SESSION, not of an install.
-echo "== the human token hangs on a live session, not on an installed tool (T-390) =="
-HSDIR="$TMP/harness-home"; mkdir -p "$HSDIR/.codex" "$HSDIR/.grok"
+# T-390: the human token gate. Two ways to be wrong, and the suite has to catch both:
+# withhold it from the owner (the bug T-390 was filed for) or hand it to an agent (§3.7).
+#
+# These checks run the SHIPPED header of bin/board — everything up to and including the
+# line that decides which token wins — with a stubbed `pass` on PATH. The first version of
+# these checks re-typed the AGENT_SESSION expression inline instead, and review proved
+# what that is worth: reverting the fix in bin/board left all 228 checks green. A check
+# that re-implements the thing it tests only proves the tester can type it twice.
+echo "== the human token gate, against the real bin/board (T-390) =="
+HSDIR="$TMP/harness-home"; mkdir -p "$HSDIR/.codex" "$HSDIR/.grok" "$TMP/fakebin"
 echo '{}' > "$HSDIR/.grok/active_sessions.json"
-agent_session_of() {  # env assignments -> the AGENT_SESSION the CLI would compute
+cat > "$TMP/fakebin/pass" <<'PASSSTUB'
+#!/usr/bin/env bash
+case "$1" in board/human-token) echo STUB-HUMAN ;; board/token) echo STUB-AGENT ;; *) exit 1 ;; esac
+PASSSTUB
+chmod +x "$TMP/fakebin/pass"
+sed -n '1,/^\[ -n "\$BOARD_HUMAN_TOKEN" \] && BOARD_TOKEN="\$BOARD_HUMAN_TOKEN"$/p' "$SRC/bin/board" > "$TMP/hdr.sh"
+grep -q 'BOARD_TOKEN="\$BOARD_HUMAN_TOKEN"' "$TMP/hdr.sh" \
+  && ok "the real bin/board header was extracted for these checks" \
+  || no "could not extract bin/board's header — the checks below would test nothing" ""
+echo 'case "$BOARD_TOKEN" in STUB-HUMAN) echo human ;; STUB-AGENT) echo agent ;; *) echo other ;; esac' >> "$TMP/hdr.sh"
+tok_as() {  # env assignments -> which token the SHIPPED header selects
   env -u CLAUDE_CODE_SESSION_ID -u ANTIGRAVITY_AGENT -u ANTIGRAVITY_CONVERSATION_ID \
       -u GROK_SESSION_ID -u GROK_CLI -u CODEX_SESSION_ID -u CODEX_HOME -u BOARD_HARNESS \
-      HOME="$HSDIR" "$@" bash -c '
-        AGENT_SESSION="${BOARD_HARNESS:-}${CLAUDE_CODE_SESSION_ID:-}${ANTIGRAVITY_AGENT:-}${ANTIGRAVITY_CONVERSATION_ID:-}${GROK_SESSION_ID:-}${GROK_CLI:-}${CODEX_SESSION_ID:-}${CODEX_HOME:-}"
-        [ -n "$AGENT_SESSION" ] && echo agent || echo human'
+      -u BOARD_TOKEN -u BOARD_HUMAN_TOKEN -u BOARD_AS_HUMAN -u BOARD_URL \
+      HOME="$HSDIR" PATH="$TMP/fakebin:$PATH" "$@" bash "$TMP/hdr.sh" 2>/dev/null | tail -1
 }
-[ "$(agent_session_of)" = human ] \
-  && ok "installed ~/.codex and ~/.grok do NOT make the human's shell an agent session" \
-  || no "an installed harness still hides the human token" "$(agent_session_of)"
-[ "$(agent_session_of CLAUDE_CODE_SESSION_ID=x)" = agent ] \
-  && ok "a live claude-code session IS an agent session" || no "live session not detected" ""
-[ "$(agent_session_of CODEX_SESSION_ID=x)" = agent ] \
-  && ok "a live codex session IS an agent session" || no "live codex session not detected" ""
-[ "$(agent_session_of BOARD_HARNESS=grok)" = agent ] \
-  && ok "an explicitly declared harness IS an agent session" || no "explicit harness not detected" ""
-# And the derivation itself must still NAME the harness from those files, so an agent
-# without env vars registers as what it is rather than as nothing.
-DERIVED=$(env -u CLAUDE_CODE_SESSION_ID -u CODEX_SESSION_ID -u CODEX_HOME -u GROK_SESSION_ID \
-  -u GROK_CLI -u BOARD_HARNESS HOME="$HSDIR" bash -c '
-    if [ -z "${BOARD_HARNESS:-}" ]; then
-      if [ -f "$HOME/.grok/active_sessions.json" ]; then BOARD_HARNESS=grok
-      elif [ -d "$HOME/.codex" ]; then BOARD_HARNESS=codex; fi
-    fi; echo "${BOARD_HARNESS:-none}"')
-[ "$DERIVED" = grok ] \
-  && ok "the filesystem probes still name a harness for an agent without env vars" \
-  || no "harness naming regressed" "$DERIVED"
+# §3.7, the direction that must never break: an agent must not end up holding it.
+[ "$(tok_as CLAUDE_CODE_SESSION_ID=x)" = agent ] \
+  && ok "a live claude-code session gets the agent token" || no "claude-code session got the human token" "$(tok_as CLAUDE_CODE_SESSION_ID=x)"
+[ "$(tok_as BOARD_HARNESS=grok)" = agent ] \
+  && ok "an explicitly declared harness gets the agent token" || no "declared harness got the human token" "$(tok_as BOARD_HARNESS=grok)"
+# A codex agent sets NEITHER CODEX_SESSION_ID (not a real variable) nor CODEX_HOME by
+# default. Env evidence alone misses it entirely; the installed-tool probe is what catches
+# it, which is why this fails closed on both kinds of evidence at once.
+[ "$(tok_as)" = agent ] \
+  && ok "a codex/grok agent with no session variable still gets the agent token" \
+  || no "an agent with no session variable reached the human token (§3.7 broken)" "$(tok_as)"
+# And the direction T-390 was filed for: the owner has to be able to get at it.
+[ "$(tok_as BOARD_AS_HUMAN=1)" = human ] \
+  && ok "BOARD_AS_HUMAN=1 gets the owner the human token despite installed harnesses" \
+  || no "the owner cannot reach the human token even when saying so" "$(tok_as BOARD_AS_HUMAN=1)"
+# On a machine with no harness installed at all, no ceremony should be needed.
+CLEANH="$TMP/clean-home"; mkdir -p "$CLEANH"
+[ "$(env -u CLAUDE_CODE_SESSION_ID -u CODEX_HOME -u CODEX_SESSION_ID -u GROK_SESSION_ID \
+      -u GROK_CLI -u BOARD_HARNESS -u BOARD_TOKEN -u BOARD_HUMAN_TOKEN -u BOARD_AS_HUMAN \
+      HOME="$CLEANH" PATH="$TMP/fakebin:$PATH" bash "$TMP/hdr.sh" 2>/dev/null | tail -1)" = human ] \
+  && ok "with no harness installed or running, the owner just gets the human token" \
+  || no "the owner is locked out on a clean machine" ""
+# An explicitly exported token always wins, which is how a deliberate caller passes one in.
+[ "$(tok_as BOARD_HUMAN_TOKEN=STUB-HUMAN CLAUDE_CODE_SESSION_ID=x)" = human ] \
+  && ok "an explicitly exported BOARD_HUMAN_TOKEN wins over the sniffing" || no "exported human token ignored" ""
+
+# The repository slug a PR is opened against comes from the git remote, because the task's
+# `repo` field is free text and is "." for a single-repo project — `$FORGE_ORG/.` is not a
+# repository, and the forge refused it. The shape has to be checked, not just emptiness:
+# sed leaves a URL it does not match untouched.
+echo "== the PR slug comes from the remote, and is shape-checked (T-390) =="
+slug_of() { printf '%s' "$1" | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#'; }
+shaped()  { printf '%s' "$1" | grep -qE '^[^/[:space:]]+/[^/[:space:]]+$'; }
+for u in "https://github.com/knobo/next.git" "git@github.com:knobo/next.git" \
+         "https://git.example.com/org/repo"; do
+  [ "$(slug_of "$u")" = "knobo/next" ] || [ "$(slug_of "$u")" = "org/repo" ] \
+    && ok "slug from $u" || no "slug from $u" "$(slug_of "$u")"
+done
+# Known limitation, asserted rather than assumed: a nested path (a GitLab subgroup) keeps
+# only its last two segments. `forge.kind` is forgejo|github and both are org/repo, so this
+# is out of scope rather than wrong — but it is the shape that would silently open a PR
+# against the wrong project if that ever changed, so pin it down here.
+[ "$(slug_of 'https://gitlab.example.com/group/subgroup/proj.git')" = "subgroup/proj" ] \
+  && ok "a nested path keeps its last two segments (known: subgroups are not supported)" \
+  || no "nested path handling changed" "$(slug_of 'https://gitlab.example.com/group/subgroup/proj.git')"
+# What the shape check is actually for: anything that is not org/repo must fall back rather
+# than reach the forge. An empty remote is the common case (no origin configured).
+shaped "" && no "an empty slug passes the shape check" "" || ok "an empty slug falls back"
+shaped "just-one-segment" && no "a single segment passes the shape check" "" \
+  || ok "a slug with no slash falls back"
 
 echo "== board without a manifest dies with a message, not unbound variable (T-67) =="
 NOMAN=$(cd "$TMP" && "$SRC/bin/board" test-level T-1 2>&1; echo "rc=$?")
