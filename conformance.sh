@@ -903,6 +903,15 @@ else
   no "status links and the PR column" "$STHTML"
 fi
 
+echo "== prometheus metrics =="
+M_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BOARD_URL/metrics")
+[ "$M_CODE" = 200 ] && ok "GET /metrics returns 200 without token" || no "GET /metrics returns 200 without token" "HTTP $M_CODE"
+M_CT=$(curl -s -o /dev/null -w '%{content_type}' "$BOARD_URL/metrics")
+grep -qi "text/plain" <<<"$M_CT" && ok "GET /metrics has text/plain content-type" || no "GET /metrics content-type" "$M_CT"
+M_BODY=$(curl -s "$BOARD_URL/metrics")
+grep -q "^board_up 1" <<<"$M_BODY" && ok "/metrics contains board_up 1" || no "/metrics contains board_up 1" "$M_BODY"
+grep -q "board_tasks_total" <<<"$M_BODY" && ok "/metrics contains board_tasks_total" || no "/metrics contains board_tasks_total" "$M_BODY"
+
 # Ordering by last activity: a project whose last event was "task went done" must still sort
 # above an older project that merely has an open task lying around.
 # (last_activity() has to read unfiltered from the database, not the already-filtered

@@ -43,7 +43,12 @@ spec:
   strategy: { type: Recreate }
   selector: { matchLabels: { app: board } }
   template:
-    metadata: { labels: { app: board } }
+    metadata:
+      labels: { app: board }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       # The service is called "board", so k8s would otherwise inject BOARD_PORT=tcp://…:80
       # and override the listening port. Turn the whole injection off rather than rename.

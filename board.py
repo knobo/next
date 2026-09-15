@@ -2153,6 +2153,207 @@ def events(q):
     return out
 
 
+def prom_esc(s):
+    if s is None:
+        return ""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def prometheus_metrics():
+    out = []
+
+    def add_metric(name, mtype, samples):
+        if samples:
+            out.append("# TYPE %s %s" % (name, mtype))
+            out.extend(samples)
+
+    # 1. board_up 1
+    add_metric("board_up", "gauge", ["board_up 1"])
+
+    # 2. board_tasks_total{project="...",repo="...",status="..."} (gauge for nåværende tasks)
+    tasks_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(repo, '') AS repo, "
+        "COALESCE(status, '') AS status, COUNT(*) AS cnt "
+        "FROM tasks GROUP BY project, repo, status"
+    ).fetchall()
+    tasks_samples = [
+        'board_tasks_total{project="%s",repo="%s",status="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), prom_esc(r["status"]), r["cnt"])
+        for r in tasks_rows
+    ]
+    add_metric("board_tasks_total", "gauge", tasks_samples)
+
+    # Event counters for task lifecycle:
+    # 3. board_tasks_created_total
+    # 4. board_tasks_completed_total
+    # 5. board_tasks_blocked_total
+    # 6. board_task_review_rounds_total
+    # 7. board_task_merges_total
+    task_counters = [
+        ("task.created", "board_tasks_created_total"),
+        ("task.done", "board_tasks_completed_total"),
+        ("task.blocked", "board_tasks_blocked_total"),
+        ("task.review_result", "board_task_review_rounds_total"),
+        ("task.merge_verified", "board_task_merges_total"),
+    ]
+    for ev_type, metric_name in task_counters:
+        rows = db.execute(
+            "SELECT e.project, COALESCE(t.repo, json_extract(e.body, '$.repo'), '') AS repo_val, COUNT(*) AS cnt "
+            "FROM events e LEFT JOIN tasks t ON e.stream = ('task/' || t.id) "
+            "WHERE e.type = ? "
+            "GROUP BY e.project, repo_val", (ev_type,)
+        ).fetchall()
+        samples = [
+            '%s{project="%s",repo="%s"} %d' % (
+                metric_name, prom_esc(r["project"]), prom_esc(r["repo_val"]), r["cnt"])
+            for r in rows
+        ]
+        add_metric(metric_name, "counter", samples)
+
+    # 8. board_task_dispatches_total{project="...",role="...",model="..."}
+    # 9. board_task_dispatch_tokens_total{project="...",role="...",model="..."}
+    dispatches = {}
+    dispatch_tokens = {}
+    for r in db.execute("SELECT project, body FROM events WHERE json_extract(body, '$.dispatch') IS NOT NULL").fetchall():
+        b = jl(r["body"], {})
+        d = b.get("dispatch")
+        if not d:
+            continue
+        if isinstance(d, dict):
+            role = d.get("role") or ""
+            model = d.get("model") or ""
+            tokens = d.get("tokens")
+        elif isinstance(d, str) and ":" in d:
+            role, _, model = d.partition(":")
+            tokens = None
+        else:
+            continue
+        key = (r["project"] or "", str(role), str(model))
+        dispatches[key] = dispatches.get(key, 0) + 1
+        if tokens is not None:
+            try:
+                dispatch_tokens[key] = dispatch_tokens.get(key, 0) + int(tokens)
+            except (ValueError, TypeError):
+                pass
+
+    disp_samples = [
+        'board_task_dispatches_total{project="%s",role="%s",model="%s"} %d' % (
+            prom_esc(proj), prom_esc(role), prom_esc(model), cnt)
+        for (proj, role, model), cnt in sorted(dispatches.items())
+    ]
+    add_metric("board_task_dispatches_total", "counter", disp_samples)
+
+    token_samples = [
+        'board_task_dispatch_tokens_total{project="%s",role="%s",model="%s"} %d' % (
+            prom_esc(proj), prom_esc(role), prom_esc(model), tok_cnt)
+        for (proj, role, model), tok_cnt in sorted(dispatch_tokens.items())
+    ]
+    add_metric("board_task_dispatch_tokens_total", "counter", token_samples)
+
+    # 10. board_agents_total{project="...",status="..."} (gauge for agenter)
+    agent_rows = db.execute(
+        "SELECT COALESCE(current_project, '') AS project, COALESCE(status, '') AS status, COUNT(*) AS cnt "
+        "FROM agents GROUP BY current_project, status"
+    ).fetchall()
+    agent_samples = [
+        'board_agents_total{project="%s",status="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["status"]), r["cnt"])
+        for r in agent_rows
+    ]
+    add_metric("board_agents_total", "gauge", agent_samples)
+
+    # 11. board_agent_ctx_percent{agent="...",harness="...",model="..."} (gauge fra agents.ctx_pct der status='alive')
+    ctx_rows = db.execute(
+        "SELECT id, COALESCE(harness, '') AS harness, COALESCE(model, '') AS model, ctx_pct "
+        "FROM agents WHERE status = 'alive' AND ctx_pct IS NOT NULL"
+    ).fetchall()
+    ctx_samples = [
+        'board_agent_ctx_percent{agent="%s",harness="%s",model="%s"} %s' % (
+            prom_esc(r["id"]), prom_esc(r["harness"]), prom_esc(r["model"]), r["ctx_pct"])
+        for r in ctx_rows
+    ]
+    add_metric("board_agent_ctx_percent", "gauge", ctx_samples)
+
+    # 12. board_agent_budget_used_percent{agent="...",harness="...",window="..."} (gauge fra agents.budget json der status='alive')
+    budget_rows = db.execute(
+        "SELECT id, COALESCE(harness, '') AS harness, budget "
+        "FROM agents WHERE status = 'alive' AND budget IS NOT NULL"
+    ).fetchall()
+    budget_samples = []
+    for r in budget_rows:
+        for w in jl(r["budget"], []):
+            if isinstance(w, dict) and w.get("window") and w.get("used_pct") is not None:
+                budget_samples.append(
+                    'board_agent_budget_used_percent{agent="%s",harness="%s",window="%s"} %s' % (
+                        prom_esc(r["id"]), prom_esc(r["harness"]), prom_esc(w["window"]), w["used_pct"]))
+    add_metric("board_agent_budget_used_percent", "gauge", budget_samples)
+
+    # 13. board_questions_total{project="...",kind="...",status="..."} (gauge)
+    q_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(kind, '') AS kind, "
+        "COALESCE(status, '') AS status, COUNT(*) AS cnt "
+        "FROM questions GROUP BY project, kind, status"
+    ).fetchall()
+    q_samples = [
+        'board_questions_total{project="%s",kind="%s",status="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["kind"]), prom_esc(r["status"]), r["cnt"])
+        for r in q_rows
+    ]
+    add_metric("board_questions_total", "gauge", q_samples)
+
+    # 14. board_events_total{project="...",type="..."} (counter fra events grupperer per type)
+    ev_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(type, '') AS type, COUNT(*) AS cnt "
+        "FROM events GROUP BY project, type"
+    ).fetchall()
+    ev_samples = [
+        'board_events_total{project="%s",type="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["type"]), r["cnt"])
+        for r in ev_rows
+    ]
+    add_metric("board_events_total", "counter", ev_samples)
+
+    # 15. board_task_review_findings_total{project="...",repo="...",status="open|fixed"}
+    findings_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(repo, '') AS repo, "
+        "SUM(COALESCE(review_open, 0)) AS s_open, SUM(COALESCE(review_fixed, 0)) AS s_fixed "
+        "FROM tasks GROUP BY project, repo"
+    ).fetchall()
+    findings_samples = []
+    for r in findings_rows:
+        findings_samples.append('board_task_review_findings_total{project="%s",repo="%s",status="open"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), r["s_open"]))
+        findings_samples.append('board_task_review_findings_total{project="%s",repo="%s",status="fixed"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), r["s_fixed"]))
+    add_metric("board_task_review_findings_total", "counter", findings_samples)
+
+    # 16. board_roles_active{project="...",role="...",agent="..."} (gauge)
+    role_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(role, '') AS role, COALESCE(agent, '') AS agent "
+        "FROM roles"
+    ).fetchall()
+    role_samples = [
+        'board_roles_active{project="%s",role="%s",agent="%s"} 1' % (
+            prom_esc(r["project"]), prom_esc(r["role"]), prom_esc(r["agent"]))
+        for r in role_rows
+    ]
+    add_metric("board_roles_active", "gauge", role_samples)
+
+    # 17. board_tasks_by_risk_total{project="...",risk="..."} (gauge)
+    risk_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(risk, 'normal') AS risk, COUNT(*) AS cnt "
+        "FROM tasks GROUP BY project, risk"
+    ).fetchall()
+    risk_samples = [
+        'board_tasks_by_risk_total{project="%s",risk="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["risk"]), r["cnt"])
+        for r in risk_rows
+    ]
+    add_metric("board_tasks_by_risk_total", "gauge", risk_samples)
+
+    return "\n".join(out) + "\n"
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "board/0"
@@ -2194,7 +2395,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         for k, v in extra:
             self.send_header(k, v)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        if "charset=" not in ctype:
+            ctype = ctype + "; charset=utf-8"
+        self.send_header("Content-Type", ctype)
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -2227,6 +2430,10 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(url.query)
         if url.path == "/healthz":            # kubelet probe: no token, no data
             return self.send(200, {"ok": True})
+        if url.path == "/metrics" and method == "GET":
+            with LOCK:
+                text = prometheus_metrics()
+            return self.send(200, text, "text/plain; version=0.0.4; charset=utf-8")
         if not self.authed(q):                # BEFORE the body is read — an
             return self.send(401, {"error": "invalid token"})   # unauthenticated client
         try:                                                    # must not make us allocate
@@ -2275,6 +2482,8 @@ class Handler(BaseHTTPRequestHandler):
     def route(self, method, path, body, q, token):
         if path == "/healthz":
             return {"ok": True}
+        if path == "/metrics" and method == "GET":
+            return self.send(200, prometheus_metrics(), "text/plain; version=0.0.4; charset=utf-8")
         if path == CSS_URL and method == "GET":
             # The content hash is in the filename, so the response can be cached
             # forever: a deploy yields a new URL. That saves the phone 25 kB per page
