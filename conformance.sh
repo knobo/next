@@ -1235,36 +1235,50 @@ REAPPY
     || no "the reaper leaves awaiting_human alone, but orphans an expired claimed" "$R"
 fi
 
+
+if [ "$OWN_SERVER" = 1 ]; then
+  # Register a fresh agent for routine tests
+  RT_AID=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-r","session":"rt-session"}' | jq -r .id)
+
+
+  # Register a fresh agent for routine tests
+  RT_AID=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-r","session":"rt-session"}' | jq -r .id)
+  
+  api POST /projects/demo/resume '{"by":"human"}' >/dev/null
+  echo "== routines =="
+  api POST /projects '{"project": "demo", "manifest": {"routines": {"clean": {"title": "Clean logs", "interval": "1d", "priority": 10}}}}' >/dev/null
+  check "routine created" "$(api GET "/routines?project=demo")" '.routines[0].name == "clean"'
+  
+  TID=$(api POST /tasks "{\"project\": \"demo\", \"title\": \"Run clean\", \"routine\": \"clean\", \"agent\": \"$RT_AID\"}" | jq -r .id)
+  api POST "/tasks/$TID/claim" "{\"agent\": \"$RT_AID\"}" >/dev/null
+  api POST "/tasks/$TID/done" "{\"agent\": \"$RT_AID\", \"no_merge\": true}" >/dev/null
+  
+  check "routine last_run updated" "$(api GET "/routines?project=demo")" '.routines[0].last_run != null'
+
+
+  R=$(curl -s "$BOARD_URL/metrics")
+  echo "$R" | grep -q 'board_routines_total{project="demo",status="open"}' && ok "metrics contains routines" || no "metrics contains routines" "missing"
+  echo "$R" | grep -q 'board_routine_last_run_timestamp_seconds{project="demo",routine="clean"}' && ok "metrics contains last_run" || no "metrics contains last_run" "missing"
+  
+  echo "== reaper routines =="
+  # test reaper spawns a routine task when due
+  api POST /projects '{"project": "demo-2", "manifest": {"routines": {"overdue": {"title": "Overdue routine", "interval": "1d", "priority": 10}}}}' >/dev/null
+  # manipulate next_due via python
+  R2=$(BOARD_DB="$TMP/reap.db" python3 - <<'REAPPY'
+import board
+board.db.execute("INSERT INTO projects (name, phase) VALUES ('demo-2', 'idea')")
+board.db.execute("INSERT INTO routines (project, name, title, spec, interval, status, next_due) VALUES ('demo-2', 'overdue', 'T', 'S', '1d', 'open', ?)", (board.plus(-10),))
+board.db.commit()
+board.reap()
+res = board.db.execute("SELECT id FROM tasks WHERE project='demo-2' AND routine='overdue'").fetchone()
+print(res[0] if res else "")
+REAPPY
+)
+  [ -n "$R2" ] && ok "the reaper spawns a task for an overdue routine" || no "the reaper spawns a task for an overdue routine" "task not spawned"
+fi
+
 echo
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
 exit $((FAIL > 0))
-
-# -----------------------------------------------------------------------------
-# routines
-# -----------------------------------------------------------------------------
-echo "### Routines"
-
-req POST /projects '{"project": "rt-test", "manifest": {"routines": {"clean": {"title": "Clean logs", "interval": "1d", "priority": 10}}}}'
-ok
-r=$(req GET "/routines?project=rt-test")
-echo "$r" | jq -e '.routines[0].name == "clean"' >/dev/null || fail "routine not created"
-
-req POST /tasks '{"project": "rt-test", "title": "Run clean", "routine": "clean"}'
-ok
-tid=$(echo "$r" | jq -r .id)
-
-req POST "/tasks/$tid/claim" '{"agent": "a1"}'
-req POST "/tasks/$tid/done" '{"agent": "a1", "no_merge": true}'
-ok
-
-r=$(req GET "/routines?project=rt-test")
-echo "$r" | jq -e '.routines[0].last_run != null' >/dev/null || fail "routine last_run not updated"
-
-# metrics
-r=$(curl -s http://localhost:8080/metrics)
-echo "$r" | grep -q 'board_routines_total{project="rt-test",status="open"}' || fail "metrics missing routines"
-echo "$r" | grep -q 'board_routine_last_run_timestamp_seconds{project="rt-test",routine="clean"}' || fail "metrics missing last_run"
-
-echo "PASS routines"
 

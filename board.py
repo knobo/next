@@ -129,12 +129,14 @@ def parse_interval(s):
     if not s: return None
     s = s.strip().lower()
     try:
-        if s.endswith("d"): return timedelta(days=float(s[:-1]))
+        if s.endswith("w"): return timedelta(days=float(s[:-1])*7)
+        elif s.endswith("d"): return timedelta(days=float(s[:-1]))
         elif s.endswith("h"): return timedelta(hours=float(s[:-1]))
         elif s.endswith("m"): return timedelta(minutes=float(s[:-1]))
     except (ValueError, TypeError):
         pass
     return None
+
 
 def mins_since(s):
     return 1e9 if not s else (datetime.now(timezone.utc) - ts(s)).total_seconds() / 60
@@ -485,29 +487,6 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
                    " manifest_host=COALESCE(?,manifest_host), manifest_path=COALESCE(?,manifest_path),"
                    " updated=? WHERE name=?",
                    (goal, json.dumps(manifest) if manifest else None, host, path, now(), name))
-    if manifest:
-        m_dict = json.loads(manifest) if isinstance(manifest, str) else manifest
-        routines = m_dict.get("routines", {})
-        existing = db.execute("SELECT name FROM routines WHERE project=?", (name,)).fetchall()
-        for row in existing:
-            if row["name"] not in routines:
-                db.execute("DELETE FROM routines WHERE project=? AND name=?", (name, row["name"]))
-        for r_id, r_def in routines.items():
-            title = r_def.get("title", "")
-            spec = r_def.get("spec", r_def.get("description", ""))
-            interval = r_def.get("interval", "")
-            deadline = r_def.get("deadline", "")
-            repo = r_def.get("repo", "")
-            priority = int(r_def.get("priority", 50))
-            role = r_def.get("role", "")
-            
-            exists = db.execute("SELECT name, last_run, next_due FROM routines WHERE project=? AND name=?", (name, r_id)).fetchone()
-            if exists:
-                db.execute("UPDATE routines SET title=?, spec=?, interval=?, deadline=?, repo=?, priority=?, role=? WHERE project=? AND name=?",
-                           (title, spec, interval, deadline, repo, priority, role, name, r_id))
-            else:
-                db.execute("INSERT INTO routines (project, name, title, spec, interval, deadline, repo, priority, role, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                           (name, r_id, title, spec, interval, deadline, repo, priority, role, "open"))
                    
 
     return db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
@@ -1132,7 +1111,9 @@ def task_done(tid, aid, b):
         if r:
             last_run = now()
             interval = parse_interval(r["interval"])
-            next_due = (datetime.fromisoformat(last_run.replace("Z", "+00:00")) + interval).isoformat().replace("+00:00", "Z") if interval else None
+            if interval is None:
+                interval = timedelta(days=1)
+            next_due = (datetime.fromisoformat(last_run.replace("Z", "+00:00")) + interval).isoformat().replace("+00:00", "Z")
             db.execute("UPDATE routines SET last_run=?, next_due=? WHERE project=? AND name=?",
                        (last_run, next_due, t["project"], t["routine"]))
 
@@ -1151,6 +1132,18 @@ def task_archive(tid, aid, b):
                (now(), tid))
     
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+    
+    if dict(t).get("routine"):
+        r = db.execute("SELECT * FROM routines WHERE project=? AND name=?", (t["project"], t["routine"])).fetchone()
+        if r:
+            last_run = now()
+            interval = parse_interval(r["interval"])
+            if interval is None:
+                interval = timedelta(days=1)
+            next_due = (datetime.fromisoformat(last_run.replace("Z", "+00:00")) + interval).isoformat().replace("+00:00", "Z")
+            db.execute("UPDATE routines SET last_run=?, next_due=? WHERE project=? AND name=?",
+                       (last_run, next_due, t["project"], t["routine"]))
+
     
 
     ev(t["project"], "task/" + tid, "task.archived", aid, note=b.get("note"))
@@ -1558,10 +1551,10 @@ def reap():
             if not open_task:
                 b = {
                     "project": r["project"],
-                    "title": r["title"],
-                    "spec": r["spec"],
+                    "title": r["title"] or r["name"],
+                    "spec": r["spec"] or "Automated routine task",
                     "repo": r["repo"],
-                    "priority": r["priority"],
+                    "priority": r["priority"] if r["priority"] is not None else 50,
                     "routine": r["name"]
                 }
                 tid = task_create(b, "board")["id"]
@@ -2320,7 +2313,24 @@ def prometheus_metrics():
         
         rt_total[(p, st)] = rt_total.get((p, st), 0) + 1
         
-        is_overdue = 1 if r["next_due"] and mins_since(r["next_due"]) > 0 else 0
+        open_task = db.execute("SELECT id FROM tasks WHERE project=? AND routine=? AND status NOT IN ('done','archived','orphaned')", (r["project"], r["name"])).fetchone()
+        is_overdue = 0
+        if r["next_due"] and mins_since(r["next_due"]) > 0 and not open_task:
+            is_overdue = 1
+        
+        # deadline check
+        if r["deadline"]:
+            d_interval = parse_interval(r["deadline"])
+            if d_interval and r["next_due"]:
+                deadline_ts = (datetime.fromisoformat(r["next_due"].replace("Z", "+00:00")) + d_interval)
+                deadline_ts_iso = deadline_ts.isoformat().replace("+00:00", "Z")
+                if mins_since(deadline_ts_iso) > 0 and not open_task:
+                    is_overdue = 1
+                rt_deadline.append('board_routine_deadline_timestamp_seconds{project="%s",routine="%s"} %f' % (p, rt, deadline_ts.timestamp()))
+            elif d_interval and r["last_run"]:
+                # fallback if next_due is none? just use next_due logic
+                pass
+        
         rt_overdue.append('board_routine_overdue{project="%s",routine="%s"} %d' % (p, rt, is_overdue))
         
         if r["last_run"]:
