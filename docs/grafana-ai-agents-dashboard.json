@@ -1,0 +1,721 @@
+{
+  "id": 7,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "color": "red",
+                  "text": "DOWN"
+                },
+                "1": {
+                  "color": "green",
+                  "text": "ONLINE"
+                }
+              },
+              "type": "value"
+            }
+          ]
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "board_up",
+          "refId": "A"
+        }
+      ],
+      "title": "Board Status",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "expr": "sum(board_agents_total{status=\"alive\", project=~\"$project\"}) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Aktive Agenter (Heartbeat)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum(board_tasks_total{status=~\"claimed|merging\", project=~\"$project\"}) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Oppgaver i arbeid (WIP)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "purple",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "expr": "sum(board_tasks_total{status=\"in_review\", project=~\"$project\"}) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Venter p\u00e5 Review",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "expr": "sum(board_tasks_total{status=\"blocked\", project=~\"$project\"}) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Blokkerte Oppgaver",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "expr": "sum(board_tasks_completed_total{project=~\"$project\"}) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "Totalt Fullf\u00f8rte Oppgaver",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "spanNulls": true
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 7,
+        "x": 0,
+        "y": 16
+      },
+      "id": 10,
+      "targets": [
+        {
+          "expr": "sum by (model) (board_task_dispatch_tokens_total{project=~\"$project\"})",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Tokenforbruk per Modell (Subagent Tokens)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 60
+              },
+              {
+                "color": "orange",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 13,
+        "y": 16
+      },
+      "id": 11,
+      "options": {
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "expr": "board_agent_budget_used_percent",
+          "legendFormat": "{{agent}} ({{window}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Agenters Kvote/Vindusforbruk (5h & 7d window %)",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 5,
+        "x": 19,
+        "y": 16
+      },
+      "id": 12,
+      "targets": [
+        {
+          "expr": "board_agent_ctx_percent",
+          "legendFormat": "{{agent}} ({{model}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Agent Context Window Saturation (ctx %)",
+      "type": "gauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 20,
+      "options": {
+        "stacking": {
+          "mode": "normal"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (repo, status) (board_tasks_total{project=~\"$project\", status!=\"archived\"})",
+          "legendFormat": "{{repo}} - {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Oppgavestatus Fordeling per Repo",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "spanNulls": true
+          }
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 21,
+      "targets": [
+        {
+          "expr": "sum by (repo) (board_task_review_findings_total{project=~\"$project\", status=\"open\"})",
+          "legendFormat": "{{repo}} (open)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (repo) (board_task_review_findings_total{project=~\"$project\", status=\"fixed\"})",
+          "legendFormat": "{{repo}} (fixed)",
+          "refId": "B"
+        }
+      ],
+      "title": "Review Findings (Open vs. Fixed)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "spanNulls": true
+          }
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 32
+      },
+      "id": 30,
+      "targets": [
+        {
+          "expr": "sum by (type) (increase(board_events_total{project=~\"$project\"}[1h]))",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Aktivitetsrate: Hendelser per time (Events/hour)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "id": 31,
+      "options": {
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "expr": "sum(board_questions_total{project=~\"$project\", status=\"open\"}) or vector(0)",
+          "legendFormat": "Ubesvarte Sp\u00f8rsm\u00e5l",
+          "refId": "A"
+        }
+      ],
+      "title": "\u00c5pne Sp\u00f8rsm\u00e5l & Testkort",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 40,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "expr": "sum by (project) (board_tasks_total{status=\"open\", project=~\"$project\"})",
+          "legendFormat": "{{project}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Tilgjengelige Oppgaver i K\u00f8 (Open per Prosjekt)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 41,
+      "options": {
+        "barWidth": 0.8,
+        "groupWidth": 0.7,
+        "stacking": {
+          "mode": "normal"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (project, status) (board_tasks_total{project=~\"$project\", status!=\"archived\"})",
+          "legendFormat": "{{project}} - {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Oppgaver per Prosjekt fordelt p\u00e5 Status (Aktiv K\u00f8)",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 42,
+      "targets": [
+        {
+          "expr": "board_tasks_total{project=~\"$project\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Oversiktstabell: Oppgaver per Prosjekt, Repo & Status",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "project",
+                "repo",
+                "status",
+                "Value"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "Value": "Antall Oppgaver",
+              "project": "Prosjekt",
+              "repo": "Repository",
+              "status": "Status"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Prosjekt"
+              },
+              {
+                "field": "Status"
+              }
+            ]
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "id": 13,
+      "title": "Tokenforbruk per Rolle (Implementer vs Reviewer)",
+      "type": "piechart",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 7,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "targets": [
+        {
+          "expr": "sum by (role) (board_task_dispatch_tokens_total{project=~\"$project\"})",
+          "legendFormat": "{{role}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "pieType": "donut"
+      }
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 38,
+  "tags": [
+    "ai",
+    "next",
+    "board",
+    "prometheus"
+  ],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "includeAll": true,
+        "name": "project",
+        "query": "label_values(board_tasks_total, project)",
+        "refresh": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "AI Agents & /next Coordination Swarm",
+  "uid": "ai-agents-board",
+  "version": 4
+}

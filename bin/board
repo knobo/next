@@ -805,6 +805,17 @@ test-level)
      '{level:$l, class:$c, env:$e, phase:$p} + (if $w=="" then {} else {why:$w} end)
       + (if $h=="" then {} else {how:$h} end)' ;;
 
+
+routines|routine)
+  parse "$@"; b=$(body); p=$(jq -r '.project // empty' <<<"$b"); st=$(jq -r '.status // empty' <<<"$b")
+  [ -z "$p" ] && p=$("$MANIFEST" 2>/dev/null | jq -r '.project // empty')
+  qs=""
+  [ -n "$p" ] && qs="project=$p"
+  [ -n "$st" ] && qs="${qs:+${qs}&}status=$st"
+  r=$(req GET "/routines?$qs")
+  jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
+  jq -r '.routines[]? | "\(.name) \(.interval // "-") \(if .next_due then "due:"+.next_due else "-" end) \(.status) \(.title[0:56])"' <<<"$r" ;;
+
 tests)
   parse "$@"; p=$(jq -r '.project // empty' <<<"$(body)")
   req GET "/questions?kind=test&status=open${p:+&project=$p}" ;;

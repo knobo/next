@@ -90,6 +90,15 @@ ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 no()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
 check() { # check "name" <json> <jq-filter>
   if jq -e "$3" >/dev/null 2>&1 <<<"$2"; then ok "$1"; else no "$1" "$2"; fi; }
+# Like api(), but the HTTP status is in the JSON. T-396 is 200 vs 400 vs 409, and `.error`
+# alone cannot tell those apart.
+apic() { local m="$1" p="$2"; shift 2
+  local code
+  code=$(curl -sS -m 5 -o "$TMP/apic.json" -w '%{http_code}' -X "$m" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    ${1:+-d "$1"} "$BOARD_URL/api/v1$p")
+  jq -nc --argjson c "$code" --slurpfile b "$TMP/apic.json" '{code:$c, body:$b[0]}'
+}
 
 echo "== manifest.py: worktree_path (T-67) =="
 WTCHK=$(python3 -c "
@@ -528,6 +537,46 @@ check "message agent→agent" "$(api POST /messages "{\"agent\":\"$AID\",\"to\":
 check "the message is in the recipient's inbox" "$(api GET "/agents/$BID/inbox")" '.messages[0].text=="regenerer typer"'
 fi
 
+echo "== append-only progress on done/archived (T-396) =="
+# A subagent archived; the coordinator's --tokens then 409'd because owner is NULL.
+# History cannot be amended, cost.complete stays false. The append is event-only.
+AT=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"late tokens after archive\"}" | jq -r .id)
+api POST /tasks/$AT/claim "{\"agent\":\"$AID\"}" >/dev/null
+api POST /tasks/$AT/archive "{\"agent\":\"$AID\",\"note\":\"subagent archived\"}" >/dev/null
+ARCH=$(api GET /tasks/$AT)
+ARCH_UPD=$(jq -r .updated <<<"$ARCH")
+sleep 1
+# A different agent in the same project — the coordinator, not the last owner.
+APP=$(apic POST /tasks/$AT/progress "{\"agent\":\"$BID\",\"dispatch\":\"tester:sonnet\",\"tokens\":98512,\"result\":\"x\"}")
+check "append-only progress on an archived task is 200" "$APP" '.code==200 and .body.ok==true'
+SHOW=$(api GET /tasks/$AT)
+check "board task show returns the dispatch and cost includes the tokens" "$SHOW" \
+  '.status=="archived" and (.dispatches|length)==1
+   and .dispatches[0].role=="tester" and .dispatches[0].model=="sonnet"
+   and .dispatches[0].tokens==98512 and .dispatches[0].result=="x"
+   and .dispatches[0].actor=="'"$BID"'"
+   and .cost.tokens==98512 and .cost.complete==true'
+[ "$(jq -r .updated <<<"$SHOW")" = "$ARCH_UPD" ] && [ "$(jq -r .status <<<"$SHOW")" = archived ] \
+  && ok "archived row status/updated are unchanged by the append" \
+  || no "archived row status/updated are unchanged by the append" "$SHOW"
+WT=$(apic POST /tasks/$AT/progress "{\"agent\":\"$BID\",\"worktree\":\"/wt/no\"}")
+check "progress --worktree on an archived task is 400" "$WT" '.code==400 and .body.error'
+SHOW2=$(api GET /tasks/$AT)
+check "the archived row is untouched after the refused worktree" "$SHOW2" \
+  '.status=="archived" and .worktree==null and .updated=="'"$ARCH_UPD"'"'
+
+DT396=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"late tokens after done\"}" | jq -r .id)
+api POST /tasks/$DT396/claim "{\"agent\":\"$AID\"}" >/dev/null
+api POST /tasks/$DT396/done "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
+DONE_UPD=$(jq -r .updated <<<"$(api GET /tasks/$DT396)")
+sleep 1
+DAPP=$(apic POST /tasks/$DT396/progress "{\"agent\":\"$BID\",\"dispatch\":\"tester:sonnet\",\"tokens\":7,\"result\":\"x\"}")
+check "append-only progress on a done task is 200" "$DAPP" '.code==200 and .body.ok==true'
+DSHOW=$(api GET /tasks/$DT396)
+check "done: dispatch lands, status/updated unchanged" "$DSHOW" \
+  '.status=="done" and .updated=="'"$DONE_UPD"'" and .cost.tokens==7
+   and .dispatches[0].role=="tester" and .dispatches[0].tokens==7'
+
 if [ "$OWN_SERVER" = 1 ]; then
 echo "== a defaulted question can still be answered by a human (T-197) =="
 # A deadline in the past: the reaper must sweep this to 'defaulted' before any human can answer.
@@ -729,6 +778,11 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
   # row — and the next claimant is handed the same worktree.
   check "a reaped owner gets an error on task.progress" \
     "$(api POST /tasks/$T3ID/progress "{\"agent\":\"$CID\",\"worktree\":\"/wt/ghost\"}")" '.error'
+  # T-396: done/archived accept a late --tokens; orphaned must not — that row is waiting
+  # to be claimed, not amended.
+  check "dispatch+tokens on an orphaned task is still 409" \
+    "$(apic POST /tasks/$T3ID/progress "{\"agent\":\"$CID\",\"dispatch\":\"tester:sonnet\",\"tokens\":1,\"result\":\"x\"}")" \
+    '.code==409 and (.body.error|test("no longer yours")) and .body.status=="orphaned"'
 
   echo "== the reaper tells waiting apart from stopping =="
   T5ID=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"waiting on a human\",\"risk\":\"high\"}" | jq -r .id)
@@ -1019,6 +1073,15 @@ if grep -q "href='/t/$SLID'" <<<"$STHTML" && grep -q ">pr<" <<<"$STHTML" && grep
 else
   no "status links and the PR column" "$STHTML"
 fi
+
+echo "== prometheus metrics =="
+M_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BOARD_URL/metrics")
+[ "$M_CODE" = 200 ] && ok "GET /metrics returns 200 without token" || no "GET /metrics returns 200 without token" "HTTP $M_CODE"
+M_CT=$(curl -s -o /dev/null -w '%{content_type}' "$BOARD_URL/metrics")
+grep -qi "text/plain" <<<"$M_CT" && ok "GET /metrics has text/plain content-type" || no "GET /metrics content-type" "$M_CT"
+M_BODY=$(curl -s "$BOARD_URL/metrics")
+grep -q "^board_up 1" <<<"$M_BODY" && ok "/metrics contains board_up 1" || no "/metrics contains board_up 1" "$M_BODY"
+grep -q "board_tasks_total" <<<"$M_BODY" && ok "/metrics contains board_tasks_total" || no "/metrics contains board_tasks_total" "$M_BODY"
 
 # Ordering by last activity: a project whose last event was "task went done" must still sort
 # above an older project that merely has an open task lying around.
@@ -1343,7 +1406,50 @@ REAPPY
     || no "the reaper leaves awaiting_human alone, but orphans an expired claimed" "$R"
 fi
 
+
+if [ "$OWN_SERVER" = 1 ]; then
+  # Register a fresh agent for routine tests
+  RT_AID=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-r","session":"rt-session"}' | jq -r .id)
+
+
+  # Register a fresh agent for routine tests
+  RT_AID=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-r","session":"rt-session"}' | jq -r .id)
+  
+  api POST /projects/demo/resume '{"by":"human"}' >/dev/null
+  echo "== routines =="
+  api POST /projects '{"project": "demo", "manifest": {"routines": {"clean": {"title": "Clean logs", "interval": "1d", "priority": 10}}}}' >/dev/null
+  check "routine created" "$(api GET "/routines?project=demo")" '.routines[0].name == "clean"'
+  
+  TID=$(api POST /tasks "{\"project\": \"demo\", \"title\": \"Run clean\", \"routine\": \"clean\", \"agent\": \"$RT_AID\"}" | jq -r .id)
+  api POST "/tasks/$TID/claim" "{\"agent\": \"$RT_AID\"}" >/dev/null
+  api POST "/tasks/$TID/done" "{\"agent\": \"$RT_AID\", \"no_merge\": true}" >/dev/null
+  
+  check "routine last_run updated" "$(api GET "/routines?project=demo")" '.routines[0].last_run != null'
+
+
+  R=$(curl -s "$BOARD_URL/metrics")
+  echo "$R" | grep -q 'board_routines_total{project="demo",status="open"}' && ok "metrics contains routines" || no "metrics contains routines" "missing"
+  echo "$R" | grep -q 'board_routine_last_run_timestamp_seconds{project="demo",routine="clean"}' && ok "metrics contains last_run" || no "metrics contains last_run" "missing"
+  
+  echo "== reaper routines =="
+  # test reaper spawns a routine task when due
+  api POST /projects '{"project": "demo-2", "manifest": {"routines": {"overdue": {"title": "Overdue routine", "interval": "1d", "priority": 10}}}}' >/dev/null
+  # manipulate next_due via python
+  R2=$(BOARD_DB="$TMP/reap.db" python3 - <<'REAPPY'
+import board
+board.db.execute("INSERT INTO projects (name, phase) VALUES ('demo-2', 'idea')")
+board.db.execute("INSERT INTO routines (project, name, title, spec, interval, status, next_due) VALUES ('demo-2', 'overdue', 'T', 'S', '1d', 'open', ?)", (board.plus(-10),))
+board.db.commit()
+board.reap()
+res = board.db.execute("SELECT id FROM tasks WHERE project='demo-2' AND routine='overdue'").fetchone()
+print(res[0] if res else "")
+REAPPY
+)
+  [ -n "$R2" ] && ok "the reaper spawns a task for an overdue routine" || no "the reaper spawns a task for an overdue routine" "task not spawned"
+fi
+
 echo
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
 exit $((FAIL > 0))
+

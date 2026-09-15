@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS roles (
   project TEXT, role TEXT, agent TEXT, source TEXT, pinned_by TEXT, since TEXT, lease_until TEXT,
   PRIMARY KEY (project, role, agent));
 CREATE UNIQUE INDEX IF NOT EXISTS roles_singleton ON roles(project, role) WHERE role = 'coordinator';
+CREATE TABLE IF NOT EXISTS routines (
+  project TEXT, name TEXT, title TEXT, spec TEXT, interval TEXT, deadline TEXT,
+  repo TEXT, priority INTEGER, role TEXT, last_run TEXT, next_due TEXT, status TEXT,
+  PRIMARY KEY (project, name));
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY, project TEXT, to_agent TEXT, from_agent TEXT,
   text TEXT, task TEXT, read INTEGER DEFAULT 0, ts TEXT);
@@ -86,7 +90,9 @@ db.row_factory = sqlite3.Row
 db.create_function("ulower", 1, lambda v: v.lower() if isinstance(v, str) else v)
 db.executescript(SCHEMA)
 for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
-                          ("agents", "budget", "TEXT")):   # T-164
+                          ("agents", "budget", "TEXT"),
+                          ("tasks", "routine", "TEXT")):
+
     try:                                # database from before the column existed
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
     except sqlite3.OperationalError:
@@ -116,6 +122,20 @@ def ts(s):
     if not s:
         return None
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+
+def parse_interval(s):
+    if not s: return None
+    s = s.strip().lower()
+    try:
+        if s.endswith("w"): return timedelta(days=float(s[:-1])*7)
+        elif s.endswith("d"): return timedelta(days=float(s[:-1]))
+        elif s.endswith("h"): return timedelta(hours=float(s[:-1]))
+        elif s.endswith("m"): return timedelta(minutes=float(s[:-1]))
+    except (ValueError, TypeError):
+        pass
+    return None
 
 
 def mins_since(s):
@@ -436,12 +456,39 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
         row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
     if phase and phase != row["phase"]:
         db.execute("UPDATE projects SET phase=?, updated=? WHERE name=?", (phase, now(), name))
+    if manifest:
+        m_dict = json.loads(manifest) if isinstance(manifest, str) else manifest
+        routines = m_dict.get("routines", {})
+        existing = db.execute("SELECT name FROM routines WHERE project=?", (name,)).fetchall()
+        for row in existing:
+            if row["name"] not in routines:
+                db.execute("DELETE FROM routines WHERE project=? AND name=?", (name, row["name"]))
+        for r_id, r_def in routines.items():
+            title = r_def.get("title", "")
+            spec = r_def.get("spec", r_def.get("description", ""))
+            interval = r_def.get("interval", "")
+            deadline = r_def.get("deadline", "")
+            repo = r_def.get("repo", "")
+            priority = int(r_def.get("priority", 50))
+            role = r_def.get("role", "")
+            
+            exists = db.execute("SELECT name, last_run, next_due FROM routines WHERE project=? AND name=?", (name, r_id)).fetchone()
+            if exists:
+                db.execute("UPDATE routines SET title=?, spec=?, interval=?, deadline=?, repo=?, priority=?, role=? WHERE project=? AND name=?",
+                           (title, spec, interval, deadline, repo, priority, role, name, r_id))
+            else:
+                db.execute("INSERT INTO routines (project, name, title, spec, interval, deadline, repo, priority, role, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           (name, r_id, title, spec, interval, deadline, repo, priority, role, "open"))
+                   
+
         ev(name, "project", "project.phase_set", HUMAN, phase=phase)
     if goal or manifest:
         db.execute("UPDATE projects SET goal=COALESCE(?,goal), manifest=COALESCE(?,manifest),"
                    " manifest_host=COALESCE(?,manifest_host), manifest_path=COALESCE(?,manifest_path),"
                    " updated=? WHERE name=?",
                    (goal, json.dumps(manifest) if manifest else None, host, path, now(), name))
+                   
+
     return db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
 
 
@@ -553,11 +600,11 @@ def task_create(b, actor):
         check_repo(project, b.get("repo"))
     tid = next_id("T-", "tasks")
     db.execute("""INSERT INTO tasks (id,project,repo,title,spec,status,requires,needs_grants,touches,
-                  risk,review_open,created,updated,priority) VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?)""",
+                  risk,review_open,created,updated,priority,routine) VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?,?)""",
                (tid, project, b.get("repo"), b["title"], b.get("spec"),
                 json.dumps(b.get("requires", [])), json.dumps(b.get("needs_grants", [])),
                 json.dumps(b.get("touches", [])), b.get("risk", "normal"), now(), now(),
-                int(b.get("priority", 50))))
+                int(b.get("priority", 50)), b.get("routine")))
     ev(project, "task/" + tid, "task.created", actor, title=b["title"], repo=b.get("repo"),
        risk=b.get("risk", "normal"), from_project=b.get("from_project"))
     return {"id": tid, "status": "open"}
@@ -652,6 +699,23 @@ def brief(t):
         d["spec"] = "(%d chars — board task show %s)" % (len(d["spec"]), d["id"])
     return d
 
+
+
+def routine_list(q):
+    project = q.get("project", [None])[0]
+    st = q.get("status", [None])[0]
+    
+    query = "SELECT * FROM routines WHERE 1=1"
+    args = []
+    if project:
+        query += " AND project=?"
+        args.append(project)
+    if st:
+        query += " AND status=?"
+        args.append(st)
+        
+    rows = [dict(r) for r in db.execute(query, args).fetchall()]
+    return {"routines": rows}
 
 def task_list(q):
     where, args = ["1=1"], []
@@ -827,6 +891,23 @@ def dispatch_of(b):
 
 def task_progress(tid, aid, b):
     t = task(tid)
+    # done/archived clear the owner, so owns() would 409 every late append — a
+    # subagent archives, the coordinator's --tokens never lands, cost.complete
+    # stays false forever (T-396). Append-only (note/dispatch/tokens/result)
+    # writes the event and leaves the row alone. worktree/branch/pr/status
+    # still mutate the row, so they stay refused. orphaned keeps the 409:
+    # that guard exists so progress does not write a worktree into a row the
+    # reaper took.
+    if t["status"] in ("done", "archived"):
+        same_project(agent(aid), t["project"])
+        locked = [k for k in ("worktree", "branch", "pr", "status") if k in b]
+        if locked:
+            raise Err(400, "cannot set %s on a %s task — append-only (note, dispatch, tokens, result)"
+                      % (", ".join(locked), t["status"]))
+        dispatch = dispatch_of(b)
+        ev(t["project"], "task/" + tid, "task.progress", aid, note=b.get("note"),
+           dispatch=dispatch, result=b.get("result"))
+        return {"ok": True}
     owns(t, aid)
     dispatch = dispatch_of(b)
     # `status` is set by the dedicated transitions, not by a free-text field in progress.
@@ -1039,7 +1120,21 @@ def task_done(tid, aid, b):
                            "out by hand." % (tid, tid), needs_deploy=True)
     db.execute("UPDATE tasks SET status='done', owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (now(), tid))
+    
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+    
+    if dict(t).get("routine"):
+        r = db.execute("SELECT * FROM routines WHERE project=? AND name=?", (t["project"], t["routine"])).fetchone()
+        if r:
+            last_run = now()
+            interval = parse_interval(r["interval"])
+            if interval is None:
+                interval = timedelta(days=1)
+            next_due = (datetime.fromisoformat(last_run.replace("Z", "+00:00")) + interval).isoformat().replace("+00:00", "Z")
+            db.execute("UPDATE routines SET last_run=?, next_due=? WHERE project=? AND name=?",
+                       (last_run, next_due, t["project"], t["routine"]))
+
+
     ev(t["project"], "task/" + tid, "task.done", aid, sha=t["merge_sha"])
     return {"ok": True}
 
@@ -1052,7 +1147,22 @@ def task_archive(tid, aid, b):
                        "worked on" % t["owner"])
     db.execute("UPDATE tasks SET status='archived', owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (now(), tid))
+    
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+    
+    if dict(t).get("routine"):
+        r = db.execute("SELECT * FROM routines WHERE project=? AND name=?", (t["project"], t["routine"])).fetchone()
+        if r:
+            last_run = now()
+            interval = parse_interval(r["interval"])
+            if interval is None:
+                interval = timedelta(days=1)
+            next_due = (datetime.fromisoformat(last_run.replace("Z", "+00:00")) + interval).isoformat().replace("+00:00", "Z")
+            db.execute("UPDATE routines SET last_run=?, next_due=? WHERE project=? AND name=?",
+                       (last_run, next_due, t["project"], t["routine"]))
+
+    
+
     ev(t["project"], "task/" + tid, "task.archived", aid, note=b.get("note"))
     return {"ok": True}
 
@@ -1070,7 +1180,10 @@ def release(tid, aid, b):
     keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "open"
     db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (keep, now(), tid))
+    
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+    
+
     ev(t["project"], "task/" + tid, "task.released", aid, note=b.get("note"))
     return {"ok": True}
 
@@ -1442,6 +1555,28 @@ def reap():
             ntfy("⏱ %s: the board answered %r on %s" % (q["project"], q["default_answer"], q["id"]),
                  "the deadline passed — you can still override the answer",
                  "%s/q/%s" % (BASE_URL, q["id"]))
+    
+    for r in db.execute("SELECT * FROM routines WHERE status='open'").fetchall():
+        is_due = False
+        if r["next_due"] and mins_since(r["next_due"]) >= 0:
+            is_due = True
+        elif not r["next_due"] and not r["last_run"]:
+            is_due = True
+        
+        if is_due:
+            open_task = db.execute("SELECT id FROM tasks WHERE project=? AND routine=? AND status NOT IN ('done','archived','orphaned')", (r["project"], r["name"])).fetchone()
+            if not open_task:
+                b = {
+                    "project": r["project"],
+                    "title": r["title"] or r["name"],
+                    "spec": r["spec"] or "Automated routine task",
+                    "repo": r["repo"],
+                    "priority": r["priority"] if r["priority"] is not None else 50,
+                    "routine": r["name"]
+                }
+                tid = task_create(b, "board")["id"]
+                ntfy("⏰ %s: routine %s is due" % (r["project"], r["title"]), "Spawned task %s" % tid, "%s/t/%s" % (BASE_URL, tid))
+
     db.commit()
     return {"ok": True}
 
@@ -2099,6 +2234,7 @@ ROUTES = [
         b["project"], b.get("phase"), b.get("goal"), b.get("manifest"), b.get("host"), b.get("path")))),
     ("POST",   r"/tasks$",                      lambda h, m, b, q: task_create(b, actor(q, b))),
     ("GET",    r"/tasks/next$",                 lambda h, m, b, q: task_next(q["agent"][0], q)),
+        ("GET",    r"/routines$",                   lambda h, m, b, q: routine_list(q)),
     ("GET",    r"/tasks$",                      lambda h, m, b, q: task_list(q)),
     ("GET",    r"/tasks/([^/]+)$",              lambda h, m, b, q: task_show(m[0])),
     ("PATCH",  r"/tasks/([^/]+)$",              lambda h, m, b, q: task_patch(m[0], actor(q, b), b)),
@@ -2215,6 +2351,256 @@ def events(q):
     return out
 
 
+def prom_esc(s):
+    if s is None:
+        return ""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def prometheus_metrics():
+    out = []
+
+    def add_metric(name, mtype, samples):
+        if samples:
+            out.append("# TYPE %s %s" % (name, mtype))
+            out.extend(samples)
+
+    # 1. board_up 1
+    add_metric("board_up", "gauge", ["board_up 1"])
+
+    # 2. board_tasks_total{project="...",repo="...",status="..."} (gauge for nåværende tasks)
+    tasks_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(repo, '') AS repo, "
+        "COALESCE(status, '') AS status, COUNT(*) AS cnt "
+        "FROM tasks GROUP BY project, repo, status"
+    ).fetchall()
+    tasks_samples = [
+        'board_tasks_total{project="%s",repo="%s",status="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), prom_esc(r["status"]), r["cnt"])
+        for r in tasks_rows
+    ]
+    add_metric("board_tasks_total", "gauge", tasks_samples)
+    rt_total = {}
+    rt_overdue = []
+    rt_last_run = []
+    rt_deadline = []
+    
+    for r in db.execute("SELECT * FROM routines").fetchall():
+        p = r["project"].replace('"', '\\"')
+        st = r["status"].replace('"', '\\"')
+        rt = r["name"].replace('"', '\\"')
+        
+        rt_total[(p, st)] = rt_total.get((p, st), 0) + 1
+        
+        open_task = db.execute("SELECT id FROM tasks WHERE project=? AND routine=? AND status NOT IN ('done','archived','orphaned')", (r["project"], r["name"])).fetchone()
+        is_overdue = 0
+        if r["next_due"] and mins_since(r["next_due"]) > 0 and not open_task:
+            is_overdue = 1
+        
+        # deadline check
+        if r["deadline"]:
+            d_interval = parse_interval(r["deadline"])
+            if d_interval and r["next_due"]:
+                deadline_ts = (datetime.fromisoformat(r["next_due"].replace("Z", "+00:00")) + d_interval)
+                deadline_ts_iso = deadline_ts.isoformat().replace("+00:00", "Z")
+                if mins_since(deadline_ts_iso) > 0 and not open_task:
+                    is_overdue = 1
+                rt_deadline.append('board_routine_deadline_timestamp_seconds{project="%s",routine="%s"} %f' % (p, rt, deadline_ts.timestamp()))
+            elif d_interval and r["last_run"]:
+                # fallback if next_due is none? just use next_due logic
+                pass
+        
+        rt_overdue.append('board_routine_overdue{project="%s",routine="%s"} %d' % (p, rt, is_overdue))
+        
+        if r["last_run"]:
+            ts_sec = ts(r["last_run"]).timestamp()
+            rt_last_run.append('board_routine_last_run_timestamp_seconds{project="%s",routine="%s"} %f' % (p, rt, ts_sec))
+            
+        if r["next_due"]:
+            ts_sec = ts(r["next_due"]).timestamp()
+            rt_deadline.append('board_routine_deadline_timestamp_seconds{project="%s",routine="%s"} %f' % (p, rt, ts_sec))
+            
+    add_metric("board_routines_total", "gauge", [
+        'board_routines_total{project="%s",status="%s"} %d' % (p, st, cnt)
+        for (p, st), cnt in rt_total.items()
+    ])
+    add_metric("board_routine_overdue", "gauge", rt_overdue)
+    add_metric("board_routine_last_run_timestamp_seconds", "gauge", rt_last_run)
+    add_metric("board_routine_deadline_timestamp_seconds", "gauge", rt_deadline)
+
+
+
+    # Event counters for task lifecycle:
+    # 3. board_tasks_created_total
+    # 4. board_tasks_completed_total
+    # 5. board_tasks_blocked_total
+    # 6. board_task_review_rounds_total
+    # 7. board_task_merges_total
+    task_counters = [
+        ("task.created", "board_tasks_created_total"),
+        ("task.done", "board_tasks_completed_total"),
+        ("task.blocked", "board_tasks_blocked_total"),
+        ("task.review_result", "board_task_review_rounds_total"),
+        ("task.merge_verified", "board_task_merges_total"),
+    ]
+    for ev_type, metric_name in task_counters:
+        rows = db.execute(
+            "SELECT e.project, COALESCE(t.repo, json_extract(e.body, '$.repo'), '') AS repo_val, COUNT(*) AS cnt "
+            "FROM events e LEFT JOIN tasks t ON e.stream = ('task/' || t.id) "
+            "WHERE e.type = ? "
+            "GROUP BY e.project, repo_val", (ev_type,)
+        ).fetchall()
+        samples = [
+            '%s{project="%s",repo="%s"} %d' % (
+                metric_name, prom_esc(r["project"]), prom_esc(r["repo_val"]), r["cnt"])
+            for r in rows
+        ]
+        add_metric(metric_name, "counter", samples)
+
+    # 8. board_task_dispatches_total{project="...",role="...",model="..."}
+    # 9. board_task_dispatch_tokens_total{project="...",role="...",model="..."}
+    dispatches = {}
+    dispatch_tokens = {}
+    for r in db.execute("SELECT project, body FROM events WHERE json_extract(body, '$.dispatch') IS NOT NULL").fetchall():
+        b = jl(r["body"], {})
+        d = b.get("dispatch")
+        if not d:
+            continue
+        if isinstance(d, dict):
+            role = d.get("role") or ""
+            model = d.get("model") or ""
+            tokens = d.get("tokens")
+        elif isinstance(d, str) and ":" in d:
+            role, _, model = d.partition(":")
+            tokens = None
+        else:
+            continue
+        key = (r["project"] or "", str(role), str(model))
+        dispatches[key] = dispatches.get(key, 0) + 1
+        if tokens is not None:
+            try:
+                dispatch_tokens[key] = dispatch_tokens.get(key, 0) + int(tokens)
+            except (ValueError, TypeError):
+                pass
+
+    disp_samples = [
+        'board_task_dispatches_total{project="%s",role="%s",model="%s"} %d' % (
+            prom_esc(proj), prom_esc(role), prom_esc(model), cnt)
+        for (proj, role, model), cnt in sorted(dispatches.items())
+    ]
+    add_metric("board_task_dispatches_total", "counter", disp_samples)
+
+    token_samples = [
+        'board_task_dispatch_tokens_total{project="%s",role="%s",model="%s"} %d' % (
+            prom_esc(proj), prom_esc(role), prom_esc(model), tok_cnt)
+        for (proj, role, model), tok_cnt in sorted(dispatch_tokens.items())
+    ]
+    add_metric("board_task_dispatch_tokens_total", "counter", token_samples)
+
+    # 10. board_agents_total{project="...",status="..."} (gauge for agenter)
+    agent_rows = db.execute(
+        "SELECT COALESCE(current_project, '') AS project, COALESCE(status, '') AS status, COUNT(*) AS cnt "
+        "FROM agents GROUP BY current_project, status"
+    ).fetchall()
+    agent_samples = [
+        'board_agents_total{project="%s",status="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["status"]), r["cnt"])
+        for r in agent_rows
+    ]
+    add_metric("board_agents_total", "gauge", agent_samples)
+
+    # 11. board_agent_ctx_percent{agent="...",harness="...",model="..."} (gauge fra agents.ctx_pct der status='alive')
+    ctx_rows = db.execute(
+        "SELECT id, COALESCE(harness, '') AS harness, COALESCE(model, '') AS model, ctx_pct "
+        "FROM agents WHERE status = 'alive' AND ctx_pct IS NOT NULL"
+    ).fetchall()
+    ctx_samples = [
+        'board_agent_ctx_percent{agent="%s",harness="%s",model="%s"} %s' % (
+            prom_esc(r["id"]), prom_esc(r["harness"]), prom_esc(r["model"]), r["ctx_pct"])
+        for r in ctx_rows
+    ]
+    add_metric("board_agent_ctx_percent", "gauge", ctx_samples)
+
+    # 12. board_agent_budget_used_percent{agent="...",harness="...",window="..."} (gauge fra agents.budget json der status='alive')
+    budget_rows = db.execute(
+        "SELECT id, COALESCE(harness, '') AS harness, budget "
+        "FROM agents WHERE status = 'alive' AND budget IS NOT NULL"
+    ).fetchall()
+    budget_samples = []
+    for r in budget_rows:
+        for w in jl(r["budget"], []):
+            if isinstance(w, dict) and w.get("window") and w.get("used_pct") is not None:
+                budget_samples.append(
+                    'board_agent_budget_used_percent{agent="%s",harness="%s",window="%s"} %s' % (
+                        prom_esc(r["id"]), prom_esc(r["harness"]), prom_esc(w["window"]), w["used_pct"]))
+    add_metric("board_agent_budget_used_percent", "gauge", budget_samples)
+
+    # 13. board_questions_total{project="...",kind="...",status="..."} (gauge)
+    q_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(kind, '') AS kind, "
+        "COALESCE(status, '') AS status, COUNT(*) AS cnt "
+        "FROM questions GROUP BY project, kind, status"
+    ).fetchall()
+    q_samples = [
+        'board_questions_total{project="%s",kind="%s",status="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["kind"]), prom_esc(r["status"]), r["cnt"])
+        for r in q_rows
+    ]
+    add_metric("board_questions_total", "gauge", q_samples)
+
+    # 14. board_events_total{project="...",type="..."} (counter fra events grupperer per type)
+    ev_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(type, '') AS type, COUNT(*) AS cnt "
+        "FROM events GROUP BY project, type"
+    ).fetchall()
+    ev_samples = [
+        'board_events_total{project="%s",type="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["type"]), r["cnt"])
+        for r in ev_rows
+    ]
+    add_metric("board_events_total", "counter", ev_samples)
+
+    # 15. board_task_review_findings_total{project="...",repo="...",status="open|fixed"}
+    findings_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(repo, '') AS repo, "
+        "SUM(COALESCE(review_open, 0)) AS s_open, SUM(COALESCE(review_fixed, 0)) AS s_fixed "
+        "FROM tasks GROUP BY project, repo"
+    ).fetchall()
+    findings_samples = []
+    for r in findings_rows:
+        findings_samples.append('board_task_review_findings_total{project="%s",repo="%s",status="open"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), r["s_open"]))
+        findings_samples.append('board_task_review_findings_total{project="%s",repo="%s",status="fixed"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["repo"]), r["s_fixed"]))
+    add_metric("board_task_review_findings_total", "counter", findings_samples)
+
+    # 16. board_roles_active{project="...",role="...",agent="..."} (gauge)
+    role_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(role, '') AS role, COALESCE(agent, '') AS agent "
+        "FROM roles"
+    ).fetchall()
+    role_samples = [
+        'board_roles_active{project="%s",role="%s",agent="%s"} 1' % (
+            prom_esc(r["project"]), prom_esc(r["role"]), prom_esc(r["agent"]))
+        for r in role_rows
+    ]
+    add_metric("board_roles_active", "gauge", role_samples)
+
+    # 17. board_tasks_by_risk_total{project="...",risk="..."} (gauge)
+    risk_rows = db.execute(
+        "SELECT COALESCE(project, '') AS project, COALESCE(risk, 'normal') AS risk, COUNT(*) AS cnt "
+        "FROM tasks GROUP BY project, risk"
+    ).fetchall()
+    risk_samples = [
+        'board_tasks_by_risk_total{project="%s",risk="%s"} %d' % (
+            prom_esc(r["project"]), prom_esc(r["risk"]), r["cnt"])
+        for r in risk_rows
+    ]
+    add_metric("board_tasks_by_risk_total", "gauge", risk_samples)
+
+    return "\n".join(out) + "\n"
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "board/0"
@@ -2256,7 +2642,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         for k, v in extra:
             self.send_header(k, v)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        if "charset=" not in ctype:
+            ctype = ctype + "; charset=utf-8"
+        self.send_header("Content-Type", ctype)
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -2289,6 +2677,10 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(url.query)
         if url.path == "/healthz":            # kubelet probe: no token, no data
             return self.send(200, {"ok": True})
+        if url.path == "/metrics" and method == "GET":
+            with LOCK:
+                text = prometheus_metrics()
+            return self.send(200, text, "text/plain; version=0.0.4; charset=utf-8")
         if not self.authed(q):                # BEFORE the body is read — an
             return self.send(401, {"error": "invalid token"})   # unauthenticated client
         try:                                                    # must not make us allocate
@@ -2337,6 +2729,8 @@ class Handler(BaseHTTPRequestHandler):
     def route(self, method, path, body, q, token):
         if path == "/healthz":
             return {"ok": True}
+        if path == "/metrics" and method == "GET":
+            return self.send(200, prometheus_metrics(), "text/plain; version=0.0.4; charset=utf-8")
         if path == CSS_URL and method == "GET":
             # The content hash is in the filename, so the response can be cached
             # forever: a deploy yields a new URL. That saves the phone 25 kB per page
