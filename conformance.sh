@@ -205,28 +205,42 @@ CLEANH="$TMP/clean-home"; mkdir -p "$CLEANH"
 
 # The repository slug a PR is opened against comes from the git remote, because the task's
 # `repo` field is free text and is "." for a single-repo project — `$FORGE_ORG/.` is not a
-# repository, and the forge refused it. The shape has to be checked, not just emptiness:
-# sed leaves a URL it does not match untouched.
+# repository, and the forge refused it.
+#
+# Like the human-token checks above, this extracts the SHIPPED block from bin/board and
+# runs it, with a stubbed `git` answering the one call it makes. The first version of this
+# section defined its own slug_of()/shaped() copies; review broke the real regex in
+# bin/board and the suite stayed green, which is the whole lesson of this task repeated one
+# commit later.
 echo "== the PR slug comes from the remote, and is shape-checked (T-390) =="
-slug_of() { printf '%s' "$1" | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#'; }
-shaped()  { printf '%s' "$1" | grep -qE '^[^/[:space:]]+/[^/[:space:]]+$'; }
-for u in "https://github.com/knobo/next.git" "git@github.com:knobo/next.git" \
-         "https://git.example.com/org/repo"; do
-  [ "$(slug_of "$u")" = "knobo/next" ] || [ "$(slug_of "$u")" = "org/repo" ] \
-    && ok "slug from $u" || no "slug from $u" "$(slug_of "$u")"
-done
-# Known limitation, asserted rather than assumed: a nested path (a GitLab subgroup) keeps
-# only its last two segments. `forge.kind` is forgejo|github and both are org/repo, so this
-# is out of scope rather than wrong — but it is the shape that would silently open a PR
-# against the wrong project if that ever changed, so pin it down here.
-[ "$(slug_of 'https://gitlab.example.com/group/subgroup/proj.git')" = "subgroup/proj" ] \
-  && ok "a nested path keeps its last two segments (known: subgroups are not supported)" \
-  || no "nested path handling changed" "$(slug_of 'https://gitlab.example.com/group/subgroup/proj.git')"
-# What the shape check is actually for: anything that is not org/repo must fall back rather
-# than reach the forge. An empty remote is the common case (no origin configured).
-shaped "" && no "an empty slug passes the shape check" "" || ok "an empty slug falls back"
-shaped "just-one-segment" && no "a single segment passes the shape check" "" \
-  || ok "a slug with no slash falls back"
+sed -n '/slug=\$(git -C "\$wt" remote get-url origin/,/|| slug="\${FORGE_ORG/p' \
+  "$SRC/bin/board" > "$TMP/slugblock.sh"
+grep -q 'FORGE_ORG' "$TMP/slugblock.sh" && grep -q 'remote get-url' "$TMP/slugblock.sh" \
+  && ok "the real slug block was extracted from bin/board for these checks" \
+  || no "could not extract the slug block — the checks below would test nothing" "$(cat "$TMP/slugblock.sh")"
+cat > "$TMP/fakebin/git" <<'GITSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$FAKE_REMOTE"
+GITSTUB
+chmod +x "$TMP/fakebin/git"
+slug_from() {  # a remote URL -> the slug the SHIPPED block derives
+  FAKE_REMOTE="$1" PATH="$TMP/fakebin:$PATH" \
+    bash -c 'wt=/x; FORGE_ORG=fallbackorg; repo=fallbackrepo
+             . "'"$TMP"'/slugblock.sh"
+             printf "%s\n" "$slug"' 2>/dev/null
+}
+[ "$(slug_from 'https://github.com/knobo/next.git')" = "knobo/next" ] \
+  && ok "https remote -> org/repo" || no "https remote" "$(slug_from 'https://github.com/knobo/next.git')"
+[ "$(slug_from 'git@github.com:knobo/next.git')" = "knobo/next" ] \
+  && ok "ssh remote -> org/repo" || no "ssh remote" "$(slug_from 'git@github.com:knobo/next.git')"
+# The point of the shape check: anything that is not org/repo must fall back to the
+# manifest rather than be handed to the forge as --repo.
+[ "$(slug_from '')" = "fallbackorg/fallbackrepo" ] \
+  && ok "no remote falls back to the manifest instead of reaching the forge" \
+  || no "empty remote" "$(slug_from '')"
+[ "$(slug_from 'not-a-url-at-all')" = "fallbackorg/fallbackrepo" ] \
+  && ok "a remote with no org/repo shape falls back instead of reaching the forge" \
+  || no "shapeless remote" "$(slug_from 'not-a-url-at-all')"
 
 echo "== board without a manifest dies with a message, not unbound variable (T-67) =="
 NOMAN=$(cd "$TMP" && "$SRC/bin/board" test-level T-1 2>&1; echo "rc=$?")
