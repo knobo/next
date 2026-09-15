@@ -19,7 +19,10 @@ T=tst-$RANDOM; P=$((18000 + RANDOM % 900)); D=$(mktemp -d)
 cat > "$D/policy.json" <<'POL'
 {"budget": {"*": {"ceilings": {"5h": 85, "7d": 60}}}}
 POL
-BOARD_TOKEN=$T BOARD_DB=$D/b.db BOARD_POLICY=$D/policy.json BOARD_PORT=$P \
+# A human token, because answering a form is a human action (T-390): without it the
+# confirmation page is never reached and the check below would test the refusal instead.
+HT=hum-$RANDOM
+BOARD_TOKEN=$T BOARD_HUMAN_TOKEN=$HT BOARD_DB=$D/b.db BOARD_POLICY=$D/policy.json BOARD_PORT=$P \
   python3 "$W/board.py" >"$D/log" 2>&1 &
 SRV=$!; trap 'kill $SRV 2>/dev/null; rm -rf "$D"' EXIT
 for _ in $(seq 40); do curl -sf "http://127.0.0.1:$P/healthz" >/dev/null && break; sleep .1; done
@@ -61,6 +64,13 @@ curl -s -H "Authorization: Bearer $T" "$B/tests" | grep -q "It all worked" \
 # the question page must show the deadline note
 curl -s -H "Authorization: Bearer $T" "$B/q/$QID" | grep -q "the agent carries on" \
   && ok "/q shows what the board answers if the deadline runs out" || no "/q is missing the deadline note"
+# The confirmation page must lead somewhere. Landing on a dead end means finding your way
+# back by typing a URL on a phone.
+SAVED=$(curl -s -H "Authorization: Bearer $HT" -H 'Content-Type: application/x-www-form-urlencoded' \
+        -X POST -d 'answer=ok' "$B/q/$TQ/answer")
+grep -q "href='/tests'" <<<"$SAVED" && grep -q "href='/status'" <<<"$SAVED" \
+  && ok "the answer confirmation links back to the test queue and the board" \
+  || no "the confirmation page is a dead end" "$(head -c 160 <<<"$SAVED")"
 # the meter's ceiling line must be there, with its number
 curl -s -H "Authorization: Bearer $T" "$B/status" | grep -q "class=track" \
   && ok "/status renders the meters" || no "/status is missing the meters"
@@ -88,6 +98,12 @@ grep -qE 'prefers-color-scheme: ?dark' "$D/css" && ok "dark mode follows prefers
 for pth in "/status" "/tests" "/q/$QID" "/t/$TID"; do
   curl -s -H "Authorization: Bearer $T" "$B$pth"
 done > "$D/all.html"
+# Pages you only reach by POSTing a form were invisible to this check, and the
+# confirmation page had been rendering unstyled because of it: it used a `.top` class
+# that does not exist in the stylesheet, on the one page you land on after pressing the
+# one button. Render them too, or the class checker keeps having a blind spot exactly
+# where a human is looking.
+printf '%s' "$SAVED" >> "$D/all.html"
 U=$(python3 unknown-classes.py "$D/all.html" ../board.css)
 if [ "$U" = "(none)" ]; then
   ok "every class in the markup exists in the stylesheet"

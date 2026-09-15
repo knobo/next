@@ -159,6 +159,98 @@ check "find() from a worktree gives the primary checkout, and the path does not 
   "$(jq -nc --arg o "$WTROOT" '{o:$o}')" \
   '.o=="'"$TMP/mfroot/project.yaml $TMP/mfroot-worktrees/task/T-2"'"'
 
+# T-390: the human token gate. Two ways to be wrong, and the suite has to catch both:
+# withhold it from the owner (the bug T-390 was filed for) or hand it to an agent (§3.7).
+#
+# These checks run the SHIPPED header of bin/board — everything up to and including the
+# line that decides which token wins — with a stubbed `pass` on PATH. The first version of
+# these checks re-typed the AGENT_SESSION expression inline instead, and review proved
+# what that is worth: reverting the fix in bin/board left all 228 checks green. A check
+# that re-implements the thing it tests only proves the tester can type it twice.
+echo "== the human token gate, against the real bin/board (T-390) =="
+HSDIR="$TMP/harness-home"; mkdir -p "$HSDIR/.codex" "$HSDIR/.grok" "$TMP/fakebin"
+echo '{}' > "$HSDIR/.grok/active_sessions.json"
+cat > "$TMP/fakebin/pass" <<'PASSSTUB'
+#!/usr/bin/env bash
+case "$1" in board/human-token) echo STUB-HUMAN ;; board/token) echo STUB-AGENT ;; *) exit 1 ;; esac
+PASSSTUB
+chmod +x "$TMP/fakebin/pass"
+sed -n '1,/^\[ -n "\$BOARD_HUMAN_TOKEN" \] && BOARD_TOKEN="\$BOARD_HUMAN_TOKEN"$/p' "$SRC/bin/board" > "$TMP/hdr.sh"
+grep -q 'BOARD_TOKEN="\$BOARD_HUMAN_TOKEN"' "$TMP/hdr.sh" \
+  && ok "the real bin/board header was extracted for these checks" \
+  || no "could not extract bin/board's header — the checks below would test nothing" ""
+echo 'case "$BOARD_TOKEN" in STUB-HUMAN) echo human ;; STUB-AGENT) echo agent ;; *) echo other ;; esac' >> "$TMP/hdr.sh"
+tok_as() {  # env assignments -> which token the SHIPPED header selects
+  env -u CLAUDE_CODE_SESSION_ID -u ANTIGRAVITY_AGENT -u ANTIGRAVITY_CONVERSATION_ID \
+      -u GROK_SESSION_ID -u GROK_CLI -u CODEX_SESSION_ID -u CODEX_HOME -u BOARD_HARNESS \
+      -u BOARD_TOKEN -u BOARD_HUMAN_TOKEN -u BOARD_AS_HUMAN -u BOARD_URL \
+      HOME="$HSDIR" PATH="$TMP/fakebin:$PATH" "$@" bash "$TMP/hdr.sh" 2>/dev/null | tail -1
+}
+# §3.7, the direction that must never break: an agent must not end up holding it.
+[ "$(tok_as CLAUDE_CODE_SESSION_ID=x)" = agent ] \
+  && ok "a live claude-code session gets the agent token" || no "claude-code session got the human token" "$(tok_as CLAUDE_CODE_SESSION_ID=x)"
+[ "$(tok_as BOARD_HARNESS=grok)" = agent ] \
+  && ok "an explicitly declared harness gets the agent token" || no "declared harness got the human token" "$(tok_as BOARD_HARNESS=grok)"
+# A codex agent sets NEITHER CODEX_SESSION_ID (not a real variable) nor CODEX_HOME by
+# default. Env evidence alone misses it entirely; the installed-tool probe is what catches
+# it, which is why this fails closed on both kinds of evidence at once.
+[ "$(tok_as)" = agent ] \
+  && ok "a codex/grok agent with no session variable still gets the agent token" \
+  || no "an agent with no session variable reached the human token (§3.7 broken)" "$(tok_as)"
+# And the direction T-390 was filed for: the owner has to be able to get at it.
+[ "$(tok_as BOARD_AS_HUMAN=1)" = human ] \
+  && ok "BOARD_AS_HUMAN=1 gets the owner the human token despite installed harnesses" \
+  || no "the owner cannot reach the human token even when saying so" "$(tok_as BOARD_AS_HUMAN=1)"
+# On a machine with no harness installed at all, no ceremony should be needed.
+CLEANH="$TMP/clean-home"; mkdir -p "$CLEANH"
+[ "$(env -u CLAUDE_CODE_SESSION_ID -u CODEX_HOME -u CODEX_SESSION_ID -u GROK_SESSION_ID \
+      -u GROK_CLI -u BOARD_HARNESS -u BOARD_TOKEN -u BOARD_HUMAN_TOKEN -u BOARD_AS_HUMAN \
+      HOME="$CLEANH" PATH="$TMP/fakebin:$PATH" bash "$TMP/hdr.sh" 2>/dev/null | tail -1)" = human ] \
+  && ok "with no harness installed or running, the owner just gets the human token" \
+  || no "the owner is locked out on a clean machine" ""
+# An explicitly exported token always wins, which is how a deliberate caller passes one in.
+[ "$(tok_as BOARD_HUMAN_TOKEN=STUB-HUMAN CLAUDE_CODE_SESSION_ID=x)" = human ] \
+  && ok "an explicitly exported BOARD_HUMAN_TOKEN wins over the sniffing" || no "exported human token ignored" ""
+
+# The repository slug a PR is opened against comes from the git remote, because the task's
+# `repo` field is free text and is "." for a single-repo project — `$FORGE_ORG/.` is not a
+# repository, and the forge refused it.
+#
+# Like the human-token checks above, this extracts the SHIPPED block from bin/board and
+# runs it, with a stubbed `git` answering the one call it makes. The first version of this
+# section defined its own slug_of()/shaped() copies; review broke the real regex in
+# bin/board and the suite stayed green, which is the whole lesson of this task repeated one
+# commit later.
+echo "== the PR slug comes from the remote, and is shape-checked (T-390) =="
+sed -n '/slug=\$(git -C "\$wt" remote get-url origin/,/|| slug="\${FORGE_ORG/p' \
+  "$SRC/bin/board" > "$TMP/slugblock.sh"
+grep -q 'FORGE_ORG' "$TMP/slugblock.sh" && grep -q 'remote get-url' "$TMP/slugblock.sh" \
+  && ok "the real slug block was extracted from bin/board for these checks" \
+  || no "could not extract the slug block — the checks below would test nothing" "$(cat "$TMP/slugblock.sh")"
+cat > "$TMP/fakebin/git" <<'GITSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$FAKE_REMOTE"
+GITSTUB
+chmod +x "$TMP/fakebin/git"
+slug_from() {  # a remote URL -> the slug the SHIPPED block derives
+  FAKE_REMOTE="$1" PATH="$TMP/fakebin:$PATH" \
+    bash -c 'wt=/x; FORGE_ORG=fallbackorg; repo=fallbackrepo
+             . "'"$TMP"'/slugblock.sh"
+             printf "%s\n" "$slug"' 2>/dev/null
+}
+[ "$(slug_from 'https://github.com/knobo/next.git')" = "knobo/next" ] \
+  && ok "https remote -> org/repo" || no "https remote" "$(slug_from 'https://github.com/knobo/next.git')"
+[ "$(slug_from 'git@github.com:knobo/next.git')" = "knobo/next" ] \
+  && ok "ssh remote -> org/repo" || no "ssh remote" "$(slug_from 'git@github.com:knobo/next.git')"
+# The point of the shape check: anything that is not org/repo must fall back to the
+# manifest rather than be handed to the forge as --repo.
+[ "$(slug_from '')" = "fallbackorg/fallbackrepo" ] \
+  && ok "no remote falls back to the manifest instead of reaching the forge" \
+  || no "empty remote" "$(slug_from '')"
+[ "$(slug_from 'not-a-url-at-all')" = "fallbackorg/fallbackrepo" ] \
+  && ok "a remote with no org/repo shape falls back instead of reaching the forge" \
+  || no "shapeless remote" "$(slug_from 'not-a-url-at-all')"
+
 echo "== board without a manifest dies with a message, not unbound variable (T-67) =="
 NOMAN=$(cd "$TMP" && "$SRC/bin/board" test-level T-1 2>&1; echo "rc=$?")
 check "test-level without a manifest: a message, no unbound variable" \
@@ -936,6 +1028,31 @@ for p in "/status?t=$TOKEN" "/tests" ${QID:+"/q/$QID"} ${TID:+"/t/$TID"}; do
 done
 code=$(curl -so /dev/null -w '%{http_code}' "$BOARD_URL/status")
 [ "$code" = 401 ] && ok "without a token: 401" || no "without a token it must be 401" "HTTP $code"
+
+# T-390: a page rendered with an agent token looks identical to one rendered with the
+# human token, and then refuses every answer. The identity has to be ON the page, and a
+# refused form has to be a page rather than a JSON blob on a phone.
+AGP=$(curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status")
+grep -q '>agent<' <<<"$AGP" \
+  && ok "an agent-token page says it is signed in as an agent" \
+  || no "the agent-token page does not say which identity it carries" "$(grep -o 'badge-[a-z]*' <<<"$AGP" | sort -u | tr '\n' ' ')"
+if [ "$OWN_SERVER" = 1 ]; then
+  AQ=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"identitet?\"}" | jq -r .id)
+  FORM=$(curl -s -o "$TMP/refused" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+         -H 'Content-Type: application/x-www-form-urlencoded' \
+         -X POST -d 'answer=yes' "$BOARD_URL/q/$AQ/answer")
+  [ "$FORM" = 403 ] && grep -q 'board open' "$TMP/refused" \
+    && ok "a refused form answer is an HTML page that says how to fix it, not JSON" \
+    || no "refused form answer" "HTTP $FORM: $(head -c 120 "$TMP/refused")"
+  grep -q '{"error"' "$TMP/refused" \
+    && no "the refused form still returns raw JSON" "$(head -c 80 "$TMP/refused")" \
+    || ok "the refused form returns no raw JSON"
+  hum POST "/questions/$AQ/answer" '{"answer":"yes","by":"human"}' >/dev/null
+  HP=$(curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status")
+  grep -q ">$(printf %s "${BOARD_HUMAN:-human}")<" <<<"$HP" \
+    && ok "a human-token page says it is signed in as the human" \
+    || no "the human-token page does not name the human" "$(grep -o 'badge-sm badge-[a-z]*>[a-z]*' <<<"$HP" | head -3)"
+fi
 TH=$(curl -sL -c "$J" -b "$J" "$BOARD_URL/t/$TID")
 if grep -q "$TID" <<<"$TH" && grep -q "timeline" <<<"$TH" && grep -q "the owner.s state" <<<"$TH" && grep -q "#201" <<<"$TH"; then
   ok "GET /t/<id> is a task page with a PR number and a timeline"
