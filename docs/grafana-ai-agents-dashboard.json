@@ -252,7 +252,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 4
+        "y": 16
       },
       "id": 10,
       "targets": [
@@ -304,7 +304,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 4
+        "y": 16
       },
       "id": 11,
       "options": {
@@ -352,7 +352,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 4
+        "y": 16
       },
       "id": 12,
       "targets": [
@@ -374,7 +374,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 12
+        "y": 24
       },
       "id": 20,
       "options": {
@@ -409,7 +409,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 12
+        "y": 24
       },
       "id": 21,
       "targets": [
@@ -444,7 +444,7 @@
         "h": 8,
         "w": 16,
         "x": 0,
-        "y": 20
+        "y": 32
       },
       "id": 30,
       "targets": [
@@ -489,7 +489,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 20
+        "y": 32
       },
       "id": 31,
       "options": {
@@ -504,6 +504,139 @@
       ],
       "title": "\u00c5pne Sp\u00f8rsm\u00e5l & Testkort",
       "type": "stat"
+    },
+    {
+      "id": 40,
+      "title": "Tilgjengelige Oppgaver i K\u00f8 (Open per Prosjekt)",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "targets": [
+        {
+          "expr": "sum by (project) (board_tasks_total{status=\"open\", project=~\"\"})",
+          "legendFormat": "{{project}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 41,
+      "title": "Oppgaver per Prosjekt fordelt p\u00e5 Status (Aktiv K\u00f8)",
+      "type": "barchart",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "targets": [
+        {
+          "expr": "sum by (project, status) (board_tasks_total{project=~\"\", status!=\"archived\"})",
+          "legendFormat": "{{project}} - {{status}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "stacking": {
+          "mode": "normal"
+        },
+        "groupWidth": 0.7,
+        "barWidth": 0.8
+      }
+    },
+    {
+      "id": 42,
+      "title": "Oversiktstabell: Oppgaver per Prosjekt, Repo & Status",
+      "type": "table",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "targets": [
+        {
+          "expr": "board_tasks_total{project=~\"\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "project",
+                "repo",
+                "status",
+                "Value"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "project": "Prosjekt",
+              "repo": "Repository",
+              "status": "Status",
+              "Value": "Antall Oppgaver"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Prosjekt"
+              },
+              {
+                "field": "Status"
+              }
+            ]
+          }
+        }
+      ]
     }
   ],
   "refresh": "15s",
@@ -538,5 +671,5 @@
   "timezone": "browser",
   "title": "AI Agents & /next Coordination Swarm",
   "uid": "ai-agents-board",
-  "version": 1
+  "version": 2
 }
