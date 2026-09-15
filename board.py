@@ -891,6 +891,23 @@ def dispatch_of(b):
 
 def task_progress(tid, aid, b):
     t = task(tid)
+    # done/archived clear the owner, so owns() would 409 every late append — a
+    # subagent archives, the coordinator's --tokens never lands, cost.complete
+    # stays false forever (T-396). Append-only (note/dispatch/tokens/result)
+    # writes the event and leaves the row alone. worktree/branch/pr/status
+    # still mutate the row, so they stay refused. orphaned keeps the 409:
+    # that guard exists so progress does not write a worktree into a row the
+    # reaper took.
+    if t["status"] in ("done", "archived"):
+        same_project(agent(aid), t["project"])
+        locked = [k for k in ("worktree", "branch", "pr", "status") if k in b]
+        if locked:
+            raise Err(400, "cannot set %s on a %s task — append-only (note, dispatch, tokens, result)"
+                      % (", ".join(locked), t["status"]))
+        dispatch = dispatch_of(b)
+        ev(t["project"], "task/" + tid, "task.progress", aid, note=b.get("note"),
+           dispatch=dispatch, result=b.get("result"))
+        return {"ok": True}
     owns(t, aid)
     dispatch = dispatch_of(b)
     # `status` is set by the dedicated transitions, not by a free-text field in progress.
