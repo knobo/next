@@ -203,8 +203,9 @@ tok_as() {  # env assignments -> which token the SHIPPED header selects
   || no "the owner cannot reach the human token even when saying so" "$(tok_as BOARD_AS_HUMAN=1)"
 # On a machine with no harness installed at all, no ceremony should be needed.
 CLEANH="$TMP/clean-home"; mkdir -p "$CLEANH"
-[ "$(env -u CLAUDE_CODE_SESSION_ID -u CODEX_HOME -u CODEX_SESSION_ID -u GROK_SESSION_ID \
-      -u GROK_CLI -u BOARD_HARNESS -u BOARD_TOKEN -u BOARD_HUMAN_TOKEN -u BOARD_AS_HUMAN \
+[ "$(env -u CLAUDE_CODE_SESSION_ID -u ANTIGRAVITY_AGENT -u ANTIGRAVITY_CONVERSATION_ID \
+      -u CODEX_HOME -u CODEX_SESSION_ID -u GROK_SESSION_ID \
+      -u GROK_CLI -u BOARD_HARNESS -u BOARD_TOKEN -u BOARD_HUMAN_TOKEN -u BOARD_AS_HUMAN -u BOARD_URL \
       HOME="$CLEANH" PATH="$TMP/fakebin:$PATH" bash "$TMP/hdr.sh" 2>/dev/null | tail -1)" = human ] \
   && ok "with no harness installed or running, the owner just gets the human token" \
   || no "the owner is locked out on a clean machine" ""
@@ -848,6 +849,24 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
     '[.tasks[]|select(.title|startswith("FAIL from human test of '"$T8ID"'"))]|length==1'
   check "and the done task does not rise again" "$(api GET /tasks/$T8ID)" '.status=="done"'
 
+  # Cleanup of dead agents and done tasks (T-402)
+  DEAD_A=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-dead","session":"s-dead"}' | jq -r .id)
+  sql "UPDATE agents SET last_seen='$PAST' WHERE id='$DEAD_A'"
+  check "agents cleanup marks dead agents as finished" \
+    "$(api POST /agents/cleanup '{"project":"demo","older_than":"24h"}')" \
+    '.ok==true and (.agents|index("'"$DEAD_A"'") != null)'
+  check "cleaned dead agent is finished" \
+    "$(api GET "/status?project=demo")" \
+    '[.projects[0].agents[]|select(.id=="'"$DEAD_A"'")]|length==0'
+
+  CLEAN_T=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"title\":\"to-cleanup\"}" | jq -r .id)
+  sql "UPDATE tasks SET status='done', updated='$PAST' WHERE id='$CLEAN_T'"
+  check "tasks cleanup archives done tasks" \
+    "$(api POST /tasks/cleanup '{"project":"demo","older_than":"0"}')" \
+    '.ok==true and (.tasks|index("'"$CLEAN_T"'") != null)'
+  check "cleaned task has status archived" \
+    "$(api GET /tasks/$CLEAN_T)" '.status=="archived"'
+
   # BOARD_LEASE_MIN=0 would have orphaned everything at once on the next tick. The clamp
   # must prevent that.
   # A free port, not PORT+1: several agents run the suite at the same time, and a fixed
@@ -1311,6 +1330,20 @@ W=$(cli task worktree "$WT_T")
 check "the worktree is built from the pushed branch, not from main" "$W" '.base=="origin"'
 if [ -f "$(jq -r .worktree <<<"$W")/done.md" ]; then ok "the work is there after a takeover"
 else no "the work is there after a takeover" "done.md is missing from $(jq -r .worktree <<<"$W")"; fi
+
+if [ "$OWN_SERVER" = 1 ]; then
+  DEAD_CLI_A=$(cli register --model claude-sonnet-5 --session s-cli-dead | jq -r .id)
+  sql "UPDATE agents SET last_seen='$PAST' WHERE id='$DEAD_CLI_A'"
+  check "cli agent cleanup cleans dead agents" \
+    "$(cli agent cleanup --older-than 24h)" \
+    '.ok==true and (.agents|index("'"$DEAD_CLI_A"'") != null)'
+
+  CLEAN_CLI_T=$(cli task create --title "to-cli-cleanup" --repo web | jq -r .id)
+  sql "UPDATE tasks SET status='done', updated='$PAST' WHERE id='$CLEAN_CLI_T'"
+  check "cli task cleanup-done archives done tasks" \
+    "$(cli task cleanup-done)" \
+    '.ok==true and (.tasks|index("'"$CLEAN_CLI_T"'") != null)'
+fi
 
 # T-142: what the automatic test requires is a property of the test, not of the CLI. An agent
 # without a browser must be able to run a `how` that is not a browser test.
