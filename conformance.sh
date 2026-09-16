@@ -58,7 +58,7 @@ else
 {"grants": {"demo": {"claude-code@*": ["merge","deploy-dev"], "codex@*": ["deploy-dev"], "*": []}},
  "budget": {"demo": {"ceilings": {"5h": 85, "7d": 75}},
             "zerobudget": {"ceilings": {"7d": 0}},
-            "rampproject": {"ceilings": {"7d": 60}},
+            "rampproject": {"ceilings": {"7d": 60, "session": 60}},
             "fallbackproject": {"ceilings": {"5h": 85}, "fallback": {"max_tasks": 1}},
             "oldshape": {"rl7_ceiling": 60}},
  "roles": {"coordinator": {"singleton": true, "requires": ["merge"], "prefer_model": ["fable","opus","sonnet"]},
@@ -387,7 +387,22 @@ check "…resets in 12 hours: effective ceiling ~89 → no stop" \
   '.stop==null and .effective_ceilings["7d"]>88 and .effective_ceilings["7d"]<90'
 check "…no resets_at: fixed ceiling → stop" "$(rstop "")" \
   '(.stop|test("7d")) and .effective_ceilings["7d"]==60'
+check "…naive ISO resets_at (no offset) in 12 hours: read as UTC, /status 200, ramped" \
+  "$(rstop ",\"resets_at\":\"$(date -u -d '+12 hours' +%FT%T)\"")" \
+  '.stop==null and .effective_ceilings["7d"]>88'
+check "…garbage resets_at is dropped at ingest: fixed ceiling → stop" \
+  "$(rstop ",\"resets_at\":\"not-a-time\"")" \
+  '(.stop|test("7d")) and .effective_ceilings["7d"]==60 and (.budget[0]|has("resets_at")|not)'
+check "…resets_at already past: no ramp → stop" \
+  "$(rstop ",\"resets_at\":$(date -u -d '-1 hour' +%s)")" \
+  '(.stop|test("7d")) and .effective_ceilings["7d"]==60'
 api POST /agents/$RID/finished '{"reason":"conformance done"}' >/dev/null
+UID_=$(api POST /agents '{"project":"rampproject","harness":"ramp2","host":"h","session":"u1"}' | jq -r .id)
+api POST /agents/$UID_/heartbeat "{\"budget\":[{\"window\":\"session\",\"used_pct\":70,\"resets_at\":\"$(date -u -d '+1 hour' +%FT%TZ)\"}]}" >/dev/null
+check "unknown window name near reset: length unknown → no ramp" \
+  "$(api GET '/status?project=rampproject' | jq -c '.projects[0].agents[]|select(.id=="'"$UID_"'")')" \
+  '.effective_ceilings.session==60 and (.stop|test("session"))'
+api POST /agents/$UID_/finished '{"reason":"conformance done"}' >/dev/null
 
 SA=$(api GET '/status?project=otherproject')
 check "a project with no budget line has no ceiling — stop, not free rein" "$SA" \

@@ -268,8 +268,13 @@ def window_minutes(name):
     """"5h" → 300. The window name IS the length of the window, and the length is the
     filter the reading is remembered within (T-192). An unknown shape is remembered for
     seven days: too long is safe, too short is a silent quota blackout."""
+    return known_minutes(name) or 7 * 24 * 60
+
+
+def known_minutes(name):
+    """Window length when the name states it ("5h" → 300), else None."""
     m = re.fullmatch(r"(\d+)\s*([mhdw])", win_name(name))
-    return int(m.group(1)) * WIN_UNIT[m.group(2)] if m else 7 * 24 * 60
+    return int(m.group(1)) * WIN_UNIT[m.group(2)] if m else None
 
 
 def windows_of(a):
@@ -294,14 +299,26 @@ def resets_of(a):
     for w in (raw if isinstance(raw, list) else jl(raw)):
         if not isinstance(w, dict) or w.get("window") is None or w.get("resets_at") in (None, ""):
             continue
-        r = w["resets_at"]
-        try:
-            t = (datetime.fromtimestamp(num(r), timezone.utc) if num(r) is not None
-                 else ts(str(r)))
-        except (ValueError, OverflowError, OSError):
-            continue
-        out[win_name(w["window"])] = (t - datetime.now(timezone.utc)).total_seconds() / 60
+        t = reset_time(w["resets_at"])
+        left = (t - datetime.now(timezone.utc)).total_seconds() / 60 if t else None
+        # A reset already past is a stale reading from the previous cycle: no ramp.
+        if left is not None and left > 0:
+            out[win_name(w["window"])] = left
     return out
+
+
+def reset_time(r):
+    """`resets_at` (ISO text or epoch seconds) as an aware UTC datetime, or None when it is
+    not a usable time. Naive ISO is read as UTC. Never raises: one bad heartbeat must not
+    break /status or the stop rules for the fleet."""
+    try:
+        t = (datetime.fromtimestamp(num(r), timezone.utc) if num(r) is not None
+             else ts(str(r)))
+        if t is None:
+            return None
+        return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
 
 
 def effective_ceilings(a, ceilings):
@@ -312,8 +329,8 @@ def effective_ceilings(a, ceilings):
     out = {}
     for name, ceil in ceilings.items():
         c = float(ceil)
-        if name in left:
-            progress = min(1.0, max(0.0, 1 - left[name] / (0.25 * window_minutes(name))))
+        if name in left and known_minutes(name):     # unknown length → no ramp
+            progress = min(1.0, max(0.0, 1 - left[name] / (0.25 * known_minutes(name))))
             c += (100 - c) * progress
         out[name] = round(c, 1)
     return out
@@ -361,6 +378,8 @@ def agent_stop(a, project):
     # Same harness as the agent itself: quota is per vendor account, not per machine.
     b, acct = budget(project), quota_max(a["harness"] or "claude-code")
     ceilings = {win_name(k): v for k, v in b["ceilings"].items()}
+    # The ramp uses this agent's own resets_at against the account-wide max: same account
+    # means same reset time, and a missing/past resets_at falls back to the fixed ceiling.
     mine, eff = windows_of(a), effective_ceilings(a, ceilings)
     for name in sorted(mine):
         pct = max(mine[name], acct.get(name, 0.0))
@@ -670,6 +689,9 @@ def budget_in(b):
         raise Err(400, "budget must be a list of windows, not %s" % type(b["budget"]).__name__)
     if isinstance(b.get("budget"), list):
         ws = [w for w in b["budget"] if isinstance(w, dict) and num(w.get("used_pct")) is not None]
+        for w in ws:                    # garbage resets_at is dropped here, not stored
+            if w.get("resets_at") not in (None, "") and reset_time(w["resets_at"]) is None:
+                del w["resets_at"]
         # A list that SHRINKS to empty is not the same as an empty list: the statusline
         # hook sends {window:"5h", used_pct:null} every time `rate_limits` is missing from
         # the payload (API key, Bedrock, or a miss). If we wrote that, an agent that just
