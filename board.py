@@ -1065,10 +1065,12 @@ def task_claim(tid, aid):
     # An `in_review` keeps its status through a claim: the new owner is to review what is
     # there, not start the task over. Worktree, branch and PR are on the board.
     # 'blocked' is here only for owner IS NULL: a task blocked by a live owner is never
-    # claimable this way (design: the reaper never orphans blocked, and a dead owner is
-    # taken over via owns(), not reassigned). owner IS NULL + blocked cannot happen going
-    # forward (task_blocked now requires ownership) but existing rows in that state — the
-    # dead end this task fixes — recover through the ordinary claim path instead of a
+    # claimable this way — the reaper orphans it once the owner dies (reap() orphans on
+    # owner death regardless of status; it only exempts awaiting_human/blocked from lease
+    # expiry, not from a dead owner), and from there it is taken over as 'orphaned', not
+    # reassigned in place. owner IS NULL + blocked cannot happen going forward (task_blocked
+    # now claims the task when it blocks one nobody owns) but existing rows in that state —
+    # the dead end this task fixes — recover through the ordinary claim path instead of a
     # bespoke repair command.
     cur = db.execute("UPDATE tasks SET status=CASE status WHEN 'in_review' THEN 'in_review'"
                      " ELSE 'claimed' END, owner=?, lease_until=?, updated=? "
@@ -1212,12 +1214,23 @@ def task_patch(tid, aid, b):
 def task_blocked(tid, aid, b):
     t = task(tid)
     # Ownership, like every other state change (task_patch, task_progress, release,
-    # gate_merge). Without this, any agent could block a task it does not own — including
-    # one still `open` with owner NULL — leaving a row that is blocked with no owner: it can
-    # then be claimed nowhere ("the task is taken", blocked is not a claimable status) nor
-    # annotated (owns() reads NULL owner as "no longer yours"). A dead end with no way out.
-    owns(t, aid)
-    db.execute("UPDATE tasks SET status='blocked', updated=? WHERE id=?", (now(), tid))
+    # gate_merge) — a task owned by someone else is refused via owns() below. But a task
+    # nobody owns yet (open/orphaned/in_review with owner IS NULL — e.g. an orphaned task
+    # found via takeover.md before it was ever claimed) is the one case owns() cannot be
+    # used for unchanged: it reads NULL owner as "no longer yours" and refuses outright,
+    # leaving no way to block work nobody owns. So blocking it claims it in the same step —
+    # a blocked task always has an owner afterwards, and the old dead end (blocked with no
+    # owner, unclaimable and unannotatable) cannot arise going forward. Legacy rows already
+    # stuck in it recover through task_claim instead (see task_claim's comment), not here.
+    if t["owner"] is None and t["status"] in ("open", "orphaned", "in_review"):
+        cur = db.execute("UPDATE tasks SET status='blocked', owner=?, updated=? "
+                         "WHERE id=? AND owner IS NULL",
+                         (aid, now(), tid)).rowcount
+        if not cur:
+            raise Err(409, "the task is taken", owner=t["owner"], status=t["status"])
+    else:
+        owns(t, aid)
+        db.execute("UPDATE tasks SET status='blocked', updated=? WHERE id=?", (now(), tid))
     ev(t["project"], "task/" + tid, "task.blocked", aid, note=b.get("note"))
     ntfy("⛔ %s %s blocked" % (t["project"], tid), b.get("note") or t["title"],
          "%s/t/%s" % (BASE_URL, tid))
