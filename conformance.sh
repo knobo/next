@@ -762,9 +762,25 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
   PAST=2020-01-01T00:00:00Z
   sql "UPDATE tasks SET lease_until='$PAST' WHERE id='$T3ID'"
 
-  check "an expired lease is stalled despite a living heartbeat" "$(api GET '/status?project=demo')" \
-    '[.projects[0].agents[]|select(.id=="'"$CID"'")][0].status=="stalled"'
-  check "a stalled agent gets no new task" "$(api GET "/tasks/next?agent=$CID")" '.error'
+  # Poll observed state instead of asserting right after the direct sqlite3 write from
+  # another connection (the same T-184 flake, see the poll above): the API's own connection
+  # is not guaranteed to observe it on the very next read.
+  STALLED=0
+  for _ in $(seq 20); do
+    jq -e '[.projects[0].agents[]|select(.id=="'"$CID"'")][0].status=="stalled"' >/dev/null 2>&1 \
+      <<<"$(api GET '/status?project=demo')" && { STALLED=1; break; }
+    sleep .2
+  done
+  [ "$STALLED" = 1 ] && ok "an expired lease is stalled despite a living heartbeat" \
+    || no "an expired lease is stalled despite a living heartbeat" "never observed stalled"
+
+  NOTASK=0
+  for _ in $(seq 20); do
+    jq -e '.error' >/dev/null 2>&1 <<<"$(api GET "/tasks/next?agent=$CID")" && { NOTASK=1; break; }
+    sleep .2
+  done
+  [ "$NOTASK" = 1 ] && ok "a stalled agent gets no new task" \
+    || no "a stalled agent gets no new task" "never got .error"
 
   # A pinned role is the human's choice. `stalled` is a new status value, and any
   # enumeration of statuses that does not know it steals the role from a living holder.
