@@ -1467,6 +1467,20 @@ if [ "$OWN_SERVER" = 1 ]; then
   check "the reaper does not orphan on silence alone (Q-107)" "$(api GET /tasks/$SILT)" \
     '.status=="claimed" and .owner=="'"$CLIID"'"'
   sql "UPDATE tasks SET status='done', owner=NULL WHERE id='$SILT'"
+
+  # T-278 review finding 65: task_blocked never clears agents.current_task, so a `blocked`
+  # task (a documented wait, same as awaiting_human) must not read as an agent gone quiet.
+  echo "== silent_min: a blocked task is a documented wait, not silence =="
+  BLKT=$(cli task create --title "blocked silent test" --repo web | jq -r .id)
+  cli task claim "$BLKT" >/dev/null
+  cli task blocked "$BLKT" "waiting for an answer" >/dev/null
+  sql "UPDATE events SET ts='$PAST' WHERE stream='task/$BLKT' AND type IN ('task.claimed','task.progress')"
+  check "a blocked task does not nudge the agent" "$(cli status --me)" \
+    '.agent.current_task=="'"$BLKT"'" and .agent.silent_min==null and .nudge==null'
+  check "a blocked task is not counted in the silent tile" \
+    "$(api GET '/status?project=demo')" \
+    '[.projects[0].agents[]|select(.id=="'"$CLIID"'")][0].silent_min==null'
+  sql "UPDATE tasks SET status='done', owner=NULL WHERE id='$BLKT'"
 fi
 
 check "task create without --project" "$(cli task create --title "cli task" --repo web)" '.id'

@@ -520,14 +520,24 @@ def status_of(a):
 
 def silent_min(a):
     """Minutes since the last task.claimed/task.progress event on the task this agent
-    currently owns. None when it owns no task — silence is only measurable against
-    something to be silent on. Q-107: purely informational, the reaper never reads this."""
+    currently owns. None when it owns no task, or the task is not `claimed` — silence is
+    only measurable, and only a concern, while the agent is actually meant to be working
+    it. `blocked`/`awaiting_human` are documented waits (task_blocked/human.test_requested
+    never clear current_task, so without this check a blocked agent reads as gone quiet);
+    `in_review`/`merging`/`done`/`archived` have moved past the agent's own coding.
+    Q-107: purely informational, the reaper never reads this."""
     tid = a["current_task"]
     if not tid:
         return None
+    t = db.execute("SELECT project, status FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not t or t["status"] != "claimed":
+        return None
+    # project=? lets this hit the events_stream(project, stream, id) index instead of a
+    # full table scan per agent per /status render.
     r = db.execute(
-        "SELECT MAX(ts) m FROM events WHERE stream=? AND type IN ('task.claimed','task.progress')",
-        ("task/" + tid,)).fetchone()
+        "SELECT MAX(ts) m FROM events WHERE project=? AND stream=? "
+        "AND type IN ('task.claimed','task.progress')",
+        (t["project"], "task/" + tid)).fetchone()
     return int(mins_since(r["m"])) if r and r["m"] else None
 
 
