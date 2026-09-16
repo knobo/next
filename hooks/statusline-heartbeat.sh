@@ -12,7 +12,8 @@ AGENT_ID=$(cat "$HOME/.cache/board/agent" 2>/dev/null)
    ctx_pct:.context_window.used_percentage, cwd:.workspace.current_dir,
    budget:[{window:"5h", used_pct:.rate_limits.five_hour.used_percentage,
             resets_at:.rate_limits.five_hour.resets_at},
-           {window:"7d", used_pct:.rate_limits.seven_day.used_percentage}]
+           {window:"7d", used_pct:.rate_limits.seven_day.used_percentage,
+            resets_at:.rate_limits.seven_day.resets_at}]
            | map(select(.used_pct != null))}' <<<"$input" \
  | curl -s -m 1 -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \
      -d @- "$BOARD_URL/api/v1/agents/$AGENT_ID/heartbeat" >/dev/null 2>&1 & )

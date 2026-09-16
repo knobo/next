@@ -327,7 +327,8 @@ Heartbeats are written to `events` like everything else. A nightly job can compa
    ctx_pct:.context_window.used_percentage,
    budget:[{window:"5h", used_pct:.rate_limits.five_hour.used_percentage,
             resets_at:.rate_limits.five_hour.resets_at},
-           {window:"7d", used_pct:.rate_limits.seven_day.used_percentage}]
+           {window:"7d", used_pct:.rate_limits.seven_day.used_percentage,
+            resets_at:.rate_limits.seven_day.resets_at}]
            | map(select(.used_pct != null)),      # no reading ≠ a window at 0
    cwd:.workspace.current_dir}' <<<"$input" \
  | curl -s -m 1 -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \

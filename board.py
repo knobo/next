@@ -286,6 +286,39 @@ def windows_of(a):
     return out
 
 
+def resets_of(a):
+    """{name: minutes until reset} for the agent's windows that report `resets_at` (ISO
+    text or epoch seconds — the statusline passes on whatever the harness gives)."""
+    raw = a.get("budget") if isinstance(a, dict) else a["budget"]
+    out = {}
+    for w in (raw if isinstance(raw, list) else jl(raw)):
+        if not isinstance(w, dict) or w.get("window") is None or w.get("resets_at") in (None, ""):
+            continue
+        r = w["resets_at"]
+        try:
+            t = (datetime.fromtimestamp(num(r), timezone.utc) if num(r) is not None
+                 else ts(str(r)))
+        except (ValueError, OverflowError, OSError):
+            continue
+        out[win_name(w["window"])] = (t - datetime.now(timezone.utc)).total_seconds() / 60
+    return out
+
+
+def effective_ceilings(a, ceilings):
+    """«Use up the quota before reset» (T-428, assumes Q-249 default): over the last 25 %
+    of a window's length before `resets_at` the ceiling rises linearly to 100 — quota left
+    unspent at reset is lost anyway. A window with no `resets_at` keeps its fixed ceiling."""
+    left = resets_of(a)
+    out = {}
+    for name, ceil in ceilings.items():
+        c = float(ceil)
+        if name in left:
+            progress = min(1.0, max(0.0, 1 - left[name] / (0.25 * window_minutes(name))))
+            c += (100 - c) * progress
+        out[name] = round(c, 1)
+    return out
+
+
 def quota_max(harness="claude-code"):
     """Quota is per account, not per session: two `/next` sessions on different machines
     or in different projects share the same windows. The stop rules must therefore read
@@ -328,15 +361,15 @@ def agent_stop(a, project):
     # Same harness as the agent itself: quota is per vendor account, not per machine.
     b, acct = budget(project), quota_max(a["harness"] or "claude-code")
     ceilings = {win_name(k): v for k, v in b["ceilings"].items()}
-    mine = windows_of(a)
+    mine, eff = windows_of(a), effective_ceilings(a, ceilings)
     for name in sorted(mine):
         pct = max(mine[name], acct.get(name, 0.0))
-        ceil = ceilings.get(name)
+        ceil = eff.get(name)
         if ceil is None:
             return ("window %s has no ceiling in the policy — set budget.%s.ceilings.%s"
                     % (name, project, name))
-        if pct >= float(ceil):
-            return "%s: %g%% used of the %s%% ceiling (per account, all sessions)" % (name, pct, ceil)
+        if pct >= ceil:
+            return "%s: %g%% used of the %g%% ceiling (per account, all sessions)" % (name, pct, ceil)
     if mine:
         return None
     # `reports-quota` is self-declared (§3.7) and is set by `board probe` only when the
@@ -1722,6 +1755,8 @@ def status(project=None):
             # the board answers in full: if `stop` is set, the agent must stop. Thresholds
             # belong here, not spread across every SKILL that reads the board (T-164).
             d["stop"] = agent_stop(a, name)
+            d["effective_ceilings"] = effective_ceilings(
+                a, {win_name(k): v for k, v in budget(name)["ceilings"].items()})
             agents.append(d)
         out["projects"].append({
             "name": name, "phase": p["phase"], "goal": p["goal"], "paused": p["paused"],
