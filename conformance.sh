@@ -893,16 +893,28 @@ check "project isolation (403)" "$(api POST /agents '{"project":"otherproject","
 if [ "$OWN_SERVER" = 1 ]; then
   QLINES=$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)
 fi
-check "finished releases everything" "$(api POST /agents/$AID/finished '{"reason":"queue empty"}')" '.ok'
+check "finished releases everything" "$(api POST /agents/$AID/finished '{}')" '.ok'
 if [ "$OWN_SERVER" = 1 ]; then
   sleep .3
   [ "$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)" = "$QLINES" ] \
-    && ok "finished with the routine 'queue empty' reason pushes nothing" \
-    || no "finished with the routine 'queue empty' reason pushes nothing" \
+    && ok "finished with no reason (the real queue-empty caller, SKILL.md:71) pushes nothing" \
+    || no "finished with no reason (the real queue-empty caller, SKILL.md:71) pushes nothing" \
        "$(tail -n +$((QLINES + 1)) "$TMP/ntfy" 2>/dev/null)"
+  # Other routine, expected exits: "queue empty" said explicitly, and "session end" from
+  # the SessionEnd hook (hooks/session-end.sh) that fires on every clean exit. Case
+  # varies to prove the match is case-insensitive.
+  for r in "Queue Empty" "session end"; do
+    QLINES=$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)
+    api POST /agents/$AID/finished "$(jq -nc --arg r "$r" '{reason:$r}')" >/dev/null
+    sleep .3
+    [ "$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)" = "$QLINES" ] \
+      && ok "finished with routine reason '$r' pushes nothing" \
+      || no "finished with routine reason '$r' pushes nothing" \
+         "$(tail -n +$((QLINES + 1)) "$TMP/ntfy" 2>/dev/null)"
+  done
   # finished() must still link to /status when a non-routine reason has no current task
-  # (T-389's fallback) — 'queue empty' above no longer pushes at all, so that path needs
-  # its own agent with a real reason to stay covered.
+  # (T-389's fallback) — the routine reasons above no longer push at all, so that path
+  # needs its own agent with a real reason to stay covered.
   NOTASKAG=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"nt","session":"nt"}' | jq -r .id)
   api POST "/agents/$NOTASKAG/finished" '{"reason":"no task click check"}' >/dev/null
   for _ in $(seq 50); do grep -q "no task click check" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done

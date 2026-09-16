@@ -756,14 +756,19 @@ def finished(aid, b):
     db.execute("UPDATE agents SET status='finished', current_task=NULL WHERE id=?", (aid,))
     db.execute("DELETE FROM roles WHERE agent=?", (aid,))
     ev(a["current_project"], "agent/" + aid, "agent.finished", aid, reason=b.get("reason"))
-    # An agent that stands down must not do it silently — UNLESS the reason is the
-    # routine "queue empty" (skill/reference/protocol.md:18): a fleet running overnight
-    # ends every session that way, and a push per drain teaches the human to mute the
-    # channel, which buries the one push that matters (quota stop, etc.). Only the exact
-    # routine string is silent; anything else — including no reason at all — pushes, and
-    # says the reason in the title instead of burying it in the body.
-    reason = b.get("reason") or "no reason given"
-    if reason.strip().lower() != "queue empty":
+    # An agent that stands down must not do it silently — UNLESS the reason is one of the
+    # routine, expected exits: no reason at all (skill/SKILL.md:71 calls `board finished`
+    # bare on queue-empty — the bug this replaces compared against the literal string
+    # "queue empty", which no real caller ever sent), "queue empty" said explicitly
+    # (skill/SKILL.md:71 now says so), or "session end" (hooks/session-end.sh's
+    # SessionEnd hook, which fires on every clean exit on top of whatever explicit call
+    # already happened, and carries no diagnostic content of its own). A fleet running
+    # overnight ends every session one of these ways, and a push per drain teaches the
+    # human to mute the channel — which buries the one push that matters. Any other
+    # reason — including the quota-stop text from `.stop` (skill/SKILL.md:67), which
+    # always names a window and a ceiling — still pushes, named in the title.
+    reason = (b.get("reason") or "").strip()
+    if reason.lower() not in ("", "queue empty", "session end"):
         note = budget(a["current_project"]).get("note")
         click = ("%s/t/%s" % (BASE_URL, a["current_task"]) if a["current_task"]
                  else "%s/status" % BASE_URL)

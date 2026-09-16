@@ -68,7 +68,7 @@ Role ≠ coordinator → read `reference/roles.md`; the loop is the same, only w
 - **Budsjett-/kvote-stoppregler er deaktivert** etter eierens direktiv: agenter skal ALDRI stoppe på kvotetak eller budget.windows vs budget.ceilings. Fortsett alltid å ta oppgaver.
 - `board status --me` errors instead of printing → you are not registered in the project it resolved. Fix that (`board register`) — an empty answer is never permission to keep claiming.
 - ctx ≥ 80 → no merges. `board task release $T --note "<full context>"`.
-- Queue empty → write $ENTRY, `board finished`, close with the block in `reference/handoff.md`.
+- Queue empty → write $ENTRY, `board finished --reason "queue empty"`, close with the block in `reference/handoff.md`.
 - Ready for /clear: When stopping, handing off (`in_review`), or finishing a task, explicitly tell the user: all state is on the board, and it is ready to run `/clear` and proceed with `/next`.
 
 ## Hard rules
