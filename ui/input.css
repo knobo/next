@@ -14,7 +14,7 @@
 
 /* --- the theme ---------------------------------------------------------------
    The colours ARE the state machine, not decoration. Three hues, each with ONE meaning:
-     warning  amber  — waiting on you   (questions, awaiting_human)
+     warning  amber  — waiting on you   (questions)
      error    red    — stopped          (blocked, orphaned, a dead agent, over the ceiling)
      success  green  — landed           (merged, done, under the ceiling)
    Working states (claimed, in_review, merging) get NO hue. Most tasks are working, and
@@ -157,7 +157,6 @@
      when border-collapse is `collapse`, and even then browsers draw it differently. The
      cell is the one place it works everywhere. */
   .tasks tbody tr.spine > td:first-child { border-left: 3px solid transparent; }
-  .tasks tbody tr.spine-wait > td:first-child { border-left-color: var(--color-warning); }
   .tasks tbody tr.spine-stop > td:first-child { border-left-color: var(--color-error); }
   .tasks tbody tr.spine-land > td:first-child { border-left-color: var(--color-success); }
 
@@ -172,7 +171,6 @@
       border-radius: var(--radius-box); background: var(--color-base-200); }
     /* The card IS the row here, so the colour moves back to the row and off the cell. */
     .tasks tbody tr.spine > td:first-child { border-left: 0; }
-    .tasks tbody tr.spine-wait { border-left-color: var(--color-warning); }
     .tasks tbody tr.spine-stop { border-left-color: var(--color-error); }
     .tasks tbody tr.spine-land { border-left-color: var(--color-success); }
     /* The row is a grid in card mode, so the title can go FIRST: on a phone you should

@@ -271,7 +271,7 @@ CREATE TABLE grants (                    -- per (agent, project); only the polic
 );
 CREATE TABLE tasks (
   id TEXT PRIMARY KEY, project TEXT, repo TEXT, title TEXT, spec TEXT,
-  status TEXT,          -- open|claimed|in_review|merging|done|blocked|orphaned|archived (+ legacy awaiting_human)
+  status TEXT,          -- open|claimed|in_review|merging|done|blocked|orphaned|archived
   requires TEXT,        -- JSON: capabilities needed ['browser-test','kubectl-dev']
   needs_grants TEXT,    -- JSON: grants needed ['merge','deploy-prod']
   touches TEXT,         -- JSON: file surfaces (a collision hint)
@@ -360,8 +360,8 @@ one 5-hour window without progress is `stalled` — not out of quota, something 
 another agent can take over. `stalled` never counts as `alive` for `task next` or the role
 ranking, but it shows in `board status` and it does not strip a role a human pinned.
 
-The reaper also never orphans `blocked` (or a legacy `awaiting_human` row): those are documented
-waits on a human, not stalls. If the *owner* dies, they can still be taken over.
+The reaper also never orphans `blocked`: it is a documented wait on a human, not a stall. If
+the *owner* dies, it can still be taken over.
 
 ### 3.6 Project phase — the declared input
 
@@ -556,8 +556,9 @@ table rated changes wrongly from file extensions, and the gate waited on a queue
 
 What is left in code: `POST /questions` with `kind: test` answers 400. The columns
 `tasks.human_test` and `questions.card` stay in the schema, unused, so old databases load; old
-`kind: test` rows render and answer as ordinary questions, and a legacy `awaiting_human` task is
-still a documented wait for the reaper and `release`.
+`kind: test` rows render as ordinary questions. On startup the board migrates legacy rows once:
+every `awaiting_human` task goes back to `open` (unowned, with a `task.released` event saying
+why), and every still-open `kind: test` question is closed as answered by `board`.
 
 ---
 
@@ -714,7 +715,7 @@ write it out again.
 | Situation | What happens | Why it is safe |
 |---|---|---|
 | **The board is down** | The CLI queues writes in the outbox and reads from cache with `stale:true`. The agent carries on with the task it has. A `board task next` served from cache can hand out a task somebody else took meanwhile → the CAS fails at flush; the agent notices at its next `board status` and releases it. | The board runs next to the forge and the cluster. If it is down, merge and CI are usually down too — nothing is lost by the board being away. It is *designed* so that the board's uptime need not exceed the forge's. |
-| **An agent dies mid-task with an open worktree** | The heartbeat stops → `stale` after 5 min, `dead` after 60 → the lease expires → the reaper sets `task.orphaned`. If the process is alive but not progressing, the lease is not renewed (only `claim` and `task.progress` renew it), the agent shows as `stalled`, and the task is orphaned the same way. `awaiting_human` and `blocked` are never orphaned by lease expiry. The next `board task next` returns the orphaned task **first**, with `worktree`, `branch`, `pr` and the last `progress` note. The new agent runs `git -C <worktree> status` and continues. | Everything needed for a takeover is structured on the board, because writing progress after every step is mandatory. The worktree directory is on the machine that died — if the new agent is elsewhere, it rebuilds from the pushed branch instead (`board task worktree` does this, and reports `base: origin`). |
+| **An agent dies mid-task with an open worktree** | The heartbeat stops → `stale` after 5 min, `dead` after 60 → the lease expires → the reaper sets `task.orphaned`. If the process is alive but not progressing, the lease is not renewed (only `claim` and `task.progress` renew it), the agent shows as `stalled`, and the task is orphaned the same way. `blocked` is never orphaned by lease expiry. The next `board task next` returns the orphaned task **first**, with `worktree`, `branch`, `pr` and the last `progress` note. The new agent runs `git -C <worktree> status` and continues. | Everything needed for a takeover is structured on the board, because writing progress after every step is mandatory. The worktree directory is on the machine that died — if the new agent is elsewhere, it rebuilds from the pushed branch instead (`board task worktree` does this, and reports `base: origin`). |
 | **Two agents take the same task** | `UPDATE … WHERE owner IS NULL` → one gets 1 row, the other 0 → 409. | SQLite serializes writes. With the board down (outbox) both can *believe* they have it; at flush the first wins and the second gets a 409 and must release — worst case duplicated work on one task, never corrupt state, because they have *separate worktrees*. |
 | **Out of tokens mid-merge** | `task.merge_requested` is written before the merge. A taking-over agent sees `merge_requested` without `merge_verified` → runs only the verification step (ancestry, the PR's state on the forge) — it does **not** re-merge. | Merge is one idempotent operation on the forge; the state is read from the forge, not from the board. The stop rule "do not start a merge near the ceiling" makes this rare. |
 | **A question unanswered for hours** | The deadline passes → `question.defaulted`. The agent has already implemented the default; the PR is marked. `risk=high` is never merged on a default. | Better a PR that assumes B and says so than no PR. And if the human later answers differently, the board turns the override into a new task — the loop closes even when the work is already merged (T-198). |

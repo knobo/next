@@ -1490,7 +1490,7 @@ if [ "$OWN_SERVER" = 1 ]; then
   echo "== reaper =="
   R=$(BOARD_DB="$TMP/reap.db" python3 - <<'REAPPY'
 import board
-for tid, st in (("R-1", "awaiting_human"), ("R-2", "claimed")):
+for tid, st in (("R-1", "blocked"), ("R-2", "claimed")):
     board.db.execute("INSERT INTO tasks (id,project,status,owner,lease_until,updated) "
                      "VALUES (?,'demo',?,'a1',?,?)", (tid, st, board.plus(-1), board.now()))
 board.reap()
@@ -1498,9 +1498,38 @@ print(*[board.db.execute("SELECT status FROM tasks WHERE id=?", (t,)).fetchone()
         for t in ("R-1", "R-2")])
 REAPPY
 )
-  [ "$R" = "awaiting_human orphaned" ] \
-    && ok "the reaper leaves awaiting_human alone, but orphans an expired claimed" \
-    || no "the reaper leaves awaiting_human alone, but orphans an expired claimed" "$R"
+  [ "$R" = "blocked orphaned" ] \
+    && ok "the reaper leaves blocked alone, but orphans an expired claimed" \
+    || no "the reaper leaves blocked alone, but orphans an expired claimed" "$R"
+
+  # T-352 removed the human test stage. A legacy `awaiting_human` row had no way out, so
+  # boot migrates it back to the queue and closes its open test card. Seed an old database,
+  # boot the board on it twice (idempotent), then claim the task.
+  echo "== legacy awaiting_human migration =="
+  BOARD_DB="$TMP/legacy.db" python3 -c 'import board' || no "boot on an empty legacy db" ""
+  python3 -c 'import sqlite3,sys
+d=sqlite3.connect(sys.argv[1])
+d.execute("INSERT INTO agents (id,current_project,status,last_seen,current_task) VALUES (\"old\",\"demo\",\"finished\",\"2020-01-01T00:00:00Z\",\"L-1\")")
+d.execute("INSERT INTO tasks (id,project,status,owner,lease_until,title) VALUES (\"L-1\",\"demo\",\"awaiting_human\",\"old\",\"2099-01-01T00:00:00Z\",\"legacy\")")
+d.execute("INSERT INTO questions (id,project,task,kind,status,text) VALUES (\"Q-L1\",\"demo\",\"L-1\",\"test\",\"open\",\"test card\")")
+d.commit()' "$TMP/legacy.db"
+  BOARD_DB="$TMP/legacy.db" python3 -c 'import board' >/dev/null
+  R=$(BOARD_DB="$TMP/legacy.db" python3 - <<'LEGACYPY'
+import board
+t = board.db.execute("SELECT status, owner, lease_until FROM tasks WHERE id='L-1'").fetchone()
+q = board.db.execute("SELECT status FROM questions WHERE id='Q-L1'").fetchone()[0]
+a = board.db.execute("SELECT current_task FROM agents WHERE id='old'").fetchone()[0]
+n = board.db.execute("SELECT count(*) FROM events WHERE stream='task/L-1' AND type='task.released'").fetchone()[0]
+board.db.execute("INSERT INTO agents (id,current_project,status,last_seen,registered) VALUES ('new','demo','alive',?,?)",
+                 (board.now(), board.now()))
+c = board.task_claim("L-1", "new")
+print(t["status"], t["owner"], t["lease_until"], q, a, n,
+      board.db.execute("SELECT status FROM tasks WHERE id='L-1'").fetchone()[0])
+LEGACYPY
+)
+  [ "$R" = "open None None answered None 1 claimed" ] \
+    && ok "boot moves a legacy awaiting_human task back to the queue, once, and it is claimable" \
+    || no "boot moves a legacy awaiting_human task back to the queue, once, and it is claimable" "$R"
 fi
 
 

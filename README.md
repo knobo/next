@@ -128,7 +128,7 @@ stateDiagram-v2
     done --> [*]
 ```
 
-`blocked` is a **documented wait** (as is `awaiting_human` on legacy rows) — the reaper never orphans them for lease
+`blocked` is a **documented wait** — the reaper never orphans it for lease
 expiry, because waiting hours on a human is correct behaviour, not a stall. But if the owner
 *dies*, it can still be taken over.
 

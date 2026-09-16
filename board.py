@@ -16,8 +16,8 @@ POLICY    = os.environ.get("BOARD_POLICY", "board-policy.json")
 NTFY_URL  = os.environ.get("NTFY_URL", "")
 NTFY_AUTH = os.environ.get("NTFY_AUTH", "")
 # A token only the human holds. Without it `by: "<human>"` is a claim any agent can
-# write, and then it can pin itself as coordinator or answer its own risk=high
-# question and open the merge gate (T-71, T-72, T-143, Q-156).
+# write, and then it can pin itself as coordinator or answer its own question in the
+# human's name (T-71, T-72, T-143, Q-156).
 HUMAN_TOKEN = os.environ.get("BOARD_HUMAN_TOKEN", "")          # "Bearer tk_..." or "Basic ..."
 # The human's name on the board: the actor string that shows up in events,
 # `answered_by`, `pinned_by` and on the HTML pages. Configurable because the owner of
@@ -110,6 +110,20 @@ if {"rl5_pct", "rl7_pct"} <= _cols:      # T-164: existing database, old columns
         if _r["rl7_pct"] is not None:
             _ws.append({"window": "7d", "used_pct": _r["rl7_pct"]})
         db.execute("UPDATE agents SET budget=? WHERE id=?", (json.dumps(_ws), _r["id"]))
+# T-352: the human test stage is gone, and nothing moves a task out of `awaiting_human`
+# any more. Put such rows back in the queue and close their test cards. Idempotent: a
+# second boot finds no rows.
+_NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+for _r in db.execute("SELECT id, project FROM tasks WHERE status='awaiting_human'").fetchall():
+    db.execute("UPDATE tasks SET status='open', owner=NULL, lease_until=NULL, updated=%s "
+               "WHERE id=?" % _NOW, (_r["id"],))
+    db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (_r["id"],))
+    db.execute("INSERT INTO events (ts,project,stream,type,actor,body) VALUES (%s,?,?,?,?,?)" % _NOW,
+               (_r["project"] or "_global", "task/" + _r["id"], "task.released", "board",
+                json.dumps({"note": "human test stage removed (T-352)"})))
+db.execute("UPDATE questions SET status='answered', answered_by='board', read=1, answered=%s, "
+           "answer='withdrawn: human test stage removed (T-352)' "
+           "WHERE kind='test' AND status='open'" % _NOW)
 db.commit()
 
 
@@ -685,7 +699,7 @@ def agents_cleanup(project=None, older_than="24h", b=None):
             m = mins_since(a["last_seen"])
             if m >= min_mins:
                 for t in db.execute("SELECT id, status FROM tasks WHERE owner=?", (a["id"],)):
-                    keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "orphaned"
+                    keep = t["status"] if t["status"] == "in_review" else "orphaned"
                     db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                                (keep, now(), t["id"]))
                     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (t["id"],))
@@ -1318,13 +1332,10 @@ def release(tid, aid, b):
     """Release IS the implementer→coordinator hand-off: a task that stands `in_review`
     keeps its status and merely becomes unowned. Without that, finished work with an open
     PR became invisible to `task next` and locked by `owns()` — deadlock on exactly what
-    was worth the most. `awaiting_human` is kept for the same reason, but the other way
-    around: it is waiting on a human (legacy rows from the removed test stage, T-352). If it became
-    `open`, finished work came out of `task next` first as new work, and the next agent
-    re-implemented it."""
+    was worth the most."""
     t = task(tid)
     owns(t, aid)
-    keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "open"
+    keep = t["status"] if t["status"] == "in_review" else "open"
     db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (keep, now(), tid))
     
@@ -1380,9 +1391,9 @@ def question_create(b, actor):
 
 
 def question_answer(qid, answer, who, note="", b=None):
-    # A question answered by the human opens the merge gate for risk=high. The human
-    # identity must therefore be PROVEN: without this an agent could ask its own
-    # question, answer it as the human, and merge high risk with nobody looking (T-143).
+    # An answer signed as the human is taken as the human's decision. The identity must
+    # therefore be PROVEN: without this an agent could ask its own question and answer
+    # it in the human's name, with nobody looking (T-143).
     if who == HUMAN and not as_human(b or {}):
         raise Err(403, "only the human token can answer as %s; answer under your own "
                        "agent id if you have an opinion about the question" % HUMAN,
@@ -1597,11 +1608,11 @@ def reap():
                              "the role is free", "%s/status" % BASE_URL)
     dead = {r["id"] for r in db.execute("SELECT id FROM agents WHERE status IN ('dead','finished')")}
     for t in db.execute("SELECT * FROM tasks WHERE status NOT IN ('done','open','orphaned','archived')").fetchall():
-        # `awaiting_human` and `blocked` are documented waits, not stops: they wait on a
-        # human for hours and must not be orphaned by the lease running out. If the owner
-        # dies (dead/finished) they must still be takeable.
+        # `blocked` is a documented wait, not a stop: it waits on a human for hours and
+        # must not be orphaned by the lease running out. If the owner dies (dead/finished)
+        # it must still be takeable.
         expired = (t["lease_until"] and mins_since(t["lease_until"]) > 0
-                   and t["status"] not in ("awaiting_human", "blocked"))
+                   and t["status"] != "blocked")
         # An unowned row in an owner state is impossible: nobody can claim it (wrong
         # status), and everything else requires ownership. Then it is wedged forever.
         # Release it.
@@ -1830,18 +1841,16 @@ def meter(label, pct, ceiling=None):
                 escape(label), cls, round(min(v, 100)), tick, round(v)))
 
 
-SPINE = {"awaiting_human": "spine-wait", "blocked": "spine-stop", "orphaned": "spine-stop",
+SPINE = {"blocked": "spine-stop", "orphaned": "spine-stop",
          "merged": "spine-land", "done": "spine-land", "archived": ""}
 
-BADGE = {"awaiting_human": "badge-warning", "blocked": "badge-error", "orphaned": "badge-error",
+BADGE = {"blocked": "badge-error", "orphaned": "badge-error",
          "merged": "badge-success", "done": "badge-success", "archived": "badge-ghost"}
 
 
 def waiting_on_you(p):
-    """What requires a human in this project. `awaiting_human` only exists on legacy
-    rows from the removed test stage (T-352)."""
-    return (len([t for t in p["tasks"] if t["status"] == "awaiting_human"])
-            + len(p["questions"]))
+    """What requires a human in this project."""
+    return len(p["questions"])
 
 
 def stuck(p):
@@ -1860,8 +1869,7 @@ def watchline(s):
     # an anchor that does not exist on the page.
     first = lambda gen, dflt: next(gen, dflt)
     wait_url = first((("/q/%s" % q["id"]) for p in s["projects"] for q in p["questions"]),
-                     first((("/t/%s" % t["id"]) for p in s["projects"] for t in p["tasks"]
-                            if t["status"] == "awaiting_human"), "/status"))
+                     "/status")
     stop_url = first((("/t/%s" % t["id"]) for p in s["projects"] for t in p["tasks"]
                       if t["status"] in ("blocked", "orphaned")), "/status")
     n = lambda v, cls, href, txt: (
@@ -1919,7 +1927,6 @@ def tell(p):
     parts = [("", len(p["agents"]), "agents" if len(p["agents"]) != 1 else "agent"),
              ("", len(p["tasks"]), "queued")]
     for st, lbl, cls in (("in_review", "to review", ""),
-                         ("awaiting_human", "waiting on you", "text-warning"),
                          ("blocked", "blocked", "text-error"),
                          ("orphaned", "unowned", "text-error")):
         if n.get(st):
