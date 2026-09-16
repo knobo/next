@@ -14,7 +14,7 @@ loop until the queue is empty or the quota runs out.
 /next                  coordinator (default) — dispatches, reviews, merges, verifies
 /next implementer      takes tasks and writes the code itself; never merges
 /next reviewer         takes `in_review` first; READ-ONLY
-/next tester           takes tasks that require browser-test, and open test cards
+/next tester           takes tasks that require browser-test
 ```
 
 The loop is the same for everyone. What differs is which tasks you take and who writes the code —
@@ -30,7 +30,6 @@ the board has a unique index, and `board role claim` says so.
 | Situation | What it does |
 |---|---|
 | Unsure about a product decision | `board ask` with its best guess as the default, implements the default, marks the PR, moves on |
-| Needs you to test in a browser | files a test card to `/tests`, takes the next task |
 | Only you can solve it | `board task blocked`, moves on |
 | CI is slow | writes progress, moves on — never waits in the foreground |
 | Quota is running out | stops claiming, finishes to a safe point, releases the task with full context |

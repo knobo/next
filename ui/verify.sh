@@ -39,7 +39,7 @@ A -X POST "$B/api/v1/agents/$AG/heartbeat" -d '{"ctx_pct":42,"budget":[{"window"
 TID=$(A -X POST "$B/api/v1/tasks" -d '{"project":"demo","title":"a task to look at","repo":".","agent":"'"$AG"'"}' | jq -r .id)
 A -X POST "$B/api/v1/tasks/$TID/claim" -d '{"agent":"'"$AG"'"}' >/dev/null
 QID=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"Should we use daisyUI?","kind":"product","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' | jq -r .id)
-TQ=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","kind":"test","text":"check that the page looks right","agent":"'"$AG"'","card":{"repo":".","env":"dev","risk":"low","url":"http://x/","steps":["open the page"],"expected":["it looks right"],"rollback":"git revert"}}' | jq -r .id)
+TQ=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"Does the page look right?","agent":"'"$AG"'"}' | jq -r .id)
 
 CSSURL=$(python3 - <<PY
 import hashlib
@@ -48,7 +48,7 @@ print("/board.%s.css" % hashlib.sha256(b).hexdigest()[:12])
 PY
 )
 
-for pth in "/status" "/tests" "/q/$QID" "/t/$TID"; do
+for pth in "/status" "/q/$QID" "/t/$TID"; do
   H=$(curl -s -o "$D/body" -w '%{http_code}' -H "Authorization: Bearer $T" -D "$D/hdr" "$B$pth")
   [ "$H" = 200 ] || { no "$pth answered $H"; continue; }
   grep -q "<link rel=stylesheet href='$CSSURL'>" "$D/body" \
@@ -58,9 +58,6 @@ for pth in "/status" "/tests" "/q/$QID" "/t/$TID"; do
   grep -q "<style" "$D/body" && no "$pth still has an inline <style> block" || ok "$pth has no inline <style>"
 done
 
-# the test-queue page must actually show the card, not just the empty state
-curl -s -H "Authorization: Bearer $T" "$B/tests" | grep -q "It all worked" \
-  && ok "/tests shows the test card with its answer buttons" || no "/tests does not show the test card"
 # the question page must show the deadline note
 curl -s -H "Authorization: Bearer $T" "$B/q/$QID" | grep -q "the agent carries on" \
   && ok "/q shows what the board answers if the deadline runs out" || no "/q is missing the deadline note"
@@ -68,8 +65,8 @@ curl -s -H "Authorization: Bearer $T" "$B/q/$QID" | grep -q "the agent carries o
 # back by typing a URL on a phone.
 SAVED=$(curl -s -H "Authorization: Bearer $HT" -H 'Content-Type: application/x-www-form-urlencoded' \
         -X POST -d 'answer=ok' "$B/q/$TQ/answer")
-grep -q "href='/tests'" <<<"$SAVED" && grep -q "href='/status'" <<<"$SAVED" \
-  && ok "the answer confirmation links back to the test queue and the board" \
+grep -q "href='/status'" <<<"$SAVED" \
+  && ok "the answer confirmation links back to the board" \
   || no "the confirmation page is a dead end" "$(head -c 160 <<<"$SAVED")"
 # the meter's ceiling line must be there, with its number
 curl -s -H "Authorization: Bearer $T" "$B/status" | grep -q "class=track" \
@@ -95,7 +92,7 @@ grep -qE 'prefers-color-scheme: ?dark' "$D/css" && ok "dark mode follows prefers
 # A Tailwind class split across two Python string literals is never seen by the text
 # extractor: the markup looks right, and the rule does not exist. The failure is mute.
 # It caught `.pane` once and made the meters page-wide without anything complaining.
-for pth in "/status" "/tests" "/q/$QID" "/t/$TID"; do
+for pth in "/status" "/q/$QID" "/t/$TID"; do
   curl -s -H "Authorization: Bearer $T" "$B$pth"
 done > "$D/all.html"
 # Pages you only reach by POSTing a form were invisible to this check, and the
@@ -128,7 +125,7 @@ const { chromium } = require('playwright');
       // favicon.ico is the browser's own spontaneous request, and the board has none. It
       // is not a fault in the pages.
       p.on('console', m => { if (m.type() === 'error' && !/favicon/.test(m.text())) errs.push(m.text()); });
-      for (const path of ['/status', '/tests', '/q/' + QID, '/t/' + TID]) {
+      for (const path of ['/status', '/q/' + QID, '/t/' + TID]) {
         await p.goto(B + path, { waitUntil: 'networkidle' });
         if (await p.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)) {
           console.log('  FAIL ' + path + ' ' + scheme + '/' + name + ' scrolls horizontally'); bad++;

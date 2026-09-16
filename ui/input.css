@@ -14,7 +14,7 @@
 
 /* --- the theme ---------------------------------------------------------------
    The colours ARE the state machine, not decoration. Three hues, each with ONE meaning:
-     warning  amber  — waiting on you   (questions, test cards, awaiting_human)
+     warning  amber  — waiting on you   (questions, awaiting_human)
      error    red    — stopped          (blocked, orphaned, a dead agent, over the ceiling)
      success  green  — landed           (merged, done, under the ceiling)
    Working states (claimed, in_review, merging) get NO hue. Most tasks are working, and

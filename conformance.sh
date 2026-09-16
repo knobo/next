@@ -267,8 +267,8 @@ slug_from() {  # a remote URL -> the slug the SHIPPED block derives
   || no "shapeless remote" "$(slug_from 'not-a-url-at-all')"
 
 echo "== board without a manifest dies with a message, not unbound variable (T-67) =="
-NOMAN=$(cd "$TMP" && "$SRC/bin/board" test-level T-1 2>&1; echo "rc=$?")
-check "test-level without a manifest: a message, no unbound variable" \
+NOMAN=$(cd "$TMP" && "$SRC/bin/board" start 2>&1; echo "rc=$?")
+check "start without a manifest: a message, no unbound variable" \
   "$(jq -nc --arg o "$NOMAN" '{o:$o}')" \
   '(.o|contains("No project.yaml")) and (.o|contains("unbound")|not) and (.o|contains("rc=1"))'
 
@@ -455,7 +455,7 @@ check "task show has a timeline and owner state" "$(api GET /tasks/$TID)" \
   '(.events|length>0) and ((.events|map(.type)|index("task.progress")) != null) and .owner_status and .phase'
 
 if [ "$OWN_SERVER" = 1 ]; then
-echo "== gate + human test (phase launch, risk=high) =="
+echo "== gate (phase launch, risk=high) =="
 G=$(api GET "/tasks/$TID/gate/merge?agent=$AID")
 # DESIGN.md §8: the gate was "only an echo of the owner's word". A coordinator once set a
 # review result on its OWN task and the gate let it through.
@@ -471,40 +471,17 @@ check "another agent's review opens it" \
   '(.reasons//[]|join(" ")|test("set by the owner itself"))|not'
 api POST "/tasks/$SELFR/done" "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
 
-check "the gate is closed without a human-OK" "$G" '.ok==false and (.reasons|length>0)'
-cat > "$TMP/card.json" <<JSON
-{"project":"demo","repo":"web","env":"dev","url":"https://dev.example.com/x","login":"e2e-owner",
- "steps":["Open the tab"],"expected":["The new button appears"],"risk":"normal","rollback":"kubectl rollout undo deploy/web"}
-JSON
-check "an invalid test card is refused" "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"kind\":\"test\",\"task\":\"$TID\",\"card\":{\"repo\":\"web\"}}")" '.error'
-QT=$(api POST /questions "$(jq -c --arg a "$AID" --arg t "$TID" --slurpfile c "$TMP/card.json" \
-      '{agent:$a,project:"demo",kind:"test",task:$t,card:$c[0]}' <<<'{}')")
-QTID=$(jq -r .id <<<"$QT"); check "testkort godtatt" "$QT" '.id'
-check "the test queue spans projects" "$(api GET '/questions?kind=test&status=open')" ".questions[0].id==\"$QTID\""
-check "the human answers OK" "$(hum POST /questions/$QTID/answer '{"answer":"ok","by":"human"}')" '.answer=="ok"'
-check "the gate opens after a human-OK" "$(api GET "/tasks/$TID/gate/merge?agent=$AID")" '.ok==true'
-# T-143: an agent answer under its OWN id must not open the gate. human_only only closed
-# "claiming to be the human"; the gate read the column without caring who set it.
-# Its own task: a new test card clears human_test on purpose, so it cannot share a task with
-# the check above.
-SFT=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"self answer\",\"risk\":\"high\"}" | jq -r .id)
-api POST "/tasks/$SFT/claim" "{\"agent\":\"$AID\"}" >/dev/null
-api POST "/tasks/$SFT/review" "{\"agent\":\"$BID\",\"open\":0}" >/dev/null
-QSELF=$(api POST /questions "$(jq -c --arg a "$AID" --arg t "$SFT" --slurpfile c "$TMP/card.json" \
-        '{agent:$a,project:"demo",kind:"test",task:$t,card:$c[0]}' <<<'{}')" | jq -r .id)
-api POST "/questions/$QSELF/answer" "{\"answer\":\"ok\",\"by\":\"$AID\"}" >/dev/null
-check "the agent's own test answer does not count as a human-OK" "$(api GET "/tasks/$SFT")" \
-  '.human_test != "ok"'
-check "and the gate is still closed after the self-answer" \
-  "$(api GET "/tasks/$SFT/gate/merge?agent=$AID")" \
-  '.ok==false and (.reasons|join(" ")|test("human-OK"))'
-QSELF2=$(api POST /questions "$(jq -c --arg a "$AID" --arg t "$SFT" --slurpfile c "$TMP/card.json" \
-         '{agent:$a,project:"demo",kind:"test",task:$t,card:$c[0]}' <<<'{}')" | jq -r .id)
-check "a human answer on a new card opens it" \
-  "$(hum POST "/questions/$QSELF2/answer" '{"answer":"ok","by":"human"}' >/dev/null; api GET "/tasks/$SFT")" \
-  '.human_test=="ok"'
-api POST "/tasks/$SFT/release" "{\"agent\":\"$AID\"}" >/dev/null
-api POST "/tasks/$SFT/done" "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
+# T-352: the human test stage is gone. Review done → the gate is open, in launch with
+# risk=high and in live on every risk, with no human_test anywhere.
+check "the gate opens in launch, risk=high, with review done and no human test" "$G" '.ok==true'
+check "a test card is refused: the test stage is gone" \
+  "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"kind\":\"test\",\"task\":\"$TID\",\"card\":{\"repo\":\"web\"}}")" '.error'
+api POST /projects '{"project":"demo","phase":"live"}' >/dev/null
+check "the gate opens in live with review done and no human test" \
+  "$(api GET "/tasks/$TID/gate/merge?agent=$AID")" '.ok==true'
+api POST /projects '{"project":"demo","phase":"launch"}' >/dev/null
+check "and the old /tests page is gone" \
+  "$(jq -nc --arg c "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BOARD_URL/tests")" '{c:$c}')" '.c!="200"'
 
 check "the gate refuses an agent without the merge grant" "$(api GET "/tasks/$TID/gate/merge?agent=$BID")" '.ok==false'
 
@@ -514,10 +491,10 @@ check "merge_requested" "$(api POST /tasks/$TID/merge_requested "{\"agent\":\"$A
 LK=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"lock test\"}" | jq -r .id)
 api POST "/tasks/$LK/claim" "{\"agent\":\"$AID\"}" >/dev/null
 api POST "/tasks/$LK/review" "{\"agent\":\"$BID\",\"open\":0}" >/dev/null
-# The lock is released once the merge HAS landed: what remains (deploy, test card, done)
+# The lock is released once the merge HAS landed: what remains (deploy, done)
 # does not touch anyone else's branches, and done can wait on a human for hours.
 api POST "/tasks/$TID/merge_verified" "{\"agent\":\"$AID\",\"sha\":\"deadbee\"}" >/dev/null
-check "a merged task does not hold the lock while it waits for a test card" \
+check "a merged task does not hold the lock while it waits for deploy/done" \
   "$(api GET "/tasks/$LK/gate/merge?agent=$AID")" \
   '(.reasons//[]|join(" ")|test("is merging right now"))|not'
 python3 - "$TMP/board.db" "$TID" <<'RESETPY'
@@ -724,26 +701,6 @@ check "another agent can claim it, and it does not become 'claimed'" \
 check "the status is still in_review after the claim" "$(api GET /tasks/$T3ID)" '.status=="in_review"'
 api POST /tasks/$T3ID/release "{\"agent\":\"$BID\"}" >/dev/null
 
-# `awaiting_human` waits on a human, not on an agent. If it loses that status, finished
-# work comes back out of `task next` as new work, and the next agent re-implements it.
-T4ID=$(jq -r .id <<<"$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"waiting on the human\",\"risk\":\"high\"}")")
-api POST /tasks/$T4ID/claim "{\"agent\":\"$AID\"}" >/dev/null
-api POST /questions "$(jq -c --arg a "$AID" --arg t "$T4ID" --slurpfile c "$TMP/card.json" \
-  '{agent:$a,project:"demo",kind:"test",task:$t,card:$c[0]}' <<<'{}')" >/dev/null
-check "a test card sets the task to awaiting_human" "$(api GET /tasks/$T4ID)" '.status=="awaiting_human"'
-check "releasing an awaiting_human keeps the status" \
-  "$(api POST /tasks/$T4ID/release "{\"agent\":\"$AID\",\"note\":\"out of context\"}"; api GET /tasks/$T4ID)" \
-  '.status=="awaiting_human" and .owner==null'
-check "task next does not offer work that is waiting on a human" "$(api GET "/tasks/next?agent=$BID")" \
-  '.id != "'"$T4ID"'"'
-# The answer on the card must deliver the task back to the queue. `claimed` without an owner
-# is invisible to `task next` and untouchable until the lease expires — finished work would
-# have been lost there.
-QT4=$(jq -r '.questions[]|select(.task=="'"$T4ID"'")|.id' <<<"$(api GET '/questions?kind=test&status=open')")
-hum POST /questions/$QT4/answer '{"answer":"ok","by":"human"}' >/dev/null
-check "answering a test card returns an unowned task to the queue" "$(api GET /tasks/$T4ID)" \
-  '.status=="open" and .human_test=="ok"'
-
 if [ "$OWN_SERVER" = 1 ]; then
 check "blocked notifies" "$(api POST /tasks/$T2ID/blocked "{\"agent\":\"$AID\",\"note\":\"classifier refused\"}")" '.ok'
 fi
@@ -816,17 +773,11 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
     '.code==409 and (.body.error|test("no longer yours")) and .body.status=="orphaned"'
 
   echo "== the reaper tells waiting apart from stopping =="
-  T5ID=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"waiting on a human\",\"risk\":\"high\"}" | jq -r .id)
-  api POST /tasks/$T5ID/claim "{\"agent\":\"$EID\"}" >/dev/null
-  Q5=$(api POST /questions "$(jq -c --arg a "$EID" --arg t "$T5ID" --slurpfile c "$TMP/card.json" \
-        '{agent:$a,project:"demo",kind:"test",task:$t,card:$c[0]}' <<<'{}')" | jq -r .id)
   T6ID=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"title\":\"blocked\"}" | jq -r .id)
   api POST /tasks/$T6ID/claim "{\"agent\":\"$EID\"}" >/dev/null
   api POST /tasks/$T6ID/blocked "{\"agent\":\"$EID\",\"note\":\"waiting for an answer\"}" >/dev/null
-  sql "UPDATE tasks SET lease_until='$PAST' WHERE id IN ('$T5ID','$T6ID')"
+  sql "UPDATE tasks SET lease_until='$PAST' WHERE id='$T6ID'"
   api POST /reap '{}' >/dev/null
-  check "the reaper does not orphan awaiting_human" "$(api GET /tasks/$T5ID)" \
-    '.status=="awaiting_human" and .owner=="'"$EID"'"'
   # A row can end up unowned in an owner state (the agent released ownership, but not the
   # status). Claim then refuses on status and everything else on ownership: wedged forever.
   STK=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"title\":\"wedged\"}" | jq -r .id)
@@ -837,47 +788,6 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
   # Tidy up: an orphaned row sorts first in task next and would have failed later checks.
   sql "UPDATE tasks SET status='done' WHERE id='$STK'"
   check "the reaper does not orphan blocked" "$(api GET /tasks/$T6ID)" '.status=="blocked"'
-
-  # skill/reference/testing.md promises: "OK → the task comes back to you as claimed".
-  # Without an owner and a lease the row is invisible to both task_next and task_claim.
-  NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  hum POST /questions/$Q5/answer '{"answer":"ok","by":"human"}' >/dev/null
-  check "a test answer returns the task to its owner with a fresh lease" "$(api GET /tasks/$T5ID)" \
-    '.status=="claimed" and .owner=="'"$EID"'" and .lease_until > "'"$NOW"'"'
-
-  # The same answer when the owner has been reaped away: the task must NOT become claimed
-  # without an owner, and the human-OK must not carry over to a new agent that never filed
-  # the card.
-  T7ID=$(api POST /tasks "{\"agent\":\"$CID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"reaped during test\",\"risk\":\"high\"}" | jq -r .id)
-  api POST /tasks/$T7ID/claim "{\"agent\":\"$CID\"}" >/dev/null
-  Q7=$(api POST /questions "$(jq -c --arg a "$CID" --arg t "$T7ID" --slurpfile c "$TMP/card.json" \
-        '{agent:$a,project:"demo",kind:"test",task:$t,card:$c[0]}' <<<'{}')" | jq -r .id)
-  sql "UPDATE agents SET last_seen='$PAST' WHERE id='$CID'"
-  api POST /reap '{}' >/dev/null
-  hum POST /questions/$Q7/answer '{"answer":"ok","by":"human"}' >/dev/null
-  check "a test answer on a reaped task does not produce an unowned claimed" "$(api GET /tasks/$T7ID)" \
-    '.status=="orphaned" and .owner==null and .human_test==null'
-
-  # And the human-OK dies with the owner: otherwise the next claimant walks straight through
-  # gate_merge's human check on a branch nobody has tested.
-  sql "UPDATE agents SET last_seen='$PAST' WHERE id='$EID'"
-  api POST /reap '{}' >/dev/null
-  check "orphaning clears the human-OK" "$(api GET /tasks/$T5ID)" \
-    '.status=="orphaned" and .human_test==null'
-
-  # A FAIL on a task that is already merged and done must become a NEW task. The block reads
-  # repo, title, pr and merge_sha from the same row the status came from — a narrower SELECT
-  # compiles fine and crashes only here, in front of a human (T-199).
-  T8ID=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"out in production\",\"risk\":\"high\"}" | jq -r .id)
-  api POST /tasks/$T8ID/claim "{\"agent\":\"$EID\"}" >/dev/null
-  Q8=$(api POST /questions "$(jq -c --arg a "$EID" --arg t "$T8ID" --slurpfile c "$TMP/card.json" \
-        '{agent:$a,project:"demo",kind:"test",task:$t,card:$c[0]}' <<<'{}')" | jq -r .id)
-  sql "UPDATE tasks SET status='done', pr='http://pr/8', merge_sha='deadbee' WHERE id='$T8ID'"
-  hum POST /questions/$Q8/answer '{"answer":"fail","by":"human","note":"the button is gone"}' >/dev/null
-  check "a FAIL on a done task creates a follow-up task" \
-    "$(api GET '/tasks?project=demo')" \
-    '[.tasks[]|select(.title|startswith("FAIL from human test of '"$T8ID"'"))]|length==1'
-  check "and the done task does not rise again" "$(api GET /tasks/$T8ID)" '.status=="done"'
 
   # Cleanup of dead agents and done tasks (T-402)
   DEAD_A=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-dead","session":"s-dead"}' | jq -r .id)
@@ -919,7 +829,7 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
     '.status=="claimed"'
   kill $P2PID 2>/dev/null
   # Tidy the lease fixture so it does not sort ahead of the WIP drain (orphaned > in_review).
-  sql "UPDATE tasks SET status='done', owner=NULL WHERE id IN ('$T3ID','$T5ID','$T6ID','$T7ID','$T8ID')"
+  sql "UPDATE tasks SET status='done', owner=NULL WHERE id IN ('$T3ID','$T6ID')"
 fi
 
 echo "== WIP limit on unreviewed work =="
@@ -1083,7 +993,7 @@ api POST "/tasks/$CMT/done" "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
 
 echo "== the HTML pages =="
 J="$TMP/cookies"
-for p in "/status?t=$TOKEN" "/tests" ${QID:+"/q/$QID"} ${TID:+"/t/$TID"}; do
+for p in "/status?t=$TOKEN" ${QID:+"/q/$QID"} ${TID:+"/t/$TID"}; do
   code=$(curl -sLo /dev/null -w '%{http_code}' -c "$J" -b "$J" "$BOARD_URL$p")
   [ "$code" = 200 ] && ok "GET $p" || no "GET $p" "HTTP $code"
 done
@@ -1446,21 +1356,6 @@ if [ "$OWN_SERVER" = 1 ]; then
     "$(cli task cleanup-done)" \
     '.ok==true and (.tasks|index("'"$CLEAN_CLI_T"'") != null)'
 fi
-
-# T-142: what the automatic test requires is a property of the test, not of the CLI. An agent
-# without a browser must be able to run a `how` that is not a browser test.
-NOCAP() { (cd "$CLIDIR" && BOARD_SESSION="conf-nocap-$$" BOARD_CACHE="$TMP/nocap-cache" board "$@" 2>/dev/null); }
-NOCAPID=$(NOCAP register --cap merge --model claude-sonnet-5 | jq -r .id)
-cat >> "$CLIDIR/project.yaml" <<'YML'
-environments:
-  dev: {how: "true", requires: []}
-YML
-check "test-level: requires:[] gives auto without a browser capability" "$(NOCAP test-level $CT)" \
-  '.level=="auto" and .how=="true"'
-sed -i 's/requires: \[\]/requires: [browser-test]/' "$CLIDIR/project.yaml"
-check "test-level: requires:[browser-test] gives human without a browser capability" "$(NOCAP test-level $CT)" \
-  '.level=="human" and (.why|test("browser-test"))'
-api POST "/agents/$NOCAPID/finished" '{"reason":"conformance done"}' >/dev/null
 
 # T-283: `board task deploy` ran the manifest AND the command against the primary working
 # copy wherever the caller stood. That copy is arbitrarily stale, so production silently got
