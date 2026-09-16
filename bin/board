@@ -680,15 +680,31 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
               || die "$t's merge_sha ($sha) is not an ancestor of origin/main — refusing"
             if [ ! -d "$dw" ]; then
               git -C "$rd" worktree add -q --detach "$dw" origin/main || die "could not create deploy worktree $dw"
+            else
+              # T-283 review: $dw could collide with a task worktree (a branch literally
+              # named "deploy" lands at the same "<repo>-worktrees/deploy" path). Never
+              # reset/clean a worktree that has a branch checked out — require it to
+              # already be detached before we touch it at all.
+              dwp=$(cd "$dw" && pwd -P)
+              state=$(git -C "$rd" worktree list --porcelain | awk -v p="$dwp" '
+                $1=="worktree" { on = ($2==p) }
+                on && $1=="branch"   { print "branch"; exit }
+                on && $1=="detached" { print "detached"; exit }
+              ')
+              [ "$state" = detached ] \
+                || die "$dw exists but is not a detached deploy worktree (git worktree list says: ${state:-not a worktree}) — refusing to touch it"
             fi
+            # Leftovers from an earlier run must not ship. -x is destructive, so only ever in
+            # the deploy worktree, never the primary checkout — check this BEFORE cleaning.
+            [ "$(cd "$dw" && pwd -P)" != "$(cd "$rd" && pwd -P)" ] && [ "$(basename "$dw")" = deploy ] \
+              || die "refusing to git clean $dw"
+            # Clean BEFORE checkout: an untracked leftover from an earlier run that collides
+            # with a path newly tracked on origin/main would otherwise make the checkout
+            # itself fail ("would be overwritten by checkout").
+            git -C "$dw" clean -qfdx || die "could not clean $dw"
             git -C "$dw" checkout -q --detach origin/main || die "could not check out origin/main in $dw"
             [ "$(git -C "$dw" rev-parse HEAD)" = "$(git -C "$rd" rev-parse origin/main)" ] \
               || die "deploy worktree is not on origin/main — refusing"
-            # Leftovers from an earlier run must not ship. -x is destructive, so only ever in
-            # the deploy worktree, never the primary checkout.
-            [ "$(cd "$dw" && pwd -P)" != "$(cd "$rd" && pwd -P)" ] && [ "$(basename "$dw")" = deploy ] \
-              || die "refusing to git clean $dw"
-            git -C "$dw" clean -qfdx || die "could not clean $dw"
             # Single repo (root IS the repo, like `next`): project.yaml is versioned, read it
             # from the deploy worktree, or new code ships with an old deploy command.
             # Multi-repo: project.yaml lives in the unversioned project root, the only source.
