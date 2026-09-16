@@ -8,16 +8,20 @@
 # number.
 # Never blocks the status line — 1 s timeout, backgrounded, errors ignored.
 # The agent id is per SESSION (bin/board start/register write it to session-<id>, keyed
-# under the board's own cache dir and, for this reader, also under the flat cache root).
-# A session with no mapping there must NOT fall back to the flat `agent` file: that file
-# is shared across every session on the machine, so the fallback kept exactly one ghost
-# agent id alive forever and it won at the coordinator ranking (T-435). Only a session-less
+# under the board's own cache dir -- same urlsafe transform as bin/board's $CACHE, copied
+# verbatim below). A session with no mapping there must NOT fall back to the flat `agent`
+# file: that file is shared across every session on the machine, so the fallback kept
+# exactly one ghost agent id alive forever and it won at the coordinator ranking (T-435).
+# There is no flat compat copy to fall back to either -- a second, non-keyed write there
+# would reopen the same collision one BOARD_URL up (same session registering against two
+# boards, whichever wrote last wins the other board's heartbeat). Only a session-less
 # caller (no `.session_id` in the payload at all) uses the flat file.
 CACHE_ROOT="${BOARD_CACHE:-$HOME/.cache/board}"
 BOARD_SESS=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null)
 if [ -n "$BOARD_SESS" ]; then
   CACHE="$CACHE_ROOT/$(printf '%s' "${BOARD_URL#*://}" | tr -c 'A-Za-z0-9._-' '_')"
-  AGENT_ID=$(cat "$CACHE/session-$BOARD_SESS" 2>/dev/null || cat "$CACHE_ROOT/session-$BOARD_SESS" 2>/dev/null)
+  AGENT_ID=""
+  [ -s "$CACHE/session-$BOARD_SESS" ] && AGENT_ID=$(cat "$CACHE/session-$BOARD_SESS")
 else
   AGENT_ID=$(cat "$CACHE_ROOT/agent" 2>/dev/null)
 fi
