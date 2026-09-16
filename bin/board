@@ -390,6 +390,13 @@ inbox)
   parse "$@"; as=$(jq -r '.as // empty' <<<"$(body)")
   req GET "/agents/$(agent_id)/inbox${as:+?as=$as}" ;;
 
+agent|agents)
+  sub="${1:-}"; shift || true; parse "$@"
+  case "$sub" in
+    cleanup) req POST /agents/cleanup "$(with_project "$(body)")" ;;
+    *) die "board agent cleanup [--older-than <interval>] [--project <p>] [--all]" ;;
+  esac ;;
+
 project)
   sub="${1:-}"; shift || true; parse "$@"
   case "$sub" in
@@ -547,6 +554,7 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
     done)   req POST "/tasks/$t/done" "$(with_agent "$(body)")"; rm -f "$CACHE/$CURRENT" ;;
     archive) [ -n "$t" ] || die "usage: board task archive <id> [note]"
             req POST "/tasks/$t/archive" "$(with_agent "$(body note "${POS[1]:-}")")"; rm -f "$CACHE/$CURRENT" ;;
+    cleanup-done) req POST /tasks/cleanup "$(with_project "$(body)")" ;;
     release) req POST "/tasks/$t/release" "$(with_agent "$(body)")"; rm -f "$CACHE/$CURRENT" ;;
     show)   r=$(req GET "/tasks/$t") || { echo "$r"; exit 1; }
             jq -e '.json' >/dev/null <<<"$(body)" && { echo "$r"; exit 0; }

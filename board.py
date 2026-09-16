@@ -578,6 +578,79 @@ def finished(aid, b):
     return {"ok": True}
 
 
+def agents_cleanup(project=None, older_than="24h", b=None):
+    if (b or {}).get("all") or project == "all":
+        project = None
+    min_mins = 0
+    if older_than and str(older_than).lower() not in ("0", "all", "none", "active"):
+        td = parse_interval(str(older_than))
+        if td:
+            min_mins = td.total_seconds() / 60
+        else:
+            try:
+                min_mins = float(older_than)
+            except (ValueError, TypeError):
+                raise Err(400, "invalid interval: %s" % older_than)
+
+    q = "SELECT * FROM agents WHERE status<>'finished'"
+    params = []
+    if project:
+        q += " AND current_project=?"
+        params.append(project)
+
+    cleaned = []
+    for a in db.execute(q, params).fetchall():
+        st = status_of(a)
+        if st == "dead":
+            m = mins_since(a["last_seen"])
+            if m >= min_mins:
+                for t in db.execute("SELECT id, status FROM tasks WHERE owner=?", (a["id"],)):
+                    keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "orphaned"
+                    db.execute("UPDATE tasks SET status=?, owner=NULL, human_test=NULL, lease_until=NULL, updated=? WHERE id=?",
+                               (keep, now(), t["id"]))
+                    db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (t["id"],))
+                    ev(a["current_project"], "task/" + t["id"], "task." + ("released" if keep != "orphaned" else "orphaned"),
+                       "board", reason="agent cleaned up: dead for %d min" % int(m))
+                db.execute("UPDATE agents SET status='finished', current_task=NULL WHERE id=?", (a["id"],))
+                db.execute("DELETE FROM roles WHERE agent=?", (a["id"],))
+                ev(a["current_project"], "agent/" + a["id"], "agent.finished", "board",
+                   reason="cleaned up: dead for %d min" % int(m))
+                cleaned.append(a["id"])
+    return {"ok": True, "cleaned": len(cleaned), "agents": cleaned}
+
+
+def tasks_cleanup(project=None, older_than="0", b=None):
+    if (b or {}).get("all") or project == "all":
+        project = None
+    min_mins = 0
+    if older_than and str(older_than).lower() not in ("0", "all", "none", "active"):
+        td = parse_interval(str(older_than))
+        if td:
+            min_mins = td.total_seconds() / 60
+        else:
+            try:
+                min_mins = float(older_than)
+            except (ValueError, TypeError):
+                raise Err(400, "invalid interval: %s" % older_than)
+
+    q = "SELECT * FROM tasks WHERE status='done'"
+    params = []
+    if project:
+        q += " AND project=?"
+        params.append(project)
+
+    archived = []
+    for t in db.execute(q, params).fetchall():
+        m = mins_since(t["updated"] or t["created"])
+        if m >= min_mins:
+            db.execute("UPDATE tasks SET status='archived', owner=NULL, lease_until=NULL, updated=? WHERE id=?",
+                       (now(), t["id"]))
+            db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (t["id"],))
+            ev(t["project"], "task/" + t["id"], "task.archived", "board", note="cleaned up: completed task")
+            archived.append(t["id"])
+    return {"ok": True, "archived": len(archived), "tasks": archived}
+
+
 # ---------- tasks ---------------------------------------------------------
 
 def task(tid):
@@ -1688,14 +1761,16 @@ def whoami(human):
             "title='signed in as an agent: answers will be refused'>agent</span>")
 
 
-def head(title, right="", nav=(("/status", "board"),), human=False):
+def head(title, right="", nav=(("/status", "board"),), human=False, show_all_btn=False):
+    btn = "<button id='btn-show-all' class='badge badge-sm badge-ghost cursor-pointer font-sans select-none' title='Vis alt / Skjul inaktive'>vis alt</button>" if show_all_btn else ""
     return ("<header class='flex flex-wrap items-baseline gap-x-3 gap-y-1 "
             "border-b-2 border-base-300 pb-3'>"
             "<h1 class='text-xl font-semibold tracking-tight sm:text-2xl'>%s</h1>%s"
-            "<nav class='ml-auto flex items-baseline gap-4 text-sm'>%s%s</nav></header>" % (
+            "<nav class='ml-auto flex items-baseline gap-4 text-sm'>%s%s%s</nav></header>" % (
                 escape(title), right,
                 "".join("<a class='%s' href='%s'>%s</a>" % (LINK, u, escape(t))
                         for u, t in nav),
+                btn,
                 whoami(human)))
 
 
@@ -1879,14 +1954,114 @@ def last_activity(p):
     return max(t or "", a or "", "")
 
 
-# Opens the project you last looked at. The server renders everything collapsed, so a
-# collapsed project never flashes open on a slow phone.
+# Opens the project you last looked at, and applies agent/task visibility filters.
 FOCUS_JS = """
-(function(){var d=document.querySelectorAll('.pj'),k='board:focus',w=localStorage.getItem(k),o;
+(function(){
+var d=document.querySelectorAll('.pj'),k='board:focus',w=localStorage.getItem(k),o;
 for(var i=0;i<d.length;i++){if(d[i].dataset.p===w)o=d[i];
 d[i].addEventListener('toggle',function(){if(this.open)localStorage.setItem(k,this.dataset.p);
 else if(localStorage.getItem(k)===this.dataset.p)localStorage.removeItem(k);});}
-(o||d[0]||{}).open=true;})();
+(o||d[0]||{}).open=true;
+
+var iv={'1h':60,'24h':1440,'7d':10080};
+var pms=new URLSearchParams(window.location.search);
+if(pms.get('all')==='1'||pms.get('all')==='true'){localStorage.setItem('board:show_all','1');}
+else if(pms.has('all')){localStorage.setItem('board:show_all','0');}
+if(pms.get('interval')){
+  localStorage.setItem('board:agent_filter',pms.get('interval'));
+  localStorage.setItem('board:task_filter',pms.get('interval'));
+}
+
+function upd(){
+  var sa=localStorage.getItem('board:show_all')==='1';
+  var b=document.getElementById('btn-show-all');
+  if(b){
+    if(sa){b.textContent='viser alt';b.classList.add('badge-primary');b.classList.remove('badge-ghost');}
+    else{b.textContent='vis alt';b.classList.remove('badge-primary');b.classList.add('badge-ghost');}
+  }
+  var pjs=document.querySelectorAll('.pj');
+  for(var p=0;p<pjs.length;p++){
+    var pj=pjs[p];
+    var as=pj.querySelector('[data-agent-filter]');
+    var av=sa?'all':(localStorage.getItem('board:agent_filter')||(as?as.value:'24h'));
+    if(as&&!sa)as.value=av;
+    var ci=pj.querySelector('[data-agent-cleanup]');
+    if(ci)ci.value=av;
+
+    var ac=pj.querySelectorAll('[data-agent]');
+    var ah=0;
+    for(var c=0;c<ac.length;c++){
+      var cd=ac[c];
+      var st=cd.getAttribute('data-status');
+      var mn=parseInt(cd.getAttribute('data-mins')||'0',10);
+      var hd=false;
+      if(!sa&&av!=='all'){
+        if(av==='active'){hd=(st==='dead');}
+        else if(iv[av]){hd=(st==='dead'&&mn>iv[av]);}
+      }
+      cd.style.display=hd?'none':'';
+      if(hd)ah++;
+    }
+    var ab=pj.querySelector('[data-agent-badge]');
+    if(ab){ab.textContent=ah>0?('('+ah+' døde skjult)'):'';}
+
+    var ts=pj.querySelector('[data-task-filter]');
+    var tv=sa?'all':(localStorage.getItem('board:task_filter')||(ts?ts.value:'active'));
+    if(ts&&!sa)ts.value=tv;
+
+    var tr=pj.querySelectorAll('[data-task]');
+    var th=0;
+    for(var r=0;r<tr.length;r++){
+      var rw=tr[r];
+      var tst=rw.getAttribute('data-status');
+      var tmn=parseInt(rw.getAttribute('data-mins')||'0',10);
+      var thd=false;
+      if(!sa&&tv!=='all'){
+        if(tv==='active'){thd=(tst==='done');}
+        else if(tv==='in_flight'){thd=(tst!=='claimed'&&tst!=='in_review'&&tst!=='merging');}
+        else if(iv[tv]){thd=(tmn>iv[tv]);}
+      }
+      rw.style.display=thd?'none':'';
+      if(thd)th++;
+    }
+    var tb=pj.querySelector('[data-task-badge]');
+    if(tb){tb.textContent=th>0?('('+th+' skjult)'):'';}
+  }
+}
+
+var afs=document.querySelectorAll('[data-agent-filter]');
+for(var i=0;i<afs.length;i++){
+  afs[i].addEventListener('change',function(){
+    localStorage.setItem('board:agent_filter',this.value);
+    localStorage.setItem('board:show_all','0');
+    upd();
+  });
+}
+var tfs=document.querySelectorAll('[data-task-filter]');
+for(var j=0;j<tfs.length;j++){
+  tfs[j].addEventListener('change',function(){
+    localStorage.setItem('board:task_filter',this.value);
+    localStorage.setItem('board:show_all','0');
+    upd();
+  });
+}
+var sab=document.getElementById('btn-show-all');
+if(sab){
+  sab.addEventListener('click',function(e){
+    e.preventDefault();
+    var cur=localStorage.getItem('board:show_all')==='1';
+    localStorage.setItem('board:show_all',cur?'0':'1');
+    upd();
+  });
+}
+var cforms=document.querySelectorAll('form[data-confirm]');
+for(var k=0;k<cforms.length;k++){
+  cforms[k].addEventListener('submit',function(e){
+    if(!confirm(this.getAttribute('data-confirm'))){e.preventDefault();}
+  });
+}
+upd();
+})();
 """
 # The CSP lets no script-src in; the hash keeps it exactly as tight as before.
 FOCUS_SHA = "'sha256-%s'" % base64.b64encode(
@@ -1897,12 +2072,15 @@ FOCUS = "<script>%s</script>" % FOCUS_JS
 def agent_block(a, ceilings):
     roles = " ".join(a["roles"]) if a.get("roles") else ""
     ws = sorted(windows_of(a).items())
-    return ("<div class='border-t border-base-300 py-2.5'>"
+    st = a.get("status") or "unknown"
+    mins = int(mins_since(a.get("last_seen"))) if a.get("last_seen") else 999999
+    return ("<div data-agent class='border-t border-base-300 py-2.5' data-status='%s' data-mins='%d'>"
             "<b class='%s block font-semibold'>%s</b>"
             "<div class='mt-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-1'>"
             "<span class='%s text-xs'>%s</span>"
             "<span class='badge badge-sm %s'>%s</span>%s%s</div>"
             "<div class='mt-1.5 grid gap-1'>%s%s</div>%s</div>" % (
+                escape(st), mins,
                 MONO, escape(a["id"]), DIM, escape(a["model"] or ""),
                 "badge-error" if a["status"] == "dead" else
                 ("badge-warning" if a["status"] != "alive" else "badge-ghost"),
@@ -1940,7 +2118,9 @@ def task_rows(p):
         pr_v, pr_e = dash("#" + pn if pn else None)
         rp_v, rp_e = dash(t["repo"])
         ow_v, ow_e = dash(t["owner"])
-        h.append("<tr id='%s' class='spine %s'>"
+        st = t.get("status") or "unknown"
+        mins = int(mins_since(t.get("updated") or t.get("created"))) if (t.get("updated") or t.get("created")) else 0
+        h.append("<tr id='%s' data-task class='spine %s' data-status='%s' data-mins='%d'>"
                  "<td data-l=id class='py-1.5 pl-3 pr-2 align-top whitespace-nowrap'>"
                  "<a class='%s %s' href='/t/%s'>%s</a>"
                  "<td data-l=status class='%s px-2 py-1.5 align-top whitespace-nowrap'>"
@@ -1950,9 +2130,36 @@ def task_rows(p):
                  "<td data-l=owner%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
                  "<td data-l=title class='px-2 py-1.5 align-top font-medium "
                  "[overflow-wrap:anywhere]'>%s" % (
-                     escape(t["id"]), SPINE.get(t["status"], ""), LINK, MONO,
+                     escape(t["id"]), SPINE.get(t["status"], ""), escape(st), mins,
+                     LINK, MONO,
                      escape(t["id"]), escape(t["id"]),
                      DIM, BADGE.get(t["status"], "badge-ghost"), escape(t["status"]),
+                     pr_e, DIM, MONO, pr_v,
+                     rp_e, DIM, rp_v,
+                     ow_e, DIM, MONO, ow_v,
+                     escape(t["title"] or "")))
+    recent_done = [brief(t) for t in db.execute(
+        "SELECT * FROM tasks WHERE project=? AND status='done' ORDER BY updated DESC LIMIT 30", (p["name"],))]
+    for t in recent_done:
+        pn = pr_num(t.get("pr"))
+        pr_v, pr_e = dash("#" + pn if pn else None)
+        rp_v, rp_e = dash(t["repo"])
+        ow_v, ow_e = dash(t["owner"])
+        mins = int(mins_since(t.get("updated") or t.get("created"))) if (t.get("updated") or t.get("created")) else 0
+        h.append("<tr id='%s' data-task class='spine spine-land' data-status='done' data-mins='%d' style='display:none;'>"
+                 "<td data-l=id class='py-1.5 pl-3 pr-2 align-top whitespace-nowrap'>"
+                 "<a class='%s %s' href='/t/%s'>%s</a>"
+                 "<td data-l=status class='%s px-2 py-1.5 align-top whitespace-nowrap'>"
+                 "<span class='badge badge-sm %s'>%s</span>"
+                 "<td data-l=pr%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
+                 "<td data-l=repo%s class='%s px-2 py-1.5 align-top whitespace-nowrap'>%s"
+                 "<td data-l=owner%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
+                 "<td data-l=title class='px-2 py-1.5 align-top font-medium "
+                 "[overflow-wrap:anywhere]'>%s" % (
+                     escape(t["id"]), mins,
+                     LINK, MONO,
+                     escape(t["id"]), escape(t["id"]),
+                     DIM, BADGE.get("done", "badge-ghost"), "done",
                      pr_e, DIM, MONO, pr_v,
                      rp_e, DIM, rp_v,
                      ow_e, DIM, MONO, ow_v,
@@ -1984,7 +2191,7 @@ def html_status(project, token="", human=False):
     s = status(project)
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
         MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")),
-        (("/tests", "test queue"),), human)]
+        (("/tests", "test queue"),), human, show_all_btn=True)]
     if not s["projects"]:
         h.append("<div class='mt-8 rounded-box border border-dashed border-base-300 "
                  "px-4 py-10 text-center %s'>No projects yet.<br>"
@@ -2019,13 +2226,42 @@ def html_status(project, token="", human=False):
         ceilings = {win_name(k): float(v or 0)
                     for k, v in ((p.get("budget") or {}).get("ceilings") or {}).items()}
         h.append("<div class='pane mt-2'><section class='min-w-0'>")
-        h.append("<p class='%s'>agents</p>" % LBL)
+        h.append("<div class='mt-6 mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>"
+                 "<div class='flex items-center gap-1'>"
+                 "<p class='text-sm text-base-content/60 m-0'>agents</p>"
+                 "<span data-agent-badge class='text-xs text-base-content/60'></span></div>"
+                 "<div class='ml-auto flex items-center gap-1'>"
+                 "<select data-agent-filter class='rounded border border-base-300 bg-base-100 px-2 py-1 text-xs font-sans cursor-pointer' data-project='%s'>"
+                 "<option value='active'>Kun aktive</option>"
+                 "<option value='1h'>&lt; 1 time</option>"
+                 "<option value='24h' selected>&lt; 24 timer</option>"
+                 "<option value='7d'>&lt; 7 dager</option>"
+                 "<option value='all'>Vis alle</option></select>"
+                 "<form method='POST' action='/agents/cleanup' class='m-0 flex items-center' data-confirm='Rydd opp døde agenter?'>"
+                 "<input type='hidden' name='project' value='%s'>"
+                 "<input type='hidden' name='older_than' value='24h' data-agent-cleanup>"
+                 "<button type='submit' class='badge badge-sm badge-error cursor-pointer' title='Merk døde agenter som ferdige'>rydd opp</button>"
+                 "</form></div></div>" % (escape(p["name"]), escape(p["name"])))
         if not p["agents"]:
             h.append("<p class='%s text-sm'>No agents are registered here yet.</p>" % DIM)
         for a in p["agents"]:
             h.append(agent_block(a, ceilings))
         h.append("</section><section class='min-w-0'>")
-        h.append("<p class='%s'>tasks</p>" % LBL)
+        h.append("<div class='mt-6 mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>"
+                 "<div class='flex items-center gap-1'>"
+                 "<p class='text-sm text-base-content/60 m-0'>tasks</p>"
+                 "<span data-task-badge class='text-xs text-base-content/60'></span></div>"
+                 "<div class='ml-auto flex items-center gap-1'>"
+                 "<select data-task-filter class='rounded border border-base-300 bg-base-100 px-2 py-1 text-xs font-sans cursor-pointer' data-project='%s'>"
+                 "<option value='active' selected>Aktive &amp; åpne</option>"
+                 "<option value='in_flight'>I arbeid</option>"
+                 "<option value='24h'>Endret &lt; 24t</option>"
+                 "<option value='7d'>Endret &lt; 7d</option>"
+                 "<option value='all'>Vis alle</option></select>"
+                 "<form method='POST' action='/tasks/cleanup' class='m-0 flex items-center' data-confirm='Arkiver fullførte oppgaver?'>"
+                 "<input type='hidden' name='project' value='%s'>"
+                 "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' title='Arkiver fullførte oppgaver'>arkiver ferdige</button>"
+                 "</form></div></div>" % (escape(p["name"]), escape(p["name"])))
         if not p["tasks"]:
             h.append("<p class='%s text-sm'>The queue is empty.</p>" % DIM)
         else:
@@ -2228,6 +2464,9 @@ ROUTES = [
     ("POST",   r"/agents/([^/]+)/heartbeat$",   lambda h, m, b, q: heartbeat(m[0], b)),
     ("PUT",    r"/agents/([^/]+)/capabilities$",lambda h, m, b, q: set_caps(m[0], b)),
     ("PUT",    r"/agents/([^/]+)/preference$",  lambda h, m, b, q: set_pref(m[0], b)),
+    ("POST",   r"/agents/cleanup$",             lambda h, m, b, q: agents_cleanup(
+        (b or {}).get("project") or q.get("project", [None])[0],
+        (b or {}).get("older_than") or q.get("older_than", ["24h"])[0], b)),
     ("POST",   r"/agents/([^/]+)/finished$",    lambda h, m, b, q: finished(m[0], b)),
     ("GET",    r"/agents/([^/]+)/inbox$",       lambda h, m, b, q: inbox(m[0], q)),
     ("POST",   r"/projects$",                   lambda h, m, b, q: dict(ensure_project(
@@ -2249,6 +2488,9 @@ ROUTES = [
     ("POST",   r"/tasks/([^/]+)/deployed$",   lambda h, m, b, q: task_deployed(m[0], actor(q, b), b)),
     ("POST",   r"/tasks/([^/]+)/done$",         lambda h, m, b, q: task_done(m[0], actor(q, b), b)),
     ("POST",   r"/tasks/([^/]+)/archive$",      lambda h, m, b, q: task_archive(m[0], actor(q, b), b)),
+    ("POST",   r"/tasks/cleanup$",              lambda h, m, b, q: tasks_cleanup(
+        (b or {}).get("project") or q.get("project", [None])[0],
+        (b or {}).get("older_than") or q.get("older_than", ["0"])[0], b)),
     ("POST",   r"/tasks/([^/]+)/release$",      lambda h, m, b, q: release(m[0], actor(q, b), b)),
     ("POST",   r"/questions$",                  lambda h, m, b, q: question_create(b, actor(q, b))),
     ("GET",    r"/questions$",                  lambda h, m, b, q: {"questions": tests_open(
@@ -2722,6 +2964,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.log_message("500 %r", e)
             return self.send(500, {"error": repr(e)})
+        if r is None:
+            return
         if isinstance(r, str):
             return self.send(200, r, "text/html")
         return self.send(200, r)
@@ -2755,6 +2999,22 @@ class Handler(BaseHTTPRequestHandler):
         if m and method == "POST":
             task_comment(m.group(1), body)
             return self.send(302, "", "text/html", extra=[("Location", "/t/" + m.group(1))])
+        if path == "/agents/cleanup" and method == "POST":
+            proj = (body or {}).get("project")
+            older = (body or {}).get("older_than", "24h")
+            res = agents_cleanup(proj, older, body)
+            if self.headers.get("accept") == "application/json":
+                return self.send(200, res)
+            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
+            return self.send(302, "", "text/html", extra=[("Location", loc)])
+        if path == "/tasks/cleanup" and method == "POST":
+            proj = (body or {}).get("project")
+            older = (body or {}).get("older_than", "0")
+            res = tasks_cleanup(proj, older, body)
+            if self.headers.get("accept") == "application/json":
+                return self.send(200, res)
+            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
+            return self.send(302, "", "text/html", extra=[("Location", loc)])
         m = re.match(r"^/q/([^/]+)/answer$", path)
         if m and method == "POST":
             ans = body.get("answer", "")
