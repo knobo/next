@@ -890,15 +890,34 @@ api POST /tasks/$T2ID/archive "{\"agent\":\"$AID\",\"note\":\"conformance cleanu
 api POST /tasks/$T3ID/archive "{\"agent\":\"$BID\",\"note\":\"conformance cleanup\"}" >/dev/null
 fi
 check "project isolation (403)" "$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' >/dev/null; api POST /tasks/$TID/claim "{\"agent\":\"$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' | jq -r .id)\"}")" '.error'
+if [ "$OWN_SERVER" = 1 ]; then
+  QLINES=$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)
+fi
 check "finished releases everything" "$(api POST /agents/$AID/finished '{"reason":"queue empty"}')" '.ok'
 if [ "$OWN_SERVER" = 1 ]; then
-for _ in $(seq 50); do grep -q "queue empty" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
-N=$(cat "$TMP/ntfy" 2>/dev/null || true)
-grep -B2 "queue empty" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
-  && ok "finished with no current task links to /status" \
-  || no "finished with no current task links to /status" "$(grep -B2 'queue empty' <<<"$N")"
+  sleep .3
+  [ "$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)" = "$QLINES" ] \
+    && ok "finished with the routine 'queue empty' reason pushes nothing" \
+    || no "finished with the routine 'queue empty' reason pushes nothing" \
+       "$(tail -n +$((QLINES + 1)) "$TMP/ntfy" 2>/dev/null)"
+  # finished() must still link to /status when a non-routine reason has no current task
+  # (T-389's fallback) — 'queue empty' above no longer pushes at all, so that path needs
+  # its own agent with a real reason to stay covered.
+  NOTASKAG=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"nt","session":"nt"}' | jq -r .id)
+  api POST "/agents/$NOTASKAG/finished" '{"reason":"no task click check"}' >/dev/null
+  for _ in $(seq 50); do grep -q "no task click check" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
+  N=$(cat "$TMP/ntfy" 2>/dev/null || true)
+  grep -B2 "no task click check" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
+    && ok "finished with no current task links to /status" \
+    || no "finished with no current task links to /status" "$(grep -B2 'no task click check' <<<"$N")"
 fi
 api POST "/agents/$BID/finished" '{"reason":"conformance"}' >/dev/null
+if [ "$OWN_SERVER" = 1 ]; then
+  for _ in $(seq 20); do grep -q "agent finished (conformance): $BID" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
+  grep -q "agent finished (conformance): $BID" "$TMP/ntfy" 2>/dev/null \
+    && ok "finished with a real reason pushes and names it in the title" \
+    || no "finished with a real reason pushes and names it in the title" "$(cat "$TMP/ntfy" 2>/dev/null)"
+fi
 
 echo "== lease: heartbeat is life, task.progress is progress (Q-107) =="
 C=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","session":"s4"}')

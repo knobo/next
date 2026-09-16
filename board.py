@@ -756,15 +756,19 @@ def finished(aid, b):
     db.execute("UPDATE agents SET status='finished', current_task=NULL WHERE id=?", (aid,))
     db.execute("DELETE FROM roles WHERE agent=?", (aid,))
     ev(a["current_project"], "agent/" + aid, "agent.finished", aid, reason=b.get("reason"))
-    # An agent that stands down must not do it silently: without a push the human only
-    # sees the fleet stop working. If the quota ceiling is missing from the policy, the
-    # reason goes in the same notification.
-    note = budget(a["current_project"]).get("note")
-    click = ("%s/t/%s" % (BASE_URL, a["current_task"]) if a["current_task"]
-             else "%s/status" % BASE_URL)
-    ntfy("agent finished: %s" % aid, "%s — %s%s" % (
-        a["current_project"] or "?", b.get("reason") or "no reason given",
-        "\n" + note if note else ""), click)
+    # An agent that stands down must not do it silently — UNLESS the reason is the
+    # routine "queue empty" (skill/reference/protocol.md:18): a fleet running overnight
+    # ends every session that way, and a push per drain teaches the human to mute the
+    # channel, which buries the one push that matters (quota stop, etc.). Only the exact
+    # routine string is silent; anything else — including no reason at all — pushes, and
+    # says the reason in the title instead of burying it in the body.
+    reason = b.get("reason") or "no reason given"
+    if reason.strip().lower() != "queue empty":
+        note = budget(a["current_project"]).get("note")
+        click = ("%s/t/%s" % (BASE_URL, a["current_task"]) if a["current_task"]
+                 else "%s/status" % BASE_URL)
+        ntfy("agent finished (%s): %s" % (reason, aid), "%s%s" % (
+            a["current_project"] or "?", "\n" + note if note else ""), click)
     return {"ok": True}
 
 
