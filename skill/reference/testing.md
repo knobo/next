@@ -3,8 +3,7 @@
 Loaded at step 10, when you have to prove the change works.
 
 Nobody verifies your work for you. The human tests what is **deployed**, in dev or prod, after
-the fact — never a branch, never your worktree, never a screenshot of your localhost. There is
-no stage in between and nothing waits for them.
+the fact — never a branch, never your worktree, never a screenshot of your localhost.
 
 ## What counts
 

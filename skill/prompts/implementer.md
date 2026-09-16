@@ -30,10 +30,8 @@ You implement ONE task in ONE worktree. The coordinator handles PRs, review, mer
    your change and pass after. If the repo has no test setup, say so instead of building one.
 4. Smallest change that satisfies the criterion. Match the surrounding code — naming, comment
    density, error handling. No refactors that were not asked for.
-5. Run the acceptance command. It has to actually run — CLI, playwright or test code; a diff
-   you read is not a test you passed. Red → fix. Do not report success you have not seen,
-   and never hand the verification to a human: no way to drive the surface at all is a
-   `blocked` report, not a request that someone checks it for you.
+5. Run the acceptance command — see `reference/testing.md` for what counts. Red → fix. Do not
+   report success you have not seen.
 
 ## Report (this is all the coordinator sees — keep it under 20 lines)
 
