@@ -300,6 +300,25 @@ check "start without a manifest: a message, no unbound variable" \
   "$(jq -nc --arg o "$NOMAN" '{o:$o}')" \
   '(.o|contains("No project.yaml")) and (.o|contains("unbound")|not) and (.o|contains("rc=1"))'
 
+echo "== board help: authored text, not raw source (T-289) =="
+HELPTOP=$(env -u BOARD_HUMAN -u BOARD_URL -u BOARD_AGENT_ID "$SRC/bin/board" help 2>&1)
+HELPTASK=$(env -u BOARD_HUMAN -u BOARD_URL -u BOARD_AGENT_ID "$SRC/bin/board" help task 2>&1)
+if grep -qE ';;|\$\(' <<<"$HELPTOP"; then no "board help has no shell syntax" "$HELPTOP"
+else ok "board help has no shell syntax"; fi
+if grep -qE ';;|\$\(' <<<"$HELPTASK"; then no "board help task has no shell syntax" "$HELPTASK"
+else ok "board help task has no shell syntax"; fi
+# Derived from the real case statement, not the help table — so a new task subcommand
+# added without help text fails this instead of the check trusting its own list.
+TASK_SUBS=$(awk '/^task\|tasks\)/{f=1; next} f && /^[a-zA-Z][a-zA-Z_-]*(\|[a-zA-Z_-]+)*\)$/{exit} f' "$SRC/bin/board" \
+  | grep -oP '^\s{4}\K[a-zA-Z][a-zA-Z_-]*(?=\))' | sort -u)
+# Match the actual listed token (`board task <name> ...`), not a raw substring — a
+# subcommand's own description text can otherwise contain another subcommand's name.
+LISTED=$(sed -n 's/^  board task \([a-zA-Z_-]*\).*/\1/p' <<<"$HELPTASK" | sort -u)
+MISSING=""
+for s in $TASK_SUBS; do grep -qx -- "$s" <<<"$LISTED" || MISSING="$MISSING $s"; done
+[ -z "$MISSING" ] && ok "board help task lists every task subcommand ($(wc -w <<<"$TASK_SUBS") found)" \
+  || no "board help task lists every task subcommand" "missing:$MISSING"
+
 echo "== registration, capabilities, heartbeat =="
 A=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","model":"claude-fable-5-1","session":"s1","capabilities":["browser-test","playwright"]}')
 check "register returns an id + grants from the policy" "$A" '.id and (.grants|index("merge"))'

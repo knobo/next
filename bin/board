@@ -252,6 +252,64 @@ with_project() {  # add `project` from the manifest if it is missing
      'if (.project // "") == "" then .project = $p else . end' <<<"${1:-\{\}}"
 }
 
+# `board help` text (T-289). One row per case label below: name(s)::usage::one-line
+# description. `::` (not the `|` case labels already use) keeps this greppable with awk.
+# This is the ONLY source `help)` reads from — it never seds its own body again.
+HELP_TOPLEVEL=$(cat <<'EOF'
+simplify::board simplify [--project <p>] [--apply] [--json]::Merge duplicate tasks, drop invalid ones, tidy the queue.
+start::board start [role] [--model <model>] [--sh]::One-step bootstrap: register, claim a role, fetch the next task.
+register::board register::Register this agent with the board.
+heartbeat::board heartbeat [--budget <json>]::Send a liveness heartbeat with context/quota usage.
+caps::board caps [--add <c,c>] [--remove <c,c>] [--prefer <model>]::Set this agent's capabilities or model preference.
+finished::board finished::Mark this agent's session finished.
+inbox::board inbox [--as <role>]::List this agent's pending questions and messages.
+agent|agents::board agent cleanup [--older-than <dur>] [--project <p>] [--all]::Agent maintenance (cleanup dead agents).
+project::board project detect|show|init|sync|set::Project manifest operations.
+caps-probe|probe::board caps-probe::Probe this host's tool capabilities.
+task|tasks::board help task::Task lifecycle — see 'board help task' for subcommands.
+gate::board gate [merge] [task-id]::Check whether a task's merge/deploy gate is satisfied.
+ask::board ask "<question>"::Ask the board (or a human) a question.
+answer::board answer <question-id> "<answer>"::Answer a pending question.
+message::board message <agent> --text "..."::Send a free-text message to an agent.
+test::board test request <task-id> --card-file <f>::Request/record a manual test card for a task.
+test-level::board test-level <task-id>::Report which test level (auto/human) a task needs.
+routines|routine::board routines [--project <p>] [--status <s>]::List scheduled routines.
+tests::board tests [--project <p>]::List open test cards.
+role::board role pin|unpin|claim|recommend [role]::Claim, release, or recommend a coordination role.
+pause|resume::board pause|resume [note]::Pause or resume a project.
+status::board status [--project <p>] [--json|--md|--me]::Show agents, tasks and open questions.
+tail::board tail [--since <n>]::Stream board events since a point in time.
+open::board open [page] [--qr]::Open the board UI (or print a login QR for a phone).
+help|-h|--help::board help [command]::Show this help.
+EOF
+)
+HELP_TASK=$(cat <<'EOF'
+simplify::board task simplify [--apply]::Merge duplicate tasks, drop invalid ones, tidy the queue.
+create::board task create --title <t> [--spec-file <f>]::Create a new task.
+next::board task next::Claim the next available task for this agent.
+claim::board task claim <id>::Claim a specific task by id.
+progress::board task progress <id> ["note"]::Post a progress note on the current task.
+blocked::board task blocked <id> ["note"]::Mark the current task blocked, with a note.
+review::board task review <id>::Move a task to review.
+merging::board task merging <id>::Rebase/build/test a task's branch against origin/main.
+merged::board task merged <id>::Finish a merge: mark the task done and clean up.
+done::board task done <id>::Mark a task done.
+archive::board task archive <id> [note]::Archive a task.
+cleanup-done::board task cleanup-done [--project <p>]::Bulk-archive old done tasks.
+release::board task release <id>::Release a claimed task back to the queue.
+show::board task show <id>::Show a task's detail and timeline.
+patch::board task patch <id> [fields...]::Patch arbitrary fields on a task.
+deployed::board task deployed <id>::Mark a task as deployed.
+comment::board task comment <id> "note"::Add a free-text comment to a task.
+deploy::board task deploy <id> <env>::Run the manifest's deploy against origin/main.
+search::board task search <text>::Search tasks by text.
+list::board task list [--project <p>] [--status <s>]::List tasks.
+worktree::board task worktree <id>::Create a git worktree for a task's branch.
+pr::board task pr <id>::Open a pull request for a task's branch.
+cleanup::board task cleanup <id>::Remove a task's worktree/branch after merge.
+EOF
+)
+
 cmd="${1:-status}"; shift || true
 
 case "$cmd" in
@@ -972,13 +1030,18 @@ so once — do not put it in a shell profile, an agent started from that profile
   fi ;;
 
 help|-h|--help)
-  if [ -n "${1:-}" ]; then
-    grep -n "^$1)" "$0" >/dev/null && sed -n "/^$1)/,/;;$/p" "$0" | head -20 \
-      || die "unknown command: $1"
+  if [ "${1:-}" = task ] || [ "${1:-}" = tasks ]; then
+    echo "board task <subcommand> ... — subcommands:"
+    awk -F'::' '{printf "  %-42s %s\n", $2, $3}' <<<"$HELP_TASK"
+  elif [ -n "${1:-}" ]; then
+    row=$(awk -F'::' -v n="$1" 'index("|" $1 "|", "|" n "|"){print; exit}' <<<"$HELP_TOPLEVEL")
+    [ -n "$row" ] || die "unknown command: $1 (board help)"
+    awk -F'::' '{printf "%s\n%s\n", $2, $3}' <<<"$row"
   else
     sed -n '2,4p' "$0"; echo
-    grep -oP '^[a-z][a-z-]*(?=\)$)' "$0" | tr '\n' ' '; echo
-    echo "board help <command> for details"
+    awk -F'::' '{printf "  %-16s %s\n", $1, $3}' <<<"$HELP_TOPLEVEL"
+    echo
+    echo "board help <command> for usage, board help task for task subcommands"
   fi ;;
 *) die "unknown command: $cmd (board help)" ;;
 esac
