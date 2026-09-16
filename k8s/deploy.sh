@@ -19,8 +19,9 @@ cd "$(dirname "$0")/.."
 ENVFILE="${BOARD_ENV:-${BOARD_REPO_ROOT:-.}/board.env}"
 [ -f "$ENVFILE" ] || {
   echo "no $ENVFILE — copy board.env.example and fill it in" >&2; exit 2; }
+case "$ENVFILE" in */*) ;; *) ENVFILE="./$ENVFILE" ;; esac
 # shellcheck disable=SC1090
-set -a; . "./$ENVFILE"; set +a
+set -a; . "$ENVFILE"; set +a
 
 : "${BOARD_HOST:?set BOARD_HOST in $ENVFILE}"
 : "${KUBE_CONTEXT:=}"
