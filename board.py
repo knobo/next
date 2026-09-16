@@ -590,7 +590,7 @@ def agents_cleanup(project=None, older_than="24h", b=None):
             try:
                 min_mins = float(older_than)
             except (ValueError, TypeError):
-                min_mins = 0
+                raise Err(400, "invalid interval: %s" % older_than)
 
     q = "SELECT * FROM agents WHERE status<>'finished'"
     params = []
@@ -604,8 +604,13 @@ def agents_cleanup(project=None, older_than="24h", b=None):
         if st == "dead":
             m = mins_since(a["last_seen"])
             if m >= min_mins:
-                for t in db.execute("SELECT id FROM tasks WHERE owner=? AND status IN ('claimed','in_review')", (a["id"],)):
-                    release(t["id"], a["id"], {"note": "agent cleaned up: dead"})
+                for t in db.execute("SELECT id, status FROM tasks WHERE owner=?", (a["id"],)):
+                    keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "orphaned"
+                    db.execute("UPDATE tasks SET status=?, owner=NULL, human_test=NULL, lease_until=NULL, updated=? WHERE id=?",
+                               (keep, now(), t["id"]))
+                    db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (t["id"],))
+                    ev(a["current_project"], "task/" + t["id"], "task." + ("released" if keep != "orphaned" else "orphaned"),
+                       "board", reason="agent cleaned up: dead for %d min" % int(m))
                 db.execute("UPDATE agents SET status='finished', current_task=NULL WHERE id=?", (a["id"],))
                 db.execute("DELETE FROM roles WHERE agent=?", (a["id"],))
                 ev(a["current_project"], "agent/" + a["id"], "agent.finished", "board",
@@ -626,7 +631,7 @@ def tasks_cleanup(project=None, older_than="0", b=None):
             try:
                 min_mins = float(older_than)
             except (ValueError, TypeError):
-                min_mins = 0
+                raise Err(400, "invalid interval: %s" % older_than)
 
     q = "SELECT * FROM tasks WHERE status='done'"
     params = []
@@ -641,7 +646,7 @@ def tasks_cleanup(project=None, older_than="0", b=None):
             db.execute("UPDATE tasks SET status='archived', owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                        (now(), t["id"]))
             db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (t["id"],))
-            ev(t["project"], "task/" + t["id"], "task.archived", "board", reason="cleaned up: completed task")
+            ev(t["project"], "task/" + t["id"], "task.archived", "board", note="cleaned up: completed task")
             archived.append(t["id"])
     return {"ok": True, "archived": len(archived), "tasks": archived}
 
@@ -1978,7 +1983,7 @@ function upd(){
   for(var p=0;p<pjs.length;p++){
     var pj=pjs[p];
     var as=pj.querySelector('[data-agent-filter]');
-    var av=sa?'all':(as?as.value:(localStorage.getItem('board:agent_filter')||'24h'));
+    var av=sa?'all':(localStorage.getItem('board:agent_filter')||(as?as.value:'24h'));
     if(as&&!sa)as.value=av;
     var ci=pj.querySelector('[data-agent-cleanup]');
     if(ci)ci.value=av;
@@ -2001,7 +2006,7 @@ function upd(){
     if(ab){ab.textContent=ah>0?('('+ah+' døde skjult)'):'';}
 
     var ts=pj.querySelector('[data-task-filter]');
-    var tv=sa?'all':(ts?ts.value:(localStorage.getItem('board:task_filter')||'active'));
+    var tv=sa?'all':(localStorage.getItem('board:task_filter')||(ts?ts.value:'active'));
     if(ts&&!sa)ts.value=tv;
 
     var tr=pj.querySelectorAll('[data-task]');
@@ -2012,7 +2017,7 @@ function upd(){
       var tmn=parseInt(rw.getAttribute('data-mins')||'0',10);
       var thd=false;
       if(!sa&&tv!=='all'){
-        if(tst==='done'){thd=true;}
+        if(tv==='active'){thd=(tst==='done');}
         else if(tv==='in_flight'){thd=(tst!=='claimed'&&tst!=='in_review'&&tst!=='merging');}
         else if(iv[tv]){thd=(tmn>iv[tv]);}
       }
@@ -2047,6 +2052,12 @@ if(sab){
     var cur=localStorage.getItem('board:show_all')==='1';
     localStorage.setItem('board:show_all',cur?'0':'1');
     upd();
+  });
+}
+var cforms=document.querySelectorAll('form[data-confirm]');
+for(var k=0;k<cforms.length;k++){
+  cforms[k].addEventListener('submit',function(e){
+    if(!confirm(this.getAttribute('data-confirm'))){e.preventDefault();}
   });
 }
 upd();
@@ -2226,7 +2237,7 @@ def html_status(project, token="", human=False):
                  "<option value='24h' selected>&lt; 24 timer</option>"
                  "<option value='7d'>&lt; 7 dager</option>"
                  "<option value='all'>Vis alle</option></select>"
-                 "<form method='POST' action='/agents/cleanup' class='m-0 flex items-center' onsubmit=\"return confirm('Rydd opp døde agenter?');\">"
+                 "<form method='POST' action='/agents/cleanup' class='m-0 flex items-center' data-confirm='Rydd opp døde agenter?'>"
                  "<input type='hidden' name='project' value='%s'>"
                  "<input type='hidden' name='older_than' value='24h' data-agent-cleanup>"
                  "<button type='submit' class='badge badge-sm badge-error cursor-pointer' title='Merk døde agenter som ferdige'>rydd opp</button>"
@@ -2247,7 +2258,7 @@ def html_status(project, token="", human=False):
                  "<option value='24h'>Endret &lt; 24t</option>"
                  "<option value='7d'>Endret &lt; 7d</option>"
                  "<option value='all'>Vis alle</option></select>"
-                 "<form method='POST' action='/tasks/cleanup' class='m-0 flex items-center' onsubmit=\"return confirm('Arkiver fullførte oppgaver?');\">"
+                 "<form method='POST' action='/tasks/cleanup' class='m-0 flex items-center' data-confirm='Arkiver fullførte oppgaver?'>"
                  "<input type='hidden' name='project' value='%s'>"
                  "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' title='Arkiver fullførte oppgaver'>arkiver ferdige</button>"
                  "</form></div></div>" % (escape(p["name"]), escape(p["name"])))
@@ -2953,6 +2964,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.log_message("500 %r", e)
             return self.send(500, {"error": repr(e)})
+        if r is None:
+            return
         if isinstance(r, str):
             return self.send(200, r, "text/html")
         return self.send(200, r)
