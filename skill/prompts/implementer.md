@@ -20,16 +20,24 @@ You implement ONE task in ONE worktree. The coordinator handles PRs, review, mer
    and follow it — the coordinator put it there on purpose. Spec unclear? Implement the most
    conservative reading and say so in the report — do not stop, do not ask. Questions are the
    coordinator's job.
-2. Write the test first when the task has a testable acceptance criterion. It must fail before
+2. Plan your slice before you touch a file — the coordinator's plan on the task is the what and
+   the why; this one is the how. Four lines: the command or test that will prove you are done,
+   the files you will change in the order you will change them, what you are deliberately NOT
+   touching, and the assumption that would sink the plan if it turned out wrong. If the plan
+   shows the task cannot be done as written, stop there and report `blocked` — a plan that dies
+   on paper is cheaper than a branch that dies in review.
+3. Write the test first when the task has a testable acceptance criterion. It must fail before
    your change and pass after. If the repo has no test setup, say so instead of building one.
-3. Smallest change that satisfies the criterion. Match the surrounding code — naming, comment
+4. Smallest change that satisfies the criterion. Match the surrounding code — naming, comment
    density, error handling. No refactors that were not asked for.
-4. Run the acceptance command. Red → fix. Do not report success you have not seen.
+5. Run the acceptance command. Red → fix. Do not report success you have not seen.
 
 ## Report (this is all the coordinator sees — keep it under 20 lines)
 
 ```
 STATUS: done | blocked | partial
+PLAN: <the plan from step 2, one line per step, max 4 — so the coordinator sees what you
+       set out to do, not only what you touched>
 COMMITS: <sha> <subject>
 ACCEPTANCE: <the command you ran> → pass | fail
 CHANGED: <file: one line why>  (max 10)
