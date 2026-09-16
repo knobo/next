@@ -256,7 +256,7 @@ with_project() {  # add `project` from the manifest if it is missing
 # description. `::` (not the `|` case labels already use) keeps this greppable with awk.
 # This is the ONLY source `help)` reads from — it never seds its own body again.
 HELP_TOPLEVEL=$(cat <<'EOF'
-simplify::board simplify [--project <p>] [--apply] [--json]::Merge duplicate tasks, drop invalid ones, tidy the queue.
+simplify::board simplify [--project <p>] [--apply] [--archive-done] [--json]::Merge duplicate tasks, drop invalid ones, tidy the queue.
 start::board start [role] [--model <model>] [--sh]::One-step bootstrap: register, claim a role, fetch the next task.
 register::board register::Register this agent with the board.
 heartbeat::board heartbeat [--budget <json>]::Send a liveness heartbeat with context/quota usage.
@@ -269,11 +269,11 @@ caps-probe|probe::board caps-probe::Probe this host's tool capabilities.
 task|tasks::board help task::Task lifecycle — see 'board help task' for subcommands.
 gate::board gate [merge] [task-id]::Check whether a task's merge/deploy gate is satisfied.
 ask::board ask "<question>"::Ask the board (or a human) a question.
-answer::board answer <question-id> "<answer>"::Answer a pending question.
+answer::board answer <question-id> "<answer>" [--note <note>]::Answer a pending question.
 message::board message <agent> --text "..."::Send a free-text message to an agent.
 test::board test request <task-id> --card-file <f>::Request/record a manual test card for a task.
 test-level::board test-level <task-id>::Report which test level (auto/human) a task needs.
-routines|routine::board routines [--project <p>] [--status <s>]::List scheduled routines.
+routines|routine::board routines [--project <p>] [--status <s>] [--json]::List scheduled routines.
 tests::board tests [--project <p>]::List open test cards.
 role::board role pin|unpin|claim|recommend [role]::Claim, release, or recommend a coordination role.
 pause|resume::board pause|resume [note]::Pause or resume a project.
@@ -284,26 +284,26 @@ help|-h|--help::board help [command]::Show this help.
 EOF
 )
 HELP_TASK=$(cat <<'EOF'
-simplify::board task simplify [--apply]::Merge duplicate tasks, drop invalid ones, tidy the queue.
+simplify::board task simplify [--project <p>] [--apply] [--archive-done] [--json]::Merge duplicate tasks, drop invalid ones, tidy the queue.
 create::board task create --title <t> [--spec-file <f>]::Create a new task.
-next::board task next::Claim the next available task for this agent.
+next::board task next [--repo <repo>]::Claim the next available task for this agent.
 claim::board task claim <id>::Claim a specific task by id.
 progress::board task progress <id> ["note"]::Post a progress note on the current task.
 blocked::board task blocked <id> ["note"]::Mark the current task blocked, with a note.
 review::board task review <id>::Move a task to review.
 merging::board task merging <id>::Rebase/build/test a task's branch against origin/main.
-merged::board task merged <id>::Finish a merge: mark the task done and clean up.
+merged::board task merged <id> --sha <sha>::Verify a task's merge landed on origin/main (merge_verified) — does not mark done or clean up.
 done::board task done <id>::Mark a task done.
 archive::board task archive <id> [note]::Archive a task.
 cleanup-done::board task cleanup-done [--project <p>]::Bulk-archive old done tasks.
 release::board task release <id>::Release a claimed task back to the queue.
-show::board task show <id>::Show a task's detail and timeline.
+show::board task show <id> [--json]::Show a task's detail and timeline.
 patch::board task patch <id> [fields...]::Patch arbitrary fields on a task.
 deployed::board task deployed <id>::Mark a task as deployed.
 comment::board task comment <id> "note"::Add a free-text comment to a task.
-deploy::board task deploy <id> <env>::Run the manifest's deploy against origin/main.
+deploy::board task deploy <id> --env <env>::Run the manifest's deploy against origin/main.
 search::board task search <text>::Search tasks by text.
-list::board task list [--project <p>] [--status <s>]::List tasks.
+list::board task list [--project <p>] [--status <s>] [--search <text>] [--all] [--exclude-status <s>] [--json]::List tasks.
 worktree::board task worktree <id>::Create a git worktree for a task's branch.
 pr::board task pr <id>::Open a pull request for a task's branch.
 cleanup::board task cleanup <id>::Remove a task's worktree/branch after merge.
@@ -719,6 +719,10 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
             # merge_sha to be an ancestor of it, read the manifest from there and run the
             # command with it as cwd. origin/main rather than merge_sha itself: deploying
             # an old task's sha would roll back everything merged since.
+            # The env is read ONLY from --env. A stray positional (`board task deploy T-1 prod`)
+            # used to be silently ignored, and `.env // "dev"` quietly deployed dev instead of
+            # prod — dying loudly here beats a wrong environment shipped with a green exit code.
+            [ -z "${POS[1]:-}" ] || die "usage: board task deploy <id> --env <env> — env is a flag, not a positional"
             manifest_sh            # sets ROOT/PROJECT
             env=$(jq -r '.env // "dev"' <<<"$(body)")
             info=$(req GET "/tasks/$t") || { echo "$info"; exit 1; }

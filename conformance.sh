@@ -319,6 +319,50 @@ for s in $TASK_SUBS; do grep -qx -- "$s" <<<"$LISTED" || MISSING="$MISSING $s"; 
 [ -z "$MISSING" ] && ok "board help task lists every task subcommand ($(wc -w <<<"$TASK_SUBS") found)" \
   || no "board help task lists every task subcommand" "missing:$MISSING"
 
+# Every --flag a help row promises must actually be read by that subcommand's own case
+# body — a mismatch here is exactly the T-289 bug class (deploy documented a positional
+# <env> that the body never read; merged omitted --sha entirely). Derived from the real
+# case body text, not from a second hand-kept list, so drift fails this instead of trusting
+# itself.
+TASK_REGION=$(awk '/^task\|tasks\)/{f=1; next} f && /^[a-zA-Z][a-zA-Z_-]*(\|[a-zA-Z_-]+)*\)$/{exit} f' "$SRC/bin/board")
+SIMPLIFY_PY=$(cat "$SRC/bin/simplify.py" 2>/dev/null)
+FLAG_MISS=""
+for sub in $TASK_SUBS; do
+  # The block from this subcommand's case label up to the next one (or the closing esac).
+  block=$(awk -v n="$sub" '
+    grab && ($0 ~ "^    [a-zA-Z][a-zA-Z0-9_-]*\\)") {exit}
+    grab && ($0 ~ "^  esac") {exit}
+    grab {print}
+    $0 ~ "^    "n"\\)" {grab=1; print}
+  ' <<<"$TASK_REGION")
+  # `simplify` forwards "$@" untouched to simplify.py's own argparse — the case body never
+  # dereferences a single flag by name, so check the script that actually parses them.
+  [ "$sub" = simplify ] && block="$SIMPLIFY_PY"
+  row=$(grep -E "^  board task $sub([^a-zA-Z0-9_-]|\$)" <<<"$HELPTASK")
+  for flag in $(grep -oE -- '--[a-zA-Z][a-zA-Z0-9-]*' <<<"$row"); do
+    field=${flag#--}; field=${field//-/_}
+    case "$sub:$flag" in
+      # --title is sent through untouched to the API (with_agent/with_project forward the
+      # whole body); bin/board itself never dereferences it, so there is no literal to grep.
+      create:--title) continue ;;
+    esac
+    if grep -qE -- "[.\"\$]$field\\b" <<<"$block"; then continue; fi
+    # --project is handled by the shared with_project/project_name idiom, not a per-command
+    # `.project` read.
+    if [ "$field" = project ] && grep -qE 'with_project|project_name' <<<"$block"; then continue; fi
+    if grep -qF -- "$flag" <<<"$block"; then continue; fi
+    FLAG_MISS="$FLAG_MISS $sub:$flag"
+  done
+done
+[ -z "$FLAG_MISS" ] && ok "board help task: every documented --flag is read by its case body" \
+  || no "board help task: every documented --flag is read by its case body" "missing:$FLAG_MISS"
+
+echo "== board task deploy: a stray positional env dies loudly, never silently defaults to dev (T-289) =="
+DEPLOY_RC=0
+env -u BOARD_HUMAN -u BOARD_AGENT_ID "$SRC/bin/board" task deploy T-does-not-exist prod >/dev/null 2>&1 || DEPLOY_RC=$?
+[ "$DEPLOY_RC" -ne 0 ] && ok "board task deploy <id> <positional-env> exits non-zero" \
+  || no "board task deploy <id> <positional-env> exits non-zero" "exit code was 0 — env silently defaulted"
+
 echo "== registration, capabilities, heartbeat =="
 A=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","model":"claude-fable-5-1","session":"s1","capabilities":["browser-test","playwright"]}')
 check "register returns an id + grants from the policy" "$A" '.id and (.grants|index("merge"))'
