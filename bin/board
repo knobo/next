@@ -589,11 +589,47 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
     deployed) req POST "/tasks/$t/deployed" "$(with_agent "$(body)")" ;;
     comment) # free text on a task. The human token makes the human the sender.
             req POST "/tasks/$t/comment" "$(with_agent "$(body text "${POS[1]:-}")")" ;;
-    deploy) # run the manifest's deploy.<env> and report it. No deploy in the manifest: say so.
+    deploy) # Run the manifest's deploy.<env> against ORIGIN/MAIN, and report it.
+            #
+            # T-283: this used to be `$MANIFEST | jq .deploy[$e] | bash` in PWD. Both halves
+            # then hit the PRIMARY working copy wherever the caller stood: manifest.py
+            # main_root() resolves a worktree to it on purpose (T-67), and the deploy
+            # command's own paths are relative to cwd. The primary copy is the tree agents
+            # must not touch, so it is arbitrarily stale — and production got old files
+            # (a board with no CSS) with a green rollout, twice in one day.
+            #
+            # So: check out origin/main in a dedicated deploy worktree, require the task's
+            # merge_sha to be an ancestor of it, read the manifest from there and run the
+            # command with it as cwd. origin/main rather than merge_sha itself: deploying
+            # an old task's sha would roll back everything merged since.
+            manifest_sh            # sets ROOT/PROJECT
             env=$(jq -r '.env // "dev"' <<<"$(body)")
-            c=$("$MANIFEST" | jq -r --arg e "$env" '.deploy[$e] // empty')
-            [ -n "$c" ] || die "the manifest has no deploy.$env"
-            echo "$c" | bash || die "deploy failed — not reported"
+            info=$(req GET "/tasks/$t") || { echo "$info"; exit 1; }
+            sha=$(jq -r '.merge_sha // empty' <<<"$info")
+            trepo=$(jq -r '.repo // empty' <<<"$info")
+            [ -n "$sha" ] || die "$t has no merge_sha — deploy requires the merge to have landed (board task merged)"
+            case "$trepo" in ""|"."|"$PROJECT") rd="$ROOT" ;; *) rd="$ROOT/$trepo" ;; esac
+            git -C "$rd" rev-parse --git-dir >/dev/null 2>&1 || die "$rd is not a git repo — cannot deploy $sha"
+            git -C "$rd" fetch -q origin || die "could not fetch origin — refusing to deploy on stale info"
+            git -C "$rd" merge-base --is-ancestor "$sha" origin/main 2>/dev/null \
+              || die "$t's merge_sha ($sha) is not an ancestor of origin/main — refusing"
+            dw="$(dirname "$rd")/$(basename "$rd")-worktrees/deploy"
+            if [ ! -d "$dw" ]; then
+              mkdir -p "$(dirname "$dw")"
+              git -C "$rd" worktree add -q --detach "$dw" origin/main || die "could not create deploy worktree $dw"
+            fi
+            git -C "$dw" checkout -q --detach origin/main || die "could not check out origin/main in $dw"
+            [ "$(git -C "$dw" rev-parse HEAD)" = "$(git -C "$rd" rev-parse origin/main)" ] \
+              || die "deploy worktree is not on origin/main — refusing"
+            # Single repo (root IS the repo, like `next`): project.yaml is versioned, read it
+            # from the deploy worktree, or new code ships with an old deploy command.
+            # Multi-repo: project.yaml lives in the unversioned project root, the only source.
+            if [ "$rd" = "$ROOT" ]; then mroot="$dw"; else mroot="$ROOT"; fi
+            c=$(BOARD_PROJECT_ROOT="$mroot" "$MANIFEST" | jq -r --arg e "$env" '.deploy[$e] // empty')
+            [ -n "$c" ] || die "the manifest ($mroot) has no deploy.$env"
+            echo "deploy $t: $env from $(git -C "$dw" rev-parse --short HEAD) in $dw" >&2
+            # BOARD_REPO_ROOT: where untracked per-installation files (board.env) still live.
+            ( cd "$dw" && echo "$c" | BOARD_REPO_ROOT="$rd" bash ) || die "deploy failed — not reported"
             req POST "/tasks/$t/deployed" "$(with_agent "$(jq -nc --arg e "$env" '{env:$e}')")" ;;
     search) q_term="${POS[0]:-}"
             [ -n "$q_term" ] || die "usage: board task search <word>"

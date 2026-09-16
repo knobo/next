@@ -14,7 +14,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ENVFILE="${BOARD_ENV:-board.env}"
+# board.env is untracked: `board task deploy` runs us from a clean origin/main worktree and
+# passes BOARD_REPO_ROOT so it is still found in the primary checkout.
+ENVFILE="${BOARD_ENV:-${BOARD_REPO_ROOT:-.}/board.env}"
 [ -f "$ENVFILE" ] || {
   echo "no $ENVFILE — copy board.env.example and fill it in" >&2; exit 2; }
 # shellcheck disable=SC1090

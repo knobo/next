@@ -1360,6 +1360,41 @@ check "test-level: requires:[browser-test] gives human without a browser capabil
   '.level=="human" and (.why|test("browser-test"))'
 api POST "/agents/$NOCAPID/finished" '{"reason":"conformance done"}' >/dev/null
 
+# T-283: `board task deploy` ran the manifest AND the command against the primary working
+# copy wherever the caller stood. That copy is arbitrarily stale, so production silently got
+# old files with a green rollout — twice on 2026-09-09 (a board served with no CSS).
+DP_T=$(cli task create --title "deploy from the right tree" --repo web | jq -r .id)
+cli task claim "$DP_T" >/dev/null
+DPR=$( (cd "$CLIDIR" && board task deploy "$DP_T" 2>&1) || true )
+if grep -q "no merge_sha" <<<"$DPR"; then ok "deploy without merge_sha is refused, not run"
+else no "deploy without merge_sha is refused" "$DPR"; fi
+
+# Now a real merge on origin/main, and a deploy.dev that REPORTS where it ran.
+DPW=$(jq -r .worktree <<<"$(cli task worktree "$DP_T")")
+echo "content-from-the-merge" > "$DPW/deployed-marker.txt"
+git -C "$DPW" add deployed-marker.txt && git -C "$DPW" commit -qm "content to deploy"
+git -C "$DPW" push -q origin HEAD:main
+DSHA=$(git -C "$DPW" rev-parse HEAD)
+api POST "/tasks/$DP_T/merge_requested" "{\"agent\":\"$CLIID\"}" >/dev/null 2>&1
+api POST "/tasks/$DP_T/merge_verified" "{\"agent\":\"$CLIID\",\"sha\":\"$DSHA\"}" >/dev/null 2>&1
+cat >> "$CLIDIR/project.yaml" <<YML
+deploy:
+  dev: "pwd > $TMP/deploy-cwd.txt && git rev-parse HEAD > $TMP/deploy-sha.txt && cat deployed-marker.txt > $TMP/deploy-saw.txt"
+YML
+# The primary working copy is deliberately stale: the marker does not exist there.
+rm -f "$CLIDIR/web/deployed-marker.txt"
+( cd "$CLIDIR" && board task deploy "$DP_T" >/dev/null 2>&1 ) || true
+if grep -qs "content-from-the-merge" "$TMP/deploy-saw.txt"; then
+  ok "deploy runs in a checkout of origin/main, not the primary working copy"
+else no "deploy runs in a checkout of origin/main" "the marker file was not seen"; fi
+if [ "$(cat "$TMP/deploy-sha.txt" 2>/dev/null)" = "$DSHA" ]; then
+  ok "deploy stood on the merged sha, not something older"
+else no "deploy stood on the merged sha" "was on $(cat "$TMP/deploy-sha.txt" 2>/dev/null), expected $DSHA"; fi
+if [ -s "$TMP/deploy-cwd.txt" ] && ! grep -qxE "$CLIDIR(/web)?" "$TMP/deploy-cwd.txt"; then
+  ok "deploy did NOT run in the primary working copy or the caller's cwd"
+else no "deploy did not run in the primary working copy" "cwd was $(cat "$TMP/deploy-cwd.txt" 2>/dev/null)"; fi
+cli task release "$DP_T" >/dev/null 2>&1
+
 # T-189: a board that answers 503 (Traefik during a rollout) is down, not a valid answer. The
 # cache is keyed on BOARD_URL (T-118), so a cache warmed against the real board does not apply
 # to the 503 URL. What matters here is that the agent does not stop: a 503 must read as
