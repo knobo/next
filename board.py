@@ -2185,13 +2185,21 @@ def agent_block(a, ceilings, human=False, project=None):
                     "<datalist id='grants-list-%s'><option value='merge'><option value='deploy-dev'><option value='deploy-prod'></datalist>"
                     "<button type='submit' class='badge badge-sm badge-primary cursor-pointer'>gi</button></form>"
                     % (escape(a["id"]), escape(project or ""), escape(a["id"]), escape(a["id"])))
+    # A dead or stale agent stopped reporting — its ctx meter and ceiling line would
+    # draw a precision (a percent, a tick mark) that is no longer true, and 12 of these on
+    # one page is most of /status's height (T-284). Only a live agent gets meters; anything
+    # else gets its last heartbeat, one line, and nothing to measure.
+    body = (meter("ctx", a["ctx_pct"], 80) +
+            ("".join(meter(w, pct, eff.get(win_name(w))) for w, pct in ws)
+             or "<p class='%s text-xs'>reports no quota</p>" % DIM)) if st in ("alive", "stalled") else (
+            "<p class='%s text-xs'>last seen %s</p>" % (DIM, escape(a.get("last_seen") or "—")))
     return ("<div data-agent class='border-t border-base-300 py-2.5' data-status='%s' data-mins='%d'>"
             "<b class='%s block font-semibold'>%s</b>"
             "<div class='mt-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-1'>"
             "<span class='%s text-xs'>%s</span>"
             "<span class='badge badge-sm %s'>%s</span>%s%s%s</div>"
             "%s"
-            "<div class='mt-1.5 grid gap-1'>%s%s</div>%s</div>" % (
+            "<div class='mt-1.5 grid gap-1'>%s</div>%s</div>" % (
                 escape(st), mins,
                 MONO, escape(a["id"]), DIM, escape(a["model"] or ""),
                 "badge-error" if a["status"] == "dead" else
@@ -2204,9 +2212,7 @@ def agent_block(a, ceilings, human=False, project=None):
                 if a["current_task"] else "",
                 grants_html,
                 add_form,
-                meter("ctx", a["ctx_pct"], 80),
-                "".join(meter(w, pct, eff.get(win_name(w))) for w, pct in ws)
-                or "<p class='%s text-xs'>reports no quota</p>" % DIM,
+                body,
                 ("<p class='mt-1.5 text-sm text-error'>stop: %s</p>" % escape(a["stop"]))
                 if a.get("stop") else ""))
 
