@@ -1317,9 +1317,16 @@ def gate_merge(tid, aid):
         rev = db.execute("SELECT actor FROM events WHERE stream=? AND type='task.review_result' "
                          "ORDER BY id DESC LIMIT 1", ("task/" + tid,)).fetchone()
         if rev and t["owner"] and rev["actor"] == t["owner"]:
+            # The reason must say what to DO, not just what is wrong. "a fresh agent must
+            # review" is true, but a Claude subagent inherits the coordinator's session,
+            # and register() above dedupes on exactly that — so the obvious fix (let the
+            # subagent report) silently comes back as the owner's own id, and the reader
+            # concludes the gate itself is broken. That happened and stalled the queue.
             reasons.append("the review result was set by the owner itself (%s) — a fresh "
                            "agent must review, otherwise the gate is only an echo of the "
-                           "owner's word" % rev["actor"])
+                           "owner's word. A subagent inherits your session: set BOTH "
+                           "BOARD_SESSION and BOARD_CACHE before it registers, and let it "
+                           "run `board task review` itself" % rev["actor"])
         if t["review_open"] > 0 and phase != "idea":
             reasons.append("%d open review findings" % t["review_open"])
     if aid:

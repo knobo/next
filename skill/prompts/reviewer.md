@@ -47,3 +47,32 @@ it ships the bug.
 ```
 
 No finding is better than a padded one. An empty list is a valid, common answer.
+
+## Report the result under YOUR OWN id — not the coordinator's
+
+The gate rejects a review result set by the task's owner (board.py: "the review result was set
+by the owner itself"). The coordinator that dispatched you IS the owner, so if the coordinator
+reports the number, the gate is only an echo of the owner's own word, and the merge stays stuck.
+That is why YOU run `board task review`, not the coordinator.
+
+But a Claude subagent is not automatically a separate agent to the board. It inherits the
+parent's `CLAUDE_CODE_SESSION_ID`, and the board dedupes agents on exactly that `session` — so a
+bare `board register` hands you back **the owner's own id**, and the gate still rejects it.
+
+Set BOTH of these before every `board` command you run:
+
+```sh
+export BOARD_SESSION="rev-$T-$(date +%s)-$$"   # your own session — otherwise you inherit the owner's id
+export BOARD_CACHE=$(mktemp -d)                # your own cache — otherwise you read the machine-wide
+                                                # id file the last `register` on this box left behind,
+                                                # which may belong to a different agent entirely
+board register --model <your model> --cap ""
+board task review $T --open <N> --fixed <M>
+```
+
+`BOARD_SESSION` alone is not enough — without your own `BOARD_CACHE`, `agent_id()` falls back to
+`$CACHE/agent`, the machine-wide file every `register` overwrites.
+
+`--open` is the count of findings scored ≥80 (the ones that block). `--fixed` is the ones you
+confirmed are already fixed in this PR. Your JSON report above still goes to the coordinator as
+before; the number goes to the board under your own id.

@@ -1739,6 +1739,41 @@ if [ -s "$TMP/deploy-cwd.txt" ] && ! grep -qxE "$CLIDIR(/web)?" "$TMP/deploy-cwd
   ok "deploy did NOT run in the primary working copy or the caller's cwd"
 else no "deploy did not run in the primary working copy" "cwd was $(cat "$TMP/deploy-cwd.txt" 2>/dev/null)"; fi
 cli task release "$DP_T" >/dev/null 2>&1
+# T-282: the gate could not be passed from one session. `board task review` set by the owner
+# is rejected (correct — otherwise the gate is an echo of the owner's own word), but a Claude
+# subagent that registers with a bare `board register` inherits CLAUDE_CODE_SESSION_ID, and
+# register() dedupes on exactly that `session` — so it gets the OWNER's own id back, and the
+# gate rejects it just the same. Both halves need covering, or a half-fix looks complete and
+# still deadlocks the queue.
+echo "== T-282: review from a different agent, from the same machine =="
+
+# Half 1, THE TRAP: an inherited session gives the SAME agent id, no matter how it re-registers.
+# Not a bug to fix here — it IS the dedupe, and it is correct for an agent restarting. It is a
+# check because it explains why BOARD_SESSION alone would not be enough.
+INHERIT=$(cli register --cap merge --model claude-sonnet-5 | jq -r .id)
+check "an inherited session gives the SAME agent id — the subagent is the owner to the board" \
+  "$(jq -nc --arg a "$INHERIT" --arg b "$CLIID" '{a:$a,b:$b}')" '.a==.b'
+
+# Half 2, THE FIX: own session AND own cache. Without BOARD_CACHE, agent_id() falls back to
+# $CACHE/agent, the machine-wide file every register overwrites.
+REV() { (cd "$CLIDIR" && BOARD_SESSION="conf-rev-282-$$" BOARD_CACHE="$TMP/rev282-cache" board "$@" 2>/dev/null); }
+REVID=$(REV register --cap merge --model claude-sonnet-5 | jq -r .id)
+check "own BOARD_SESSION + BOARD_CACHE gives a DIFFERENT agent id than the owner's" \
+  "$(jq -nc --arg a "$REVID" --arg b "$CLIID" '{a:$a,b:$b}')" '.a and (.a != .b)'
+
+# End to end, the acceptance criterion: A owns, B reports the review, the gate opens.
+RT=$(cli task create --title "T-282 review-from-another-agent" --repo web --risk normal | jq -r .id)
+cli task claim "$RT" >/dev/null
+cli task review "$RT" --open 0 --fixed 0 >/dev/null
+check "the owner's own review result closes the gate, with an actionable reason" \
+  "$(cli gate merge "$RT")" \
+  '.ok==false and ([.reasons[]|select(test("owner itself"))]|length)==1
+     and ([.reasons[]|select(test("BOARD_SESSION") and test("BOARD_CACHE"))]|length)==1'
+# Same task, same owner — just reported by a different agent id.
+REV task review "$RT" --open 0 --fixed 0 >/dev/null
+check "a review reported by a DIFFERENT agent: the gate opens for the owner (T-282 acceptance)" \
+  "$(cli gate merge "$RT")" '.ok==true and (.reasons|length)==0'
+api POST "/agents/$REVID/finished" '{"reason":"conformance done"}' >/dev/null
 
 # T-283 review: the check above swaps in a synthetic deploy.dev, so the REAL k8s/deploy.sh
 # was never run. It sourced "./$ENVFILE", which with an absolute BOARD_REPO_ROOT became
