@@ -731,9 +731,11 @@ def finished(aid, b):
     # sees the fleet stop working. If the quota ceiling is missing from the policy, the
     # reason goes in the same notification.
     note = budget(a["current_project"]).get("note")
+    click = ("%s/t/%s" % (BASE_URL, a["current_task"]) if a["current_task"]
+             else "%s/status" % BASE_URL)
     ntfy("agent finished: %s" % aid, "%s — %s%s" % (
         a["current_project"] or "?", b.get("reason") or "no reason given",
-        "\n" + note if note else ""))
+        "\n" + note if note else ""), click)
     return {"ok": True}
 
 
@@ -1206,7 +1208,7 @@ def task_blocked(tid, aid, b):
     db.execute("UPDATE tasks SET status='blocked', updated=? WHERE id=?", (now(), tid))
     ev(t["project"], "task/" + tid, "task.blocked", aid, note=b.get("note"))
     ntfy("⛔ %s %s blocked" % (t["project"], tid), b.get("note") or t["title"],
-         "%s/status" % BASE_URL)
+         "%s/t/%s" % (BASE_URL, tid))
     return {"ok": True}
 
 

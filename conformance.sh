@@ -94,6 +94,7 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         with open(os.environ["NTFY_LOG"], "ab") as f:
             f.write(("TITLE: %s\n" % self.headers.get("Title", "")).encode("utf-8", "replace"))
+            f.write(("CLICK: %s\n" % self.headers.get("Click", "")).encode("utf-8", "replace"))
             f.write(self.rfile.read(n) + b"\n---\n")
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -764,9 +765,29 @@ api POST /tasks/$T3ID/release "{\"agent\":\"$BID\"}" >/dev/null
 
 if [ "$OWN_SERVER" = 1 ]; then
 check "blocked notifies" "$(api POST /tasks/$T2ID/blocked "{\"agent\":\"$AID\",\"note\":\"classifier refused\"}")" '.ok'
+N=$(cat "$TMP/ntfy" 2>/dev/null || true)
+grep -B2 "classifier refused" <<<"$N" | grep -q "CLICK: .*/t/$T2ID" \
+  && ok "blocked notification links to the task, not /status" \
+  || no "blocked notification links to the task, not /status" "$(grep -B2 'classifier refused' <<<"$N")"
+
+# finished() must link to the agent's own current task when it has one.
+CLKAG=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"clk","session":"clk"}' | jq -r .id)
+CLKID=$(api POST /tasks "{\"agent\":\"$CLKAG\",\"project\":\"demo\",\"title\":\"click target\"}" | jq -r .id)
+api POST /tasks/$CLKID/claim "{\"agent\":\"$CLKAG\"}" >/dev/null
+api POST "/agents/$CLKAG/finished" '{"reason":"click check"}' >/dev/null
+N=$(cat "$TMP/ntfy" 2>/dev/null || true)
+grep -B2 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
+  && ok "finished links to the agent's current task" \
+  || no "finished links to the agent's current task" "$(grep -B2 'click check' <<<"$N")"
 fi
 check "project isolation (403)" "$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' >/dev/null; api POST /tasks/$TID/claim "{\"agent\":\"$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' | jq -r .id)\"}")" '.error'
 check "finished releases everything" "$(api POST /agents/$AID/finished '{"reason":"queue empty"}')" '.ok'
+if [ "$OWN_SERVER" = 1 ]; then
+N=$(cat "$TMP/ntfy" 2>/dev/null || true)
+grep -B2 "queue empty" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
+  && ok "finished with no current task links to /status" \
+  || no "finished with no current task links to /status" "$(grep -B2 'queue empty' <<<"$N")"
+fi
 api POST "/agents/$BID/finished" '{"reason":"conformance"}' >/dev/null
 
 echo "== lease: heartbeat is life, task.progress is progress (Q-107) =="
