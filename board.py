@@ -1064,9 +1064,15 @@ def task_claim(tid, aid):
         raise Err(409, "missing grants", needs_grants=jl(t["needs_grants"]))
     # An `in_review` keeps its status through a claim: the new owner is to review what is
     # there, not start the task over. Worktree, branch and PR are on the board.
+    # 'blocked' is here only for owner IS NULL: a task blocked by a live owner is never
+    # claimable this way (design: the reaper never orphans blocked, and a dead owner is
+    # taken over via owns(), not reassigned). owner IS NULL + blocked cannot happen going
+    # forward (task_blocked now requires ownership) but existing rows in that state — the
+    # dead end this task fixes — recover through the ordinary claim path instead of a
+    # bespoke repair command.
     cur = db.execute("UPDATE tasks SET status=CASE status WHEN 'in_review' THEN 'in_review'"
                      " ELSE 'claimed' END, owner=?, lease_until=?, updated=? "
-                     "WHERE id=? AND owner IS NULL AND status IN ('open','orphaned','in_review')",
+                     "WHERE id=? AND owner IS NULL AND status IN ('open','orphaned','in_review','blocked')",
                      (aid, plus(LEASE_MIN), now(), tid)).rowcount
     if not cur:
         raise Err(409, "the task is taken", owner=t["owner"], status=t["status"])
@@ -1205,6 +1211,12 @@ def task_patch(tid, aid, b):
 
 def task_blocked(tid, aid, b):
     t = task(tid)
+    # Ownership, like every other state change (task_patch, task_progress, release,
+    # gate_merge). Without this, any agent could block a task it does not own — including
+    # one still `open` with owner NULL — leaving a row that is blocked with no owner: it can
+    # then be claimed nowhere ("the task is taken", blocked is not a claimable status) nor
+    # annotated (owns() reads NULL owner as "no longer yours"). A dead end with no way out.
+    owns(t, aid)
     db.execute("UPDATE tasks SET status='blocked', updated=? WHERE id=?", (now(), tid))
     ev(t["project"], "task/" + tid, "task.blocked", aid, note=b.get("note"))
     ntfy("⛔ %s %s blocked" % (t["project"], tid), b.get("note") or t["title"],

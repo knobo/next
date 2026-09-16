@@ -764,6 +764,9 @@ check "the status is still in_review after the claim" "$(api GET /tasks/$T3ID)" 
 api POST /tasks/$T3ID/release "{\"agent\":\"$BID\"}" >/dev/null
 
 if [ "$OWN_SERVER" = 1 ]; then
+# blocked (T-407) now requires ownership, like every other state transition — T2ID was
+# released (owner NULL) above, so re-claim it first.
+api POST /tasks/$T2ID/claim "{\"agent\":\"$AID\"}" >/dev/null
 check "blocked notifies" "$(api POST /tasks/$T2ID/blocked "{\"agent\":\"$AID\",\"note\":\"classifier refused\"}")" '.ok'
 for _ in $(seq 50); do grep -q "classifier refused" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
 N=$(cat "$TMP/ntfy" 2>/dev/null || true)
@@ -781,6 +784,12 @@ N=$(cat "$TMP/ntfy" 2>/dev/null || true)
 grep -B2 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
   && ok "finished links to the agent's current task" \
   || no "finished links to the agent's current task" "$(grep -B2 'click check' <<<"$N")"
+check "blocking without ownership is refused" \
+  "$(api POST /tasks/$T3ID/blocked "{\"agent\":\"$BID\",\"note\":\"not mine\"}")" '.error'
+# Retire it now it has served its purpose: left blocked+owned, AID's later /finished plus a
+# reap cycle would legitimately hand it back as 'orphaned' (owner dead/finished — by design,
+# see reap()) and it would then compete with the WIP-limit fixture further down.
+api POST /tasks/$T2ID/archive "{\"agent\":\"$AID\",\"note\":\"conformance cleanup\"}" >/dev/null
 fi
 check "project isolation (403)" "$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' >/dev/null; api POST /tasks/$TID/claim "{\"agent\":\"$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' | jq -r .id)\"}")" '.error'
 check "finished releases everything" "$(api POST /agents/$AID/finished '{"reason":"queue empty"}')" '.ok'
@@ -858,6 +867,20 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
   check "dispatch+tokens on an orphaned task is still 409" \
     "$(apic POST /tasks/$T3ID/progress "{\"agent\":\"$CID\",\"dispatch\":\"tester:sonnet\",\"tokens\":1,\"result\":\"x\"}")" \
     '.code==409 and (.body.error|test("no longer yours")) and .body.status=="orphaned"'
+
+  echo "== recovering a pre-existing blocked+owner-NULL row (T-407) =="
+  # task_blocked now requires ownership, so this state cannot be produced through the API
+  # any more — but rows already stuck in it (the dead end this task fixes) must still
+  # recover through the ordinary claim path.
+  T3B=$(api POST /tasks "{\"agent\":\"$CID\",\"project\":\"demo\",\"title\":\"legacy dead end\"}" | jq -r .id)
+  sql "UPDATE tasks SET status='blocked', owner=NULL WHERE id='$T3B'"
+  check "a pre-existing blocked task with owner NULL can still be claimed" \
+    "$(api POST /tasks/$T3B/claim "{\"agent\":\"$EID\"}")" '.owner=="'"$EID"'"'
+  check "recovering it produces a normal claimed task, not blocked" "$(api GET /tasks/$T3B)" \
+    '.status=="claimed"'
+  # Retire it: left claimed, EID finishing later plus a reap cycle would hand it back as
+  # 'orphaned' (by design) and it would then compete with the WIP-limit fixture below.
+  api POST /tasks/$T3B/archive "{\"agent\":\"$EID\",\"note\":\"conformance cleanup\"}" >/dev/null
 
   echo "== the reaper tells waiting apart from stopping =="
   T6ID=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"title\":\"blocked\"}" | jq -r .id)
