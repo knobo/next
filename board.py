@@ -31,6 +31,9 @@ PORT      = int(os.environ.get("BOARD_PORT", "8080"))
 # sleeping 60s against a fresh instance — the reap logic itself is unchanged.
 REAP_INTERVAL = int(os.environ.get("BOARD_REAP_INTERVAL", "60"))
 
+NTFY_LOCK = threading.Lock()
+ntfy_failures_since_success = 0
+
 STALE_MIN, DEAD_MIN = 5, 60
 # The lease is also the threshold for `stalled`. It is renewed by claim and
 # task.progress, never by heartbeat (Q-107): a process that has sat for more than one
@@ -351,25 +354,55 @@ def ntfy(title, message, click=""):
     the push never left the process — for a full day, invisibly, because the call
     swallowed everything. The header is trimmed to ascii; the full title with the emoji
     goes in the body, which is UTF-8 and works against any HTTP receiver. Still never
-    fails the board, but says so on stderr."""
+    fails the board, but says so on stderr.
+
+    Retries transient errors (DNS/URLError, timeout, 5xx HTTPError) up to 3 attempts with
+    short backoff (0.1s, 0.2s). Non-transient 4xx errors are not retried. Tracks failures
+    since last success in ntfy_failures_since_success."""
     if not NTFY_URL:
-        return
+        return None
 
     def send():
+        global ntfy_failures_since_success
         head = title.encode("ascii", "ignore").decode().strip() or "board"
         body = message if head == title else "%s\n%s" % (title, message)
-        req = urllib.request.Request(NTFY_URL, data=body.encode(),
-                                     headers={"Title": head, "Click": click} if click
-                                     else {"Title": head})
-        if NTFY_AUTH:
-            req.add_header("Authorization", NTFY_AUTH)
-        try:
-            urllib.request.urlopen(req, timeout=3).close()
-        except Exception as e:
-            print("ntfy failed (%s: %s) — title %r" % (type(e).__name__, e, title),
-                  file=sys.stderr, flush=True)
+        backoffs = [0.1, 0.2]
+        max_attempts = 3
+        last_exc = None
+        for attempt in range(max_attempts):
+            req = urllib.request.Request(NTFY_URL, data=body.encode(),
+                                         headers={"Title": head, "Click": click} if click
+                                         else {"Title": head})
+            if NTFY_AUTH:
+                req.add_header("Authorization", NTFY_AUTH)
+            try:
+                urllib.request.urlopen(req, timeout=3).close()
+                with NTFY_LOCK:
+                    ntfy_failures_since_success = 0
+                return
+            except urllib.error.HTTPError as e:
+                last_exc = e
+                # Do NOT retry on 4xx client errors (400 <= code < 500)
+                if 400 <= e.code < 500:
+                    break
+                if attempt < len(backoffs):
+                    time.sleep(backoffs[attempt])
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_exc = e
+                if attempt < len(backoffs):
+                    time.sleep(backoffs[attempt])
+            except Exception as e:
+                last_exc = e
+                break
 
-    threading.Thread(target=send, daemon=True).start()
+        with NTFY_LOCK:
+            ntfy_failures_since_success += 1
+        print("ntfy failed (%s: %s) — title %r" % (type(last_exc).__name__, last_exc, title),
+              file=sys.stderr, flush=True)
+
+    t = threading.Thread(target=send, daemon=True)
+    t.start()
+    return t
 
 
 # ---------- agents --------------------------------------------------------
@@ -1667,7 +1700,9 @@ def reaper_loop():
 # ---------- status --------------------------------------------------------
 
 def status(project=None):
-    out = {"generated": now(), "projects": []}
+    with NTFY_LOCK:
+        fails = ntfy_failures_since_success
+    out = {"generated": now(), "projects": [], "ntfy_failures_since_success": fails}
     names = [project] if project else [r["name"] for r in db.execute(
         "SELECT name FROM projects ORDER BY name")]
     for name in names:
@@ -2192,6 +2227,13 @@ def html_status(project, token="", human=False):
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
         MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")),
         (("/tests", "test queue"),), human, show_all_btn=True)]
+    if s.get("ntfy_failures_since_success", 0) > 0:
+        fails = s["ntfy_failures_since_success"]
+        h.append("<div class='mt-4 rounded-box border border-l-4 border-base-300 "
+                 "border-l-error bg-base-200 p-3 text-sm'>"
+                 "<b class='font-semibold text-error'>ntfy push failed:</b> %d %s failed since last success. "
+                 "Check notification server / ntfy settings.</div>" % (
+                     fails, "push" if fails == 1 else "pushes"))
     if not s["projects"]:
         h.append("<div class='mt-8 rounded-box border border-dashed border-base-300 "
                  "px-4 py-10 text-center %s'>No projects yet.<br>"
