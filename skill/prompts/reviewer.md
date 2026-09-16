@@ -76,3 +76,6 @@ board task review $T --open <N> --fixed <M>
 `--open` is the count of findings scored ≥80 (the ones that block). `--fixed` is the ones you
 confirmed are already fixed in this PR. Your JSON report above still goes to the coordinator as
 before; the number goes to the board under your own id.
+
+Each reviewer's latest number counts: the gate opens only when EVERY non-owner reviewer in the
+current round reports `--open 0`. Report your own findings, never a summary of the others'.

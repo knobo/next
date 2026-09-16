@@ -1773,6 +1773,28 @@ check "the owner's own review result closes the gate, with an actionable reason"
 REV task review "$RT" --open 0 --fixed 0 >/dev/null
 check "a review reported by a DIFFERENT agent: the gate opens for the owner (T-282 acceptance)" \
   "$(cli gate merge "$RT")" '.ok==true and (.reasons|length)==0'
+# T-282 review [88]: one shared review_open column was last-write-wins — reviewer A reports a
+# blocker, B and C report 0 afterwards, and the gate opened on a known blocker. Each reviewer's
+# latest result in the current round counts; only the owner's --round (after a fix) resets.
+REVB() { (cd "$CLIDIR" && BOARD_SESSION="conf-revb-282-$$" BOARD_CACHE="$TMP/revb282-cache" board "$@" 2>/dev/null); }
+REVC() { (cd "$CLIDIR" && BOARD_SESSION="conf-revc-282-$$" BOARD_CACHE="$TMP/revc282-cache" board "$@" 2>/dev/null); }
+REVBID=$(REVB register --cap merge --model claude-sonnet-5 | jq -r .id)
+REVCID=$(REVC register --cap merge --model claude-sonnet-5 | jq -r .id)
+RR=$(cli task create --title "T-282 three reviewers" --repo web --risk normal | jq -r .id)
+cli task claim "$RR" >/dev/null
+REV task review "$RR" --open 1 --fixed 0 >/dev/null
+REVB task review "$RR" --open 0 --fixed 0 >/dev/null
+REVC task review "$RR" --open 0 --fixed 0 >/dev/null
+check "A open=1, then B and C open=0: the gate stays closed (no last-write-wins)" \
+  "$(cli gate merge "$RR")" '.ok==false and ([.reasons[]|select(test("1 open review"))]|length)==1'
+check "a reviewer cannot start a new round and wipe the others' results" \
+  "$(api POST "/tasks/$RR/review" "{\"agent\":\"$REVBID\",\"open\":0,\"round\":true}")" '.error'
+cli task review "$RR" --open 0 --fixed 1 --round >/dev/null
+check "a new round started by the owner alone: the gate is closed" "$(cli gate merge "$RR")" '.ok==false'
+REVB task review "$RR" --open 0 --fixed 0 >/dev/null
+check "new round + B open=0: the gate opens" "$(cli gate merge "$RR")" '.ok==true'
+api POST "/agents/$REVBID/finished" '{"reason":"conformance done"}' >/dev/null
+api POST "/agents/$REVCID/finished" '{"reason":"conformance done"}' >/dev/null
 api POST "/agents/$REVID/finished" '{"reason":"conformance done"}' >/dev/null
 
 # T-283 review: the check above swaps in a synthetic deploy.dev, so the REAL k8s/deploy.sh

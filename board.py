@@ -1272,12 +1272,34 @@ def task_blocked(tid, aid, b):
     return {"ok": True}
 
 
+def review_round(tid):
+    """Latest result per reviewer in the CURRENT round: {actor: {"open","fixed"}}.
+    One shared column was last-write-wins: reviewer A reports 1 blocker, B and C report 0
+    afterwards, and the gate opened on a known blocker. A round starts when the owner
+    records a fix with --round; that drops the old results, which is safe because the owner
+    cannot add a non-owner result."""
+    res = {}
+    for e in db.execute("SELECT type, actor, body FROM events WHERE stream=? AND type IN "
+                        "('task.review_round','task.review_result') ORDER BY id", ("task/" + tid,)):
+        if e["type"] == "task.review_round":
+            res = {}
+        else:
+            res[e["actor"]] = json.loads(e["body"] or "{}")
+    return res
+
+
 def task_review(tid, aid, b):
     t = task(tid)
-    db.execute("UPDATE tasks SET review_open=?, review_fixed=?, status='in_review', updated=? WHERE id=?",
-               (int(b.get("open", 0)), int(b.get("fixed", 0)), now(), tid))
+    if b.get("round"):
+        if aid != t["owner"]:
+            raise Err(403, "only the owner starts a new review round (--round), after a fix")
+        ev(t["project"], "task/" + tid, "task.review_round", aid)
     ev(t["project"], "task/" + tid, "task.review_result", aid,
        open=int(b.get("open", 0)), fixed=int(b.get("fixed", 0)), sha=b.get("sha"))
+    # The columns are derived (UI, status, WIP counter): the worst result in this round.
+    rs = review_round(tid).values()
+    db.execute("UPDATE tasks SET review_open=?, review_fixed=?, status='in_review', updated=? WHERE id=?",
+               (max(r.get("open", 0) for r in rs), max(r.get("fixed", 0) for r in rs), now(), tid))
     return {"ok": True}
 
 
@@ -1305,30 +1327,32 @@ def gate_merge(tid, aid):
         reasons.append("%s is merging right now (%s) — write progress and take ANOTHER "
                        "task; come back to this one later. Do not wait in the foreground."
                        % (other["id"], other["owner"] or "unowned"))
-    if t["review_open"] is None:
-        reasons.append("no review result reported (board task review)")
-    else:
+    rs = review_round(tid)
+    others = [r for a, r in rs.items() if a != t["owner"]]
+    if not rs:
+        reasons.append("no review result reported in this round (board task review)")
+    elif not others:
         # DESIGN.md §8 admits the hole: "an agent that writes board task review --open 0
         # without having run a review". Phase 3 was to require that the review event comes
         # from a DIFFERENT agent id than the owner's. That rule was missing, and a
         # coordinator reviewed its own task — the gate let it through on its own word.
         # Not watertight: an agent can still log a review it never ran. But it can no
         # longer do so on WORK IT OWNS ITSELF, and that is the common failure.
-        rev = db.execute("SELECT actor FROM events WHERE stream=? AND type='task.review_result' "
-                         "ORDER BY id DESC LIMIT 1", ("task/" + tid,)).fetchone()
-        if rev and t["owner"] and rev["actor"] == t["owner"]:
-            # The reason must say what to DO, not just what is wrong. "a fresh agent must
-            # review" is true, but a Claude subagent inherits the coordinator's session,
-            # and register() above dedupes on exactly that — so the obvious fix (let the
-            # subagent report) silently comes back as the owner's own id, and the reader
-            # concludes the gate itself is broken. That happened and stalled the queue.
-            reasons.append("the review result was set by the owner itself (%s) — a fresh "
-                           "agent must review, otherwise the gate is only an echo of the "
-                           "owner's word. A subagent inherits your session: set BOTH "
-                           "BOARD_SESSION and BOARD_CACHE before it registers, and let it "
-                           "run `board task review` itself" % rev["actor"])
-        if t["review_open"] > 0 and phase != "idea":
-            reasons.append("%d open review findings" % t["review_open"])
+        # The reason must say what to DO, not just what is wrong. "a fresh agent must
+        # review" is true, but a Claude subagent inherits the coordinator's session,
+        # and register() above dedupes on exactly that — so the obvious fix (let the
+        # subagent report) silently comes back as the owner's own id, and the reader
+        # concludes the gate itself is broken. That happened and stalled the queue.
+        reasons.append("the review result was set by the owner itself (%s) — a fresh "
+                       "agent must review, otherwise the gate is only an echo of the "
+                       "owner's word. A subagent inherits your session: set BOTH "
+                       "BOARD_SESSION and BOARD_CACHE before it registers, and let it "
+                       "run `board task review` itself" % t["owner"])
+    else:
+        # Every reviewer's latest word counts, not just the last one to write.
+        n = max(r.get("open", 0) for r in others)
+        if n > 0 and phase != "idea":
+            reasons.append("%d open review findings" % n)
     if aid:
         if "merge" not in agent_grants(aid, t["project"]):
             reasons.append("the agent lacks the merge grant in %s" % t["project"])
