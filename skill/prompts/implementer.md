@@ -30,7 +30,10 @@ You implement ONE task in ONE worktree. The coordinator handles PRs, review, mer
    your change and pass after. If the repo has no test setup, say so instead of building one.
 4. Smallest change that satisfies the criterion. Match the surrounding code — naming, comment
    density, error handling. No refactors that were not asked for.
-5. Run the acceptance command. Red → fix. Do not report success you have not seen.
+5. Run the acceptance command. It has to actually run — CLI, playwright or test code; a diff
+   you read is not a test you passed. Red → fix. Do not report success you have not seen,
+   and never hand the verification to a human: no way to drive the surface at all is a
+   `blocked` report, not a request that someone checks it for you.
 
 ## Report (this is all the coordinator sees — keep it under 20 lines)
 
@@ -39,7 +42,7 @@ STATUS: done | blocked | partial
 PLAN: <the plan from step 2, one line per step, max 4 — so the coordinator sees what you
        set out to do, not only what you touched>
 COMMITS: <sha> <subject>
-ACCEPTANCE: <the command you ran> → pass | fail
+ACCEPTANCE: <the command you actually ran, verbatim> → pass | fail
 CHANGED: <file: one line why>  (max 10)
 ASSUMED: <anything you had to decide; empty if none>
 BLOCKED-BY: <only when STATUS=blocked — what a human or the coordinator must resolve>

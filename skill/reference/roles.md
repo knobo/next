@@ -51,7 +51,7 @@ The loop in SKILL.md is the same for everyone. Only these lines differ:
 | `coordinator` | `board task next` — anything you qualify for, orphans first | a dispatched subagent (step 6) | yes, after the gate |
 | `implementer` | same queue, but you take the task and **write the code yourself** — skip step 6, do the work in your own worktree | you | no — hand it over (below) |
 | `reviewer` | `board task list --status in_review` first | nobody; you are READ-ONLY (`prompts/reviewer.md` applies to you) | no |
-| `tester` | tasks with `requires: browser-test`, and open cards in `board tests` | nobody; you run the tests | no |
+| `tester` | tasks with `requires: browser-test` — the browser verification another agent had no capability to run | nobody; you run it, and the output is the evidence | no |
 
 Whoever writes the code plans first (loop step 4), and the plan goes on the board before the
 first edit. An implementer has no coordinator holding a plan for them — so theirs is the only

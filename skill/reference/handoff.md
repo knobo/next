@@ -10,7 +10,7 @@ Print it as your last output. Keep it under 25 lines.
 
 DONE THIS SESSION
 - T-42 <title> → merged <sha>
-- T-43 <title> → awaiting_human (test card Q-9)
+- T-43 <title> → blocked, "cannot verify: no playwright on this host"
 
 LEFT ON THE BOARD
 - T-44 <title> → released, "<why>"      ← anyone can pick this up

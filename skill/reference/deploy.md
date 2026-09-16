@@ -34,5 +34,5 @@ database is neither.
 ## After deploying
 
 `board task deploy $T` runs the manifest command and records `task.deployed`. `done` is refused
-without it. If the service crash-loops, create a P0 rollback task and take it FIRST — the
-rollback command belongs in the test card, so it is already written down.
+without it. If the service crash-loops, create a P0 rollback task and take it FIRST — put the
+rollback command in the task spec so it is written down before you need it.
