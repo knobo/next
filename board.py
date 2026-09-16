@@ -111,16 +111,26 @@ if {"rl5_pct", "rl7_pct"} <= _cols:      # T-164: existing database, old columns
             _ws.append({"window": "7d", "used_pct": _r["rl7_pct"]})
         db.execute("UPDATE agents SET budget=? WHERE id=?", (json.dumps(_ws), _r["id"]))
 # T-352: the human test stage is gone, and nothing moves a task out of `awaiting_human`
-# any more. Put such rows back in the queue and close their test cards. Idempotent: a
-# second boot finds no rows.
+# any more. These rows are not fresh work: a PR means the task is `in_review`, a
+# worktree/branch with no PR means it was `orphaned` (matches how the reaper and
+# task_claim already treat existing work — see agents_cleanup and task_next). Only a
+# row with neither goes back to `open`. Idempotent: a second boot finds no rows.
 _NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
-for _r in db.execute("SELECT id, project FROM tasks WHERE status='awaiting_human'").fetchall():
-    db.execute("UPDATE tasks SET status='open', owner=NULL, lease_until=NULL, updated=%s "
-               "WHERE id=?" % _NOW, (_r["id"],))
+for _r in db.execute("SELECT id, project, pr, branch, worktree FROM tasks "
+                     "WHERE status='awaiting_human'").fetchall():
+    if _r["pr"]:
+        _status = "in_review"
+    elif _r["branch"] or _r["worktree"]:
+        _status = "orphaned"
+    else:
+        _status = "open"
+    db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=%s "
+               "WHERE id=?" % _NOW, (_status, _r["id"]))
     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (_r["id"],))
     db.execute("INSERT INTO events (ts,project,stream,type,actor,body) VALUES (%s,?,?,?,?,?)" % _NOW,
-               (_r["project"] or "_global", "task/" + _r["id"], "task.released", "board",
-                json.dumps({"note": "human test stage removed (T-352)"})))
+               (_r["project"] or "_global", "task/" + _r["id"],
+                "task.orphaned" if _status == "orphaned" else "task.released", "board",
+                json.dumps({"note": "human test stage removed (T-352)", "status": _status})))
 db.execute("UPDATE questions SET status='answered', answered_by='board', read=1, answered=%s, "
            "answer='withdrawn: human test stage removed (T-352)' "
            "WHERE kind='test' AND status='open'" % _NOW)
