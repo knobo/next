@@ -301,7 +301,13 @@ start)
   r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
   aid=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
   echo "$aid" > "$CACHE/agent"
-  [ -n "$sess" ] && echo "$aid" > "$CACHE/session-$sess"
+  # Also under the flat, non-URL-keyed root (T-435): the statusline hook runs in a
+  # different process with no reliable way to rebuild the per-board $CACHE path, so it
+  # reads the flat compat copy. Without this write, every session there falls through to
+  # the shared flat `agent` file — a ghost agent id that outlives the session that wrote
+  # it and wins the coordinator ranking.
+  [ -n "$sess" ] && echo "$aid" > "$CACHE/session-$sess" \
+                 && echo "$aid" > "$CACHE_ROOT/session-$sess"
 
   actual_role="$role"
   if [ "$role" = "coordinator" ]; then
@@ -365,7 +371,9 @@ register)
   r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
   id=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
   echo "$id" > "$CACHE/agent"
-  [ -n "$sess" ] && echo "$id" > "$CACHE/session-$sess"
+  # Flat compat copy, same reason as `start` above (T-435).
+  [ -n "$sess" ] && echo "$id" > "$CACHE/session-$sess" \
+                 && echo "$id" > "$CACHE_ROOT/session-$sess"
   echo "$r" ;;
 
 heartbeat)

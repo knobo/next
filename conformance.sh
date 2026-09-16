@@ -1258,9 +1258,12 @@ for U in "$BOARD_URL" "http://localhost:1"; do
   BOARD_CACHE="$CH" BOARD_URL="$U" BOARD_TOKEN="$TOKEN" BOARD_SESSION=hijack \
     ./bin/board register --project demo --model m --host hijacker >/dev/null 2>&1
 done
-if [ "$(find "$CH" -name 'session-hijack' | wc -l)" -eq 2 ]; then
+# -mindepth 2: skip the flat compat copy $CH/session-hijack (T-435) — that one is
+# deliberately shared across every BOARD_URL under this cache root, only the per-URL
+# keyed copies (one directory down) prove the cache is keyed.
+if [ "$(find "$CH" -mindepth 2 -name 'session-hijack' | wc -l)" -eq 2 ]; then
   ok "the session cache is keyed on BOARD_URL"
-else no "the session cache is keyed on BOARD_URL" "$(find "$CH" -name 'session-hijack' | tr '\n' ' ')"; fi
+else no "the session cache is keyed on BOARD_URL" "$(find "$CH" -mindepth 2 -name 'session-hijack' | tr '\n' ' ')"; fi
 
 CLIDIR="$TMP/proj"; mkdir -p "$CLIDIR/web"
 git -C "$CLIDIR/web" init -q . 2>/dev/null
@@ -1437,6 +1440,15 @@ GROKID=$(jq -r .id <<<"$(cd "$CLIDIR" && env -u CLAUDE_CODE_SESSION_ID BOARD_HAR
   BOARD_CACHE="$TMP/cli-cache-3" board register --model grok-4 2>/dev/null)")
 check "grok gets the gk prefix and no merge grant" "$(api GET '/status?project=demo')" \
   '[.projects[0].agents[]?|select(.id=="'"$GROKID"'")][0] | (.id|startswith("gk-")) and (.grants|index("merge")|not)'
+# T-435: the statusline heartbeat runs in a process that cannot rebuild the per-board
+# $CACHE path, so `register`/`start` also drop a flat copy under the bare cache root —
+# without it, a session with no mapping there fell back to the shared flat `agent` file
+# (a ghost id from a different session) instead of sending no heartbeat at all.
+if [ -f "$TMP/cli-cache-3/session-conf-grok-$$" ] && [ "$(cat "$TMP/cli-cache-3/session-conf-grok-$$")" = "$GROKID" ]; then
+  ok "register also writes the flat session compat file"
+else
+  no "register also writes the flat session compat file" "$(ls "$TMP/cli-cache-3" 2>&1)"
+fi
 
 # An in_review takeover on ANOTHER machine: the directory on the board does not exist here,
 # but the branch is pushed. `worktree add -b <br> origin/main` then gave an EMPTY branch and
