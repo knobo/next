@@ -1414,6 +1414,22 @@ if [ -s "$TMP/deploy-cwd.txt" ] && ! grep -qxE "$CLIDIR(/web)?" "$TMP/deploy-cwd
 else no "deploy did not run in the primary working copy" "cwd was $(cat "$TMP/deploy-cwd.txt" 2>/dev/null)"; fi
 cli task release "$DP_T" >/dev/null 2>&1
 
+# T-283 review: the check above swaps in a synthetic deploy.dev, so the REAL k8s/deploy.sh
+# was never run. It sourced "./$ENVFILE", which with an absolute BOARD_REPO_ROOT became
+# .//abs/board.env and died before any kubectl. Run it with a kubectl stub that records.
+mkdir -p "$TMP/kdeploy/bin" "$TMP/kdeploy/root"
+printf 'BOARD_HOST=board.example.test\n' > "$TMP/kdeploy/root/board.env"
+cat > "$TMP/kdeploy/bin/kubectl" <<SH
+#!/usr/bin/env bash
+echo "\$*" >> "$TMP/kdeploy/kubectl.log"
+[ -t 0 ] || cat >/dev/null
+SH
+chmod +x "$TMP/kdeploy/bin/kubectl"
+KDR=$(env -u BOARD_ENV PATH="$TMP/kdeploy/bin:$PATH" BOARD_REPO_ROOT="$TMP/kdeploy/root" ./k8s/deploy.sh </dev/null 2>&1)
+if grep -qs "rollout status deploy/board" "$TMP/kdeploy/kubectl.log"; then
+  ok "k8s/deploy.sh finds board.env via an absolute BOARD_REPO_ROOT and reaches kubectl"
+else no "k8s/deploy.sh with an absolute BOARD_REPO_ROOT" "$KDR"; fi
+
 # T-189: a board that answers 503 (Traefik during a rollout) is down, not a valid answer. The
 # cache is keyed on BOARD_URL (T-118), so a cache warmed against the real board does not apply
 # to the 503 URL. What matters here is that the agent does not stop: a 503 must read as

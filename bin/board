@@ -667,19 +667,28 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
             sha=$(jq -r '.merge_sha // empty' <<<"$info")
             trepo=$(jq -r '.repo // empty' <<<"$info")
             [ -n "$sha" ] || die "$t has no merge_sha — deploy requires the merge to have landed (board task merged)"
-            case "$trepo" in ""|"."|"$PROJECT") rd="$ROOT" ;; *) rd="$ROOT/$trepo" ;; esac
+            rd=$(repo_dir "$trepo") || exit 1
             git -C "$rd" rev-parse --git-dir >/dev/null 2>&1 || die "$rd is not a git repo — cannot deploy $sha"
+            dw="$(dirname "$rd")/$(basename "$rd")-worktrees/deploy"
+            # Everything from here on uses the ONE shared deploy worktree: two concurrent
+            # deploys would fetch, check out and run over each other. Wait for the lock, do not skip.
+            mkdir -p "$(dirname "$dw")"
+            exec 8>"$(dirname "$dw")/deploy.lock"
+            flock 8 || die "could not lock $dw"
             git -C "$rd" fetch -q origin || die "could not fetch origin — refusing to deploy on stale info"
             git -C "$rd" merge-base --is-ancestor "$sha" origin/main 2>/dev/null \
               || die "$t's merge_sha ($sha) is not an ancestor of origin/main — refusing"
-            dw="$(dirname "$rd")/$(basename "$rd")-worktrees/deploy"
             if [ ! -d "$dw" ]; then
-              mkdir -p "$(dirname "$dw")"
               git -C "$rd" worktree add -q --detach "$dw" origin/main || die "could not create deploy worktree $dw"
             fi
             git -C "$dw" checkout -q --detach origin/main || die "could not check out origin/main in $dw"
             [ "$(git -C "$dw" rev-parse HEAD)" = "$(git -C "$rd" rev-parse origin/main)" ] \
               || die "deploy worktree is not on origin/main — refusing"
+            # Leftovers from an earlier run must not ship. -x is destructive, so only ever in
+            # the deploy worktree, never the primary checkout.
+            [ "$(cd "$dw" && pwd -P)" != "$(cd "$rd" && pwd -P)" ] && [ "$(basename "$dw")" = deploy ] \
+              || die "refusing to git clean $dw"
+            git -C "$dw" clean -qfdx || die "could not clean $dw"
             # Single repo (root IS the repo, like `next`): project.yaml is versioned, read it
             # from the deploy worktree, or new code ships with an old deploy command.
             # Multi-repo: project.yaml lives in the unversioned project root, the only source.
@@ -688,7 +697,7 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
             [ -n "$c" ] || die "the manifest ($mroot) has no deploy.$env"
             echo "deploy $t: $env from $(git -C "$dw" rev-parse --short HEAD) in $dw" >&2
             # BOARD_REPO_ROOT: where untracked per-installation files (board.env) still live.
-            ( cd "$dw" && echo "$c" | BOARD_REPO_ROOT="$rd" bash ) || die "deploy failed — not reported"
+            ( cd "$dw" && echo "$c" | BOARD_REPO_ROOT="$rd" bash 8>&- ) || die "deploy failed — not reported"
             req POST "/tasks/$t/deployed" "$(with_agent "$(jq -nc --arg e "$env" '{env:$e}')")" ;;
     search) q_term="${POS[0]:-}"
             [ -n "$q_term" ] || die "usage: board task search <word>"
