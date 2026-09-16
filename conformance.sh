@@ -40,6 +40,7 @@ if [ -n "$TARGET" ]; then
   echo "== running against $BOARD_URL â the suite WRITES in the project «demo» there =="
 else
   TOKEN=conformance         # our own instance: we pick the token ourselves
+  BOARD_HUMAN=human
   cat > "$TMP/policy.json" <<'JSON'
 {"grants": {"demo": {"claude-code@*": ["merge","deploy-dev"], "codex@*": ["deploy-dev"], "*": []}},
  "budget": {"demo": {"ceilings": {"5h": 85, "7d": 75}},
@@ -56,7 +57,7 @@ JSON
   # (emoji in the Title header).
   NTFY_PORT=$(python3 -c "import socket;s=socket.socket();s.bind((\"\",0));print(s.getsockname()[1]);s.close()")
   NTFY_LOG="$TMP/ntfy" NTFY_PORT="$NTFY_PORT" \
-  BOARD_DB="$TMP/board.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" BOARD_POLICY="$TMP/policy.json" \
+  BOARD_DB="$TMP/board.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" BOARD_HUMAN="human" BOARD_POLICY="$TMP/policy.json" \
     BOARD_PORT="$PORT" BOARD_BASE_URL="http://localhost:$PORT" BOARD_REAP_INTERVAL=1 \
     NTFY_URL="http://127.0.0.1:$NTFY_PORT/board" \
     python3 board.py > "$TMP/log" 2>&1 &
@@ -939,7 +940,7 @@ HT="human-$$"
 # Its own instance with BOARD_HUMAN_TOKEN set, so we can test both sides.
 HDIR=$(mktemp -d); cp "$TMP/policy.json" "$HDIR/p.json" 2>/dev/null || echo '{}' > "$HDIR/p.json"
 HPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('',0));print(s.getsockname()[1]);s.close()")
-BOARD_DB="$HDIR/h.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HT" BOARD_POLICY="$HDIR/p.json" \
+BOARD_DB="$HDIR/h.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HT" BOARD_HUMAN="human" BOARD_POLICY="$HDIR/p.json" \
   BOARD_PORT="$HPORT" python3 board.py > "$HDIR/log" 2>&1 &
 HPID=$!
 for _ in $(seq 50); do curl -sf "http://localhost:$HPORT/healthz" >/dev/null && break; sleep .1; done
@@ -1011,6 +1012,8 @@ if [ "$OWN_SERVER" = 1 ]; then
     || no "emoji in the body" "$N"
   grep -q "ntfy failed" "$TMP/log" && no "ntfy error in the pod log" "$(grep -m1 'ntfy failed' "$TMP/log")" \
     || ok "no ntfy errors in the pod log"
+  check "ntfy_failures_since_success is 0 after successful push" \
+    "$(api GET /status)" '.ntfy_failures_since_success==0'
 fi
 
 # An absolute symlink points out of any worktree and into the primary checkout: the agent
@@ -1162,6 +1165,8 @@ check "register without --project takes it from the manifest" "$R" '.project=="d
 CLIID=$(jq -r .id <<<"$R")
 check "register mirrors the phase from the manifest" "$(cli status --json)" \
   '[.projects[]|select(.name=="demo")][0].phase=="launch"'
+check "cli status --json exposes ntfy_failures_since_success" "$(cli status --json)" \
+  'has("ntfy_failures_since_success")'
 
 # `status --me` is the command the stop rules are read from. It must give the agent's own
 # row AND the budget block — and it must blow up, not stay quiet, when the agent is not in
