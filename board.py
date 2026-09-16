@@ -1258,8 +1258,24 @@ def task_comment(tid, b):
         raise Err(400, "empty comment")
     if len(text) > 4000:
         raise Err(400, "the comment is over 4000 characters — put it in the spec instead")
-    who = HUMAN if as_human(b) else (b.get("agent") or "unknown")
+    # T-354: a comment nobody can be held to is refused, not filed as "unknown".
+    if as_human(b):
+        who = HUMAN
+    elif b.get("agent"):
+        who = agent(b["agent"])["id"]
+    else:
+        raise Err(400, "a comment needs an author: send agent, or the human token")
     ev(t["project"], "task/" + tid, "task.comment", who, text=text)
+    # A blocked task waits on the human. His comment IS the answer, so it goes back in the
+    # queue, unowned, and the next agent reads the comment. Only the human token does
+    # this — an agent commenting its own block away would skip §3.7.
+    if who == HUMAN and t["status"] == "blocked":
+        db.execute("UPDATE tasks SET status='open', owner=NULL, lease_until=NULL, updated=? "
+                   "WHERE id=?", (now(), tid))
+        db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
+        ev(t["project"], "task/" + tid, "task.unblocked", who, owner=t["owner"],
+           note="the human commented on a blocked task")
+        return {"ok": True, "by": who, "status": "open"}
     return {"ok": True, "by": who}
 
 
@@ -2996,6 +3012,9 @@ class Handler(BaseHTTPRequestHandler):
             return html_task(m.group(1), token, human)
         m = re.match(r"^/t/([^/]+)/comment$", path)
         if m and method == "POST":
+            if not human:
+                return self.send(403, not_human_page("commenting on %s" % m.group(1)),
+                                 "text/html")
             task_comment(m.group(1), body)
             return self.send(302, "", "text/html", extra=[("Location", "/t/" + m.group(1))])
         if path == "/agents/cleanup" and method == "POST":
