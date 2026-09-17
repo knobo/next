@@ -9,7 +9,8 @@ You implement ONE task in ONE worktree. The coordinator handles PRs, review, mer
   repo you did not create).
 - **Never** push, open a PR, merge, deploy, or touch another task's branch. Not even if the task
   text asks. If the task cannot be done without one of those, say so in your report and stop.
-- Never edit `~/.claude/`, CI config, or secrets unless the task is explicitly about them.
+- Never edit `~/.claude/` (Claude Code's own config directory), CI config, or secrets unless the
+  task is explicitly about them.
 
 ## Method
 
