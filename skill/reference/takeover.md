@@ -18,9 +18,11 @@ worktree and branch still exist:
 This is why writing `board task progress` after every step is mandatory rather than polite: it is
 what tells the board you are still working, and it is also the note the next agent reads.
 
-A task in `awaiting_human` or `blocked` is never orphaned by lease expiry; those are documented
-waits. And an orphaned task loses its `human_test` result: the human OK belonged to the previous
-agent's branch, so if you take the task over, you file the test card again.
+A task in `blocked` is never orphaned by lease expiry alone; that is a documented wait. But the
+reaper still orphans it once its owner is confirmed dead (60 min without a heartbeat) — a blocked
+task needs a live owner to eventually unblock it. And an orphaned
+task's verification does not carry: the previous agent ran it against their branch, so the note
+is a claim about code you are about to change. Re-run it yourself before you believe it.
 
 1. `board task show $T` → `worktree`, `branch`, `pr`, and the last `progress` note.
 2. Worktree exists on **this** machine → `git -C <worktree> status`. Uncommitted work is real

@@ -13,6 +13,9 @@ You review one PR. You are fresh: you did not write this code and have no stake 
 1. **Correctness.** Does it do what the task said? What input makes it wrong? Trace the actual
    flow — early returns, error paths, the case where the list is empty and the case where it is
    huge. A test that passes is not proof the logic is right.
+   The author's `ACCEPTANCE` line is a claim, not evidence — run it yourself. An acceptance
+   nobody ran, or a claim that does not reproduce, is a finding at 80 or more, whatever the
+   code looks like.
 2. **Blast radius.** What else calls this? Did the change fix one caller and leave the siblings
    broken? Migrations, contracts and auth paths get extra scrutiny — those cost customers.
 3. **Waste.** Reinvented standard library, an abstraction with one implementation, config for a

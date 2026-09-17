@@ -4,7 +4,7 @@ Loaded at step 13, when the project declares `deploy` in its manifest.
 
 ## Downtime tolerance follows the phase
 
-The phase already decides test level, merge gate, prod deploy and model (DESIGN.md §3.6).
+The phase already decides merge gate, prod deploy and model (DESIGN.md §3.6).
 Downtime is the same axis: how much does it cost when the service is gone for a moment.
 
 | Phase | Tolerated downtime | What that means in practice |
@@ -34,5 +34,5 @@ database is neither.
 ## After deploying
 
 `board task deploy $T` runs the manifest command and records `task.deployed`. `done` is refused
-without it. If the service crash-loops, create a P0 rollback task and take it FIRST — the
-rollback command belongs in the test card, so it is already written down.
+without it. If the service crash-loops, create a P0 rollback task and take it FIRST — put the
+rollback command in the task spec so it is written down before you need it.
