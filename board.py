@@ -1223,11 +1223,17 @@ def task_blocked(tid, aid, b):
     # owner, unclaimable and unannotatable) cannot arise going forward. Legacy rows already
     # stuck in it recover through task_claim instead (see task_claim's comment), not here.
     if t["owner"] is None and t["status"] in ("open", "orphaned", "in_review"):
+        # Same validation task_claim does: an unknown or dead agent id must not become
+        # the owner (a phantom owner makes the task unclaimable by anyone real), and a
+        # project mismatch must not let an agent block work outside its own project.
+        a = agent(aid, alive_only=True)
+        same_project(a, t["project"])
         cur = db.execute("UPDATE tasks SET status='blocked', owner=?, updated=? "
                          "WHERE id=? AND owner IS NULL",
                          (aid, now(), tid)).rowcount
         if not cur:
             raise Err(409, "the task is taken", owner=t["owner"], status=t["status"])
+        db.execute("UPDATE agents SET current_task=? WHERE id=?", (tid, aid))
     else:
         owns(t, aid)
         db.execute("UPDATE tasks SET status='blocked', updated=? WHERE id=?", (now(), tid))

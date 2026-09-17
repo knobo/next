@@ -788,10 +788,25 @@ grep -B2 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
   || no "finished links to the agent's current task" "$(grep -B2 'click check' <<<"$N")"
 # But T3ID is unowned (in_review, released above): the root fix claims it for whoever
 # blocks it instead of refusing outright — a blocked task always ends up owned.
+# T-407: the self-claim branch must validate the agent (like task_claim) before making it
+# the owner — a phantom id would make the task unclaimable by anyone real.
+check "blocking an unowned task with an unknown agent id is refused" \
+  "$(api POST /tasks/$T3ID/blocked "{\"agent\":\"nonexistent-agent\",\"note\":\"phantom\"}")" '.error'
+check "the phantom-agent block attempt did not claim the task" "$(api GET /tasks/$T3ID)" \
+  '.owner==null and .status=="in_review"'
+# T-407: same_project() must also gate the self-claim branch, like task_claim/task_patch.
+OID=$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s-t407"}' | jq -r .id)
+check "blocking an unowned task from a different project is refused" \
+  "$(api POST /tasks/$T3ID/blocked "{\"agent\":\"$OID\",\"note\":\"wrong project\"}")" '.error'
+check "the cross-project block attempt did not claim the task" "$(api GET /tasks/$T3ID)" \
+  '.owner==null and .status=="in_review"'
 check "blocking an unowned task claims it for the caller" \
   "$(api POST /tasks/$T3ID/blocked "{\"agent\":\"$BID\",\"note\":\"waiting on a design call\"}")" '.ok'
 check "the claim-and-block sticks" "$(api GET /tasks/$T3ID)" \
   '.status=="blocked" and .owner=="'"$BID"'"'
+# T-407: self-claim must also update agents.current_task, like task_claim does.
+check "the self-claim updates agents.current_task" \
+  "$(api POST /agents/$BID/heartbeat '{}')" '.task=="'"$T3ID"'"'
 # Retire both now they have served their purpose: left blocked+owned, the owning agent's
 # later /finished plus a reap cycle would legitimately hand them back as 'orphaned' (owner
 # dead/finished — by design, see reap()) and they would then compete with the WIP-limit
