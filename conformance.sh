@@ -858,9 +858,11 @@ api POST /tasks/$CLKID/claim "{\"agent\":\"$CLKAG\"}" >/dev/null
 api POST "/agents/$CLKAG/finished" '{"reason":"click check"}' >/dev/null
 for _ in $(seq 50); do grep -q "click check" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
 N=$(cat "$TMP/ntfy" 2>/dev/null || true)
-grep -B2 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
+# The reason lives in the TITLE line now (finished() names it there), so CLICK is the
+# line AFTER the match, not before.
+grep -A1 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
   && ok "finished links to the agent's current task" \
-  || no "finished links to the agent's current task" "$(grep -B2 'click check' <<<"$N")"
+  || no "finished links to the agent's current task" "$(grep -A1 'click check' <<<"$N")"
 # But T3ID is unowned (in_review, released above): the root fix claims it for whoever
 # blocks it instead of refusing outright — a blocked task always ends up owned.
 # T-407: the self-claim branch must validate the agent (like task_claim) before making it
@@ -919,9 +921,10 @@ if [ "$OWN_SERVER" = 1 ]; then
   api POST "/agents/$NOTASKAG/finished" '{"reason":"no task click check"}' >/dev/null
   for _ in $(seq 50); do grep -q "no task click check" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
   N=$(cat "$TMP/ntfy" 2>/dev/null || true)
-  grep -B2 "no task click check" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
+  # The reason lives in the TITLE line now, so CLICK is the line AFTER the match.
+  grep -A1 "no task click check" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
     && ok "finished with no current task links to /status" \
-    || no "finished with no current task links to /status" "$(grep -B2 'no task click check' <<<"$N")"
+    || no "finished with no current task links to /status" "$(grep -A1 'no task click check' <<<"$N")"
 fi
 api POST "/agents/$BID/finished" '{"reason":"conformance"}' >/dev/null
 if [ "$OWN_SERVER" = 1 ]; then
