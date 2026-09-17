@@ -39,9 +39,10 @@ PORT="${BOARD_PORT:-$(python3 -c "import socket;s=socket.socket();s.bind((\"\",0
 # The tests that play the human (answering questions, pinning roles) must PROVE they are
 # the human: `by: <human>` is no longer enough, that is the whole point of the human token.
 HUMAN_TOKEN="${BOARD_HUMAN_TOKEN:-human-conformance}"
-TMP=$(mktemp -d); trap 'kill %1 2>/dev/null; kill ${NTFY_PID:-0} 2>/dev/null; rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d); trap 'kill ${BOARD_PID:-0} 2>/dev/null; kill ${NTFY_PID:-0} 2>/dev/null; rm -rf "$TMP"' EXIT
 OWN_SERVER=0
 NTFY_PID=
+BOARD_PID=
 
 if [ -n "$TARGET" ]; then
   # Against a real board the token has to be right. Falls back to `pass`, and says so
@@ -70,11 +71,19 @@ JSON
   # board.py. Without this the push was untested, and it was effectively dead for a day
   # (emoji in the Title header).
   NTFY_PORT=$(python3 -c "import socket;s=socket.socket();s.bind((\"\",0));print(s.getsockname()[1]);s.close()")
-  NTFY_LOG="$TMP/ntfy" NTFY_PORT="$NTFY_PORT" \
-  BOARD_DB="$TMP/board.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" BOARD_HUMAN="human" BOARD_POLICY="$TMP/policy.json" \
-    BOARD_PORT="$PORT" BOARD_BASE_URL="http://localhost:$PORT" BOARD_REAP_INTERVAL=1 \
-    NTFY_URL="http://127.0.0.1:$NTFY_PORT/board" \
-    python3 board.py > "$TMP/log" 2>&1 &
+  # Starts (or restarts, see the reaper section below) board.py on $PORT against the same
+  # db/policy. Extracted so a different BOARD_REAP_INTERVAL can be used later without
+  # duplicating this whole env block.
+  start_board() {
+    NTFY_LOG="$TMP/ntfy" NTFY_PORT="$NTFY_PORT" \
+    BOARD_DB="$TMP/board.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" BOARD_HUMAN="human" BOARD_POLICY="$TMP/policy.json" \
+      BOARD_PORT="$PORT" BOARD_BASE_URL="http://localhost:$PORT" BOARD_REAP_INTERVAL="$1" \
+      NTFY_URL="http://127.0.0.1:$NTFY_PORT/board" \
+      python3 board.py >> "$TMP/log" 2>&1 &
+    BOARD_PID=$!
+    for _ in $(seq 50); do curl -sf "http://localhost:$PORT/healthz" >/dev/null && break; sleep .1; done
+  }
+  start_board 1
   OWN_SERVER=1
   BOARD_URL="http://localhost:$PORT"
   NTFY_LOG="$TMP/ntfy" python3 - "$NTFY_PORT" > "$TMP/ntfy-log" 2>&1 <<'PY' &
@@ -105,6 +114,23 @@ ok()  { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 no()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
 check() { # check "name" <json> <jq-filter>
   if jq -e "$3" >/dev/null 2>&1 <<<"$2"; then ok "$1"; else no "$1" "$2"; fi; }
+# poll_until <attempts> <delay-seconds> <predicate...> — retries a predicate command until
+# it succeeds or the attempts run out (T-184: poll observed state, never sleep a fixed
+# number of seconds and guess). The idiom was hand-copied at every call site before this.
+poll_until() {
+  local attempts="$1" delay="$2" i; shift 2
+  for ((i = 0; i < attempts; i++)); do
+    "$@" && return 0
+    sleep "$delay"
+  done
+  return 1
+}
+# Predicates for poll_until, using jq --arg so the values never need shell-quoting tricks.
+event_seen() { jq -e --arg t "$2" '.events[]|select(.type==$t)' >/dev/null 2>&1 \
+  <<<"$(api GET "/events?stream=$1")"; }
+agent_status_is() { jq -e --arg id "$1" --arg st "$2" \
+  '[.projects[0].agents[]|select(.id==$id)][0].status==$st' >/dev/null 2>&1 \
+  <<<"$(api GET '/status?project=demo')"; }
 # Like api(), but the HTTP status is in the JSON. T-396 is 200 vs 400 vs 409, and `.error`
 # alone cannot tell those apart.
 apic() { local m="$1" p="$2"; shift 2
@@ -634,13 +660,8 @@ QL=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"task\":\"$L
 # Poll observed state instead of sleeping a fixed number of seconds (the T-184 flake).
 # BOARD_REAP_INTERVAL=1 on our own instance keeps this quick; against a real board (60s
 # cycle) the 75 attempts still fit inside the time budget.
-DEFAULTED=0
-for _ in $(seq 75); do
-  jq -e '.events[]|select(.type=="question.defaulted")' >/dev/null 2>&1 \
-    <<<"$(api GET "/events?stream=question/$QDID")" && { DEFAULTED=1; break; }
-  sleep 1
-done
-[ "$DEFAULTED" = 1 ] && ok "the reaper swept the overdue question to defaulted" \
+poll_until 75 1 event_seen "question/$QDID" question.defaulted \
+  && ok "the reaper swept the overdue question to defaulted" \
   || no "the reaper swept the overdue question to defaulted" "never defaulted after 75s"
 check "a defaulted question is visible in /status, not gone" \
   "$(api GET '/status?project=demo')" \
@@ -674,11 +695,7 @@ check "a question already answered by a human is still 409 on a new answer" \
 # mind must reach the WORK that was done on the guess — otherwise the board "knows" yes
 # while the merged code does no, and that is only visible by reading raw events.
 for Q in "$QT" "$QL"; do
-  for _ in $(seq 75); do
-    jq -e '.events[]|select(.type=="question.defaulted")' >/dev/null 2>&1 \
-      <<<"$(api GET "/events?stream=question/$Q")" && break
-    sleep 1
-  done
+  poll_until 75 1 event_seen "question/$Q" question.defaulted
 done
 hum POST /questions/$QT/answer '{"answer":"yes","by":"human"}' >/dev/null
 check "an overridden default on a DONE task becomes a new task in the queue" \
@@ -708,11 +725,7 @@ CT2=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"web\"
 api POST /tasks/$CT2/claim "{\"agent\":\"$AID\"}" >/dev/null
 QC=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"task\":\"$CT2\",\"text\":\"same?\",\"default\":\"yes\",\"deadline\":\"2020-01-01T00:00:00Z\"}" | jq -r .id)
 api POST /tasks/$CT2/done "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
-for _ in $(seq 75); do
-  jq -e '.events[]|select(.type=="question.defaulted")' >/dev/null 2>&1 \
-    <<<"$(api GET "/events?stream=question/$QC")" && break
-  sleep 1
-done
+poll_until 75 1 event_seen "question/$QC" question.defaulted
 hum POST /questions/$QC/answer '{"answer":"Yes ","by":"human"}' >/dev/null
 check "«Yes » confirms the default «yes» — not an override" \
   "$(api GET '/tasks?project=demo')" \
@@ -778,27 +791,29 @@ if [ "$OWN_SERVER" = 1 ]; then
   sql() { python3 -c 'import sqlite3,sys
 d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$TMP/board.db" "$1"; }
   PAST=2020-01-01T00:00:00Z
+
+  # BOARD_REAP_INTERVAL=1 made the two checks below race the live reaper: it can orphan
+  # the task between the sqlite write and the read, and once it does, `stalled` never
+  # comes back (owner and current_task are cleared, so status_of() falls through to
+  # `alive`) — polling the same value cannot recover from that, it only delays the
+  # failure. Everything from here on triggers reap explicitly via POST /reap, so restart
+  # the same server on the same port/db with the automatic loop effectively off.
+  kill "${BOARD_PID:-0}" 2>/dev/null; wait "${BOARD_PID:-0}" 2>/dev/null
+  start_board 100000
+
   sql "UPDATE tasks SET lease_until='$PAST' WHERE id='$T3ID'"
 
   # Poll observed state instead of asserting right after the direct sqlite3 write from
   # another connection (the same T-184 flake, see the poll above): the API's own connection
-  # is not guaranteed to observe it on the very next read.
-  STALLED=0
-  for _ in $(seq 20); do
-    jq -e '[.projects[0].agents[]|select(.id=="'"$CID"'")][0].status=="stalled"' >/dev/null 2>&1 \
-      <<<"$(api GET '/status?project=demo')" && { STALLED=1; break; }
-    sleep .2
-  done
-  [ "$STALLED" = 1 ] && ok "an expired lease is stalled despite a living heartbeat" \
+  # is not guaranteed to observe it on the very next read. With the reaper frozen this is
+  # the only remaining source of flakiness — the task cannot flip to orphaned out from
+  # under us anymore.
+  poll_until 20 .2 agent_status_is "$CID" stalled \
+    && ok "an expired lease is stalled despite a living heartbeat" \
     || no "an expired lease is stalled despite a living heartbeat" "never observed stalled"
 
-  NOTASK=0
-  for _ in $(seq 20); do
-    jq -e '.error' >/dev/null 2>&1 <<<"$(api GET "/tasks/next?agent=$CID")" && { NOTASK=1; break; }
-    sleep .2
-  done
-  [ "$NOTASK" = 1 ] && ok "a stalled agent gets no new task" \
-    || no "a stalled agent gets no new task" "never got .error"
+  # Deterministic now: nothing but an explicit POST /reap (below) can change this.
+  check "a stalled agent gets no new task" "$(api GET "/tasks/next?agent=$CID")" '.error'
 
   # A pinned role is the human's choice. `stalled` is a new status value, and any
   # enumeration of statuses that does not know it steals the role from a living holder.
