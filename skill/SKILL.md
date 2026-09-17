@@ -17,7 +17,6 @@ Role ≠ coordinator → read `reference/roles.md`; the loop is the same, only w
 4. Answers and messages: `board inbox` (handled in `board start`).
 5. Queue hygiene & consolidation (coordinator): Run `board simplify [--apply]` regularly. It automatically:
    - Clusters related fragmented tasks (INNMELDING.md, counterless, web-stabilitet, infra, mobil, betaling) into consolidated packages, preserving all specs and shortening the dev cycle by 60–70%.
-   - Converts open human test cards (`kind: test`) into an automated agent verification task (`dev: samlet maskinell verifisering og utkvittering av testkort`) so AI agents run Playwright/curl/kubectl and answer them via `BOARD_WHO=<agent> board answer Q-xxx`.
    - Closes and archives obsolete/retracted cards (`FAIL fra menneske-test`, `TRUKKET`) and completed tasks (`status: done` → `status: archived`), keeping active listings and searches (`board task search`) focused only on open work.
    Can also be triggered manually anytime (`board simplify --archive-done`).
 6. Only if `board task list` is empty (any status — `blocked` tasks are not an empty queue): read `$ROOT/$ENTRY`, `board task create` one per item (`--repo --requires --risk --touches`). Otherwise **do not read it**: the board is the queue, that file is one you write, not read.

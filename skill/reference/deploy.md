@@ -4,7 +4,7 @@ Loaded at step 13, when the project declares `deploy` in its manifest.
 
 ## Downtime tolerance follows the phase
 
-The phase already decides test level, merge gate, prod deploy and model (DESIGN.md §3.6).
+The phase already decides merge gate, prod deploy and model (DESIGN.md §3.6).
 Downtime is the same axis: how much does it cost when the service is gone for a moment.
 
 | Phase | Tolerated downtime | What that means in practice |

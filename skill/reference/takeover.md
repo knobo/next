@@ -18,7 +18,9 @@ worktree and branch still exist:
 This is why writing `board task progress` after every step is mandatory rather than polite: it is
 what tells the board you are still working, and it is also the note the next agent reads.
 
-A task in `blocked` is never orphaned by lease expiry; that is a documented wait. And an orphaned
+A task in `blocked` is never orphaned by lease expiry alone; that is a documented wait. But the
+reaper still orphans it once its owner is confirmed dead (60 min without a heartbeat) — a blocked
+task needs a live owner to eventually unblock it. And an orphaned
 task's verification does not carry: the previous agent ran it against their branch, so the note
 is a claim about code you are about to change. Re-run it yourself before you believe it.
 
