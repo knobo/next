@@ -991,6 +991,28 @@ check "a 3000-character comment does not grow task list" \
   "$(jq -nc --argjson a "$LIST_A" --argjson b "$LIST_B" '{d:($a-$b)}')" '.d < 50'
 api POST "/tasks/$CMT/done" "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
 
+# T-354: a comment from the human on a blocked task is his answer — back to the queue.
+# An agent must not be able to comment a block away (§3.7), and nobody is "unknown".
+BA=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-blk","session":"blk"}' | jq -r .id)
+BLK=$(api POST /tasks "{\"agent\":\"$BA\",\"project\":\"demo\",\"repo\":\"cmt-blk\",\"title\":\"blocked, commented\"}" | jq -r .id)
+api POST "/tasks/$BLK/claim" "{\"agent\":\"$BA\"}" >/dev/null
+api POST "/tasks/$BLK/blocked" "{\"agent\":\"$BA\",\"note\":\"needs the human\"}" >/dev/null
+check "an anonymous comment is refused with a 4xx, never filed as unknown" \
+  "$(apic POST "/tasks/$BLK/comment" '{"text":"who am I"}')" '.code>=400 and .code<500'
+check "an agent comment on a blocked task leaves it blocked" \
+  "$(api POST "/tasks/$BLK/comment" "{\"agent\":\"$BA\",\"text\":\"I unblock myself\"}" >/dev/null; api GET "/tasks/$BLK")" \
+  '.status=="blocked" and .owner=="'"$BA"'"'
+check "a human comment on a blocked task puts it back in the queue" \
+  "$(hum POST "/tasks/$BLK/comment" '{"text":"use the staging key"}')" '.by=="'"${BOARD_HUMAN:-human}"'" and .status=="open"'
+check "the unblocked task is open, unowned and claimable" \
+  "$(api POST "/tasks/$BLK/claim" "{\"agent\":\"$BA\"}")" '.owner=="'"$BA"'"'
+api POST "/tasks/$BLK/done" "{\"agent\":\"$BA\",\"no_merge\":true}" >/dev/null
+if [ "$OWN_SERVER" = 1 ]; then
+  CF=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+       -H 'Content-Type: application/x-www-form-urlencoded' -X POST -d 'text=hi' "$BOARD_URL/t/$CMT/comment")
+  [ "$CF" = 403 ] && ok "the comment form refuses an agent-token browser" || no "agent-token comment form" "HTTP $CF"
+fi
+
 echo "== the HTML pages =="
 J="$TMP/cookies"
 for p in "/status?t=$TOKEN" ${QID:+"/q/$QID"} ${TID:+"/t/$TID"}; do
