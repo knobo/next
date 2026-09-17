@@ -480,6 +480,8 @@ def agent_grant_add(aid, b):
 
 def agent_grant_del(aid, grant, b, q):
     human_only(b or {}, "revoking permissions")
+    if not grant:
+        raise Err(400, "grant is required")
     a = agent(aid)
     project = (b or {}).get("project") or q.get("project", [None])[0] or a["current_project"]
     ensure_project(project)
@@ -2149,16 +2151,36 @@ FOCUS_SHA = "'sha256-%s'" % base64.b64encode(
 FOCUS = "<script>%s</script>" % FOCUS_JS
 
 
-def agent_block(a, ceilings):
+def agent_block(a, ceilings, human=False, project=None):
     roles = " ".join(a["roles"]) if a.get("roles") else ""
     ws = sorted(windows_of(a).items())
     st = a.get("status") or "unknown"
     mins = int(mins_since(a.get("last_seen"))) if a.get("last_seen") else 999999
+    grants_badges = []
+    for g in a.get("grants", []):
+        rev = ""
+        if human:
+            rev = ("<form method='POST' action='/agents/%s/grants/revoke' class='inline m-0'>"
+                   "<input type='hidden' name='grant' value='%s'>"
+                   "<input type='hidden' name='project' value='%s'>"
+                   "<button type='submit' class='cursor-pointer ml-1 text-xs opacity-60 hover:opacity-100 hover:text-error' title='Trekk tilbake grant'>✕</button>"
+                   "</form>" % (escape(a["id"]), escape(g), escape(project or "")))
+        grants_badges.append("<span class='badge badge-sm badge-outline font-mono'>%s%s</span>" % (escape(g), rev))
+    grants_html = "".join(grants_badges)
+    add_form = ""
+    if human:
+        add_form = ("<form method='POST' action='/agents/%s/grants' class='m-0 flex items-center gap-1 mt-1'>"
+                    "<input type='hidden' name='project' value='%s'>"
+                    "<input list='grants-list-%s' name='grant' placeholder='+ grant' class='rounded border border-base-300 bg-base-100 px-1.5 py-0.5 text-xs font-mono w-24'>"
+                    "<datalist id='grants-list-%s'><option value='merge'><option value='deploy-dev'><option value='deploy-prod'></datalist>"
+                    "<button type='submit' class='badge badge-sm badge-primary cursor-pointer'>gi</button></form>"
+                    % (escape(a["id"]), escape(project or ""), escape(a["id"]), escape(a["id"])))
     return ("<div data-agent class='border-t border-base-300 py-2.5' data-status='%s' data-mins='%d'>"
             "<b class='%s block font-semibold'>%s</b>"
             "<div class='mt-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-1'>"
             "<span class='%s text-xs'>%s</span>"
-            "<span class='badge badge-sm %s'>%s</span>%s%s</div>"
+            "<span class='badge badge-sm %s'>%s</span>%s%s%s</div>"
+            "%s"
             "<div class='mt-1.5 grid gap-1'>%s%s</div>%s</div>" % (
                 escape(st), mins,
                 MONO, escape(a["id"]), DIM, escape(a["model"] or ""),
@@ -2170,6 +2192,8 @@ def agent_block(a, ceilings):
                 ("<a class='%s %s text-sm' href='/t/%s'>%s</a>" % (
                     LINK, MONO, escape(a["current_task"]), escape(a["current_task"])))
                 if a["current_task"] else "",
+                grants_html,
+                add_form,
                 meter("ctx", a["ctx_pct"], 80),
                 "".join(meter(w, pct, ceilings.get(win_name(w))) for w, pct in ws)
                 or "<p class='%s text-xs'>reports no quota</p>" % DIM,
@@ -2291,6 +2315,18 @@ def html_status(project, token="", human=False):
     for p in sorted(s["projects"], key=last_activity, reverse=True):
         pause = ("<span class='badge badge-sm badge-error'>paused: %s</span>"
                  % escape(p["paused"])) if p.get("paused") else ""
+        pause_btn = ""
+        if human:
+            if p.get("paused"):
+                pause_btn = ("<form method='POST' action='/projects/%s/resume' class='inline m-0'>"
+                             "<input type='hidden' name='project' value='%s'>"
+                             "<button type='submit' class='badge badge-sm badge-success cursor-pointer'>▶ gjenoppta</button></form>"
+                             % (escape(p["name"]), escape(p["name"])))
+            else:
+                pause_btn = ("<form method='POST' action='/projects/%s/pause' class='inline m-0' data-confirm='Pause prosjektet (draining)?'>"
+                             "<input type='hidden' name='project' value='%s'>"
+                             "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' title='Pause prosjekt'>⏸ pause</button></form>"
+                             % (escape(p["name"]), escape(p["name"])))
         h.append("<details class='pj border-t-2 border-base-300 last-of-type:border-b-2' "
                  "data-p='%s'><summary class='grid cursor-pointer list-none "
                  "grid-cols-[1.2ch_auto_auto_minmax(0,1fr)] items-baseline gap-x-2 gap-y-1 "
@@ -2300,9 +2336,9 @@ def html_status(project, token="", human=False):
                  "<h2 class='text-base font-semibold'>%s</h2>"
                  "<span class='badge badge-sm badge-ghost'>%s</span>"
                  "<span class='max-sm:col-start-2 max-sm:col-end-[-1] "
-                 "max-sm:justify-start'>%s%s</span></summary>" % (
+                 "max-sm:justify-start'>%s%s%s</span></summary>" % (
                      escape(p["name"]), DIM, escape(p["name"]), escape(p["phase"]),
-                     tell(p), pause))
+                     tell(p), (" " + pause) if pause else "", (" " + pause_btn) if pause_btn else ""))
         h.append("<div class='pb-4'>")
         if p.get("goal"):
             h.append("<p class='max-w-[68ch] %s'>%s</p>" % (DIM, escape(p["goal"])))
@@ -2332,7 +2368,7 @@ def html_status(project, token="", human=False):
         if not p["agents"]:
             h.append("<p class='%s text-sm'>No agents are registered here yet.</p>" % DIM)
         for a in p["agents"]:
-            h.append(agent_block(a, ceilings))
+            h.append(agent_block(a, ceilings, human=human, project=p["name"]))
         h.append("</section><section class='min-w-0'>")
         h.append("<div class='mt-6 mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>"
                  "<div class='flex items-center gap-1'>"
@@ -2553,6 +2589,7 @@ ROUTES = [
     ("PUT",    r"/agents/([^/]+)/preference$",  lambda h, m, b, q: set_pref(m[0], b)),
     ("GET",    r"/agents/([^/]+)/grants$",      lambda h, m, b, q: agent_grants_get(m[0], q)),
     ("POST",   r"/agents/([^/]+)/grants$",      lambda h, m, b, q: agent_grant_add(m[0], b)),
+    ("POST",   r"/agents/([^/]+)/grants/revoke$", lambda h, m, b, q: agent_grant_del(m[0], (b or {}).get("grant"), b, q)),
     ("DELETE", r"/agents/([^/]+)/grants/([^/]+)$", lambda h, m, b, q: agent_grant_del(m[0], m[1], b, q)),
     ("POST",   r"/agents/cleanup$",             lambda h, m, b, q: agents_cleanup(
         (b or {}).get("project") or q.get("project", [None])[0],
@@ -3101,6 +3138,41 @@ class Handler(BaseHTTPRequestHandler):
             proj = (body or {}).get("project")
             older = (body or {}).get("older_than", "0")
             res = tasks_cleanup(proj, older, body)
+            if self.headers.get("accept") == "application/json":
+                return self.send(200, res)
+            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
+            return self.send(302, "", "text/html", extra=[("Location", loc)])
+        m = re.match(r"^/agents/([^/]+)/grants$", path)
+        if m and method == "POST":
+            proj = (body or {}).get("project")
+            res = agent_grant_add(m.group(1), body)
+            proj = proj or res.get("project")
+            if self.headers.get("accept") == "application/json":
+                return self.send(200, res)
+            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
+            return self.send(302, "", "text/html", extra=[("Location", loc)])
+        m = re.match(r"^/agents/([^/]+)/grants/revoke$", path)
+        if m and method == "POST":
+            proj = (body or {}).get("project")
+            grant = (body or {}).get("grant")
+            res = agent_grant_del(m.group(1), grant, body, q)
+            proj = proj or res.get("project")
+            if self.headers.get("accept") == "application/json":
+                return self.send(200, res)
+            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
+            return self.send(302, "", "text/html", extra=[("Location", loc)])
+        m = re.match(r"^/projects/([^/]+)/pause$", path)
+        if m and method == "POST":
+            proj = m.group(1)
+            res = set_paused(proj, body, True)
+            if self.headers.get("accept") == "application/json":
+                return self.send(200, res)
+            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
+            return self.send(302, "", "text/html", extra=[("Location", loc)])
+        m = re.match(r"^/projects/([^/]+)/resume$", path)
+        if m and method == "POST":
+            proj = m.group(1)
+            res = set_paused(proj, body, False)
             if self.headers.get("accept") == "application/json":
                 return self.send(200, res)
             loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))

@@ -6,6 +6,7 @@ import threading
 import unittest
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import ThreadingHTTPServer
 
 # Prepare environment before importing board
@@ -161,6 +162,130 @@ class TestGrants(unittest.TestCase):
         types = [e["type"] for e in evs]
         self.assertIn("agent.granted", types)
         self.assertIn("agent.revoked", types)
+
+    def form_request(self, method, path, form_data=None, token="human-token", accept=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        if accept:
+            headers["Accept"] = accept
+        body = urllib.parse.urlencode(form_data).encode("utf-8") if form_data is not None else None
+
+        class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with opener.open(req) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode("utf-8")
+
+    def test_web_ui_grants_and_project_controls(self):
+        # Register an agent for web UI tests
+        reg_data = {
+            "harness": "codex",
+            "host": "testhost2",
+            "project": "demo",
+            "session": "sess-webui-1"
+        }
+        status, reg_res = self.request("POST", "/agents", reg_data, token="agent-token")
+        self.assertEqual(status, 200)
+        aid = reg_res["id"]
+
+        # 1. Test HTML rendering in html_status
+        # Non-human: no revoke buttons, no add-grant form, no pause/resume buttons
+        html_non_human = board.html_status("demo", token="agent-token", human=False)
+        self.assertNotIn(f"/agents/{aid}/grants/revoke", html_non_human)
+        self.assertNotIn(f"/agents/{aid}/grants", html_non_human)
+        self.assertNotIn("/projects/demo/pause", html_non_human)
+        self.assertNotIn("/projects/demo/resume", html_non_human)
+
+        # Human: add-grant form and pause button visible
+        html_human = board.html_status("demo", token="human-token", human=True)
+        self.assertIn(f"action='/agents/{aid}/grants'", html_human)
+        self.assertIn(f"grants-list-{aid}", html_human)
+        self.assertIn("action='/projects/demo/pause'", html_human)
+        self.assertIn("⏸ pause", html_human)
+
+        # 2. Form POST to add grant with agent-token (non-human) -> 403 Forbidden
+        status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
+                                               {"grant": "merge", "project": "demo"},
+                                               token="agent-token")
+        self.assertEqual(status, 403)
+        self.assertIn("needs_human_token", body)
+
+        # 3. Form POST to add grant with human-token -> 302 Redirect to /status?project=demo
+        status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
+                                               {"grant": "merge", "project": "demo"},
+                                               token="human-token")
+        self.assertEqual(status, 302)
+        self.assertEqual(hdrs.get("Location"), "/status?project=demo")
+
+        # Verify grant is now present in html_status for both non-human and human
+        html_nh = board.html_status("demo", token="agent-token", human=False)
+        self.assertIn("<span class='badge badge-sm badge-outline font-mono'>merge</span>", html_nh)
+        self.assertNotIn(f"/agents/{aid}/grants/revoke", html_nh)
+
+        html_h = board.html_status("demo", token="human-token", human=True)
+        self.assertIn(f"action='/agents/{aid}/grants/revoke'", html_h)
+        self.assertIn("value='merge'", html_h)
+        self.assertIn("Trekk tilbake grant", html_h)
+
+        # 4. Form POST to revoke grant with agent-token (non-human) -> 403 Forbidden
+        status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants/revoke",
+                                               {"grant": "merge", "project": "demo"},
+                                               token="agent-token")
+        self.assertEqual(status, 403)
+        self.assertIn("needs_human_token", body)
+
+        # 5. Form POST to revoke grant with human-token -> 302 Redirect to /status?project=demo
+        status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants/revoke",
+                                               {"grant": "merge", "project": "demo"},
+                                               token="human-token")
+        self.assertEqual(status, 302)
+        self.assertEqual(hdrs.get("Location"), "/status?project=demo")
+
+        # Verify grant is revoked
+        status, g_get = self.request("GET", f"/agents/{aid}/grants?project=demo", token="agent-token")
+        self.assertNotIn("merge", g_get["grants"])
+
+        # 6. Form POST to pause project -> 302 Redirect
+        status, hdrs, body = self.form_request("POST", "/projects/demo/pause",
+                                               {"project": "demo"},
+                                               token="human-token")
+        self.assertEqual(status, 302)
+        self.assertEqual(hdrs.get("Location"), "/status?project=demo")
+
+        # Verify project is paused and resume button is rendered in human view
+        html_paused = board.html_status("demo", token="human-token", human=True)
+        self.assertIn("action='/projects/demo/resume'", html_paused)
+        self.assertIn("▶ gjenoppta", html_paused)
+
+        # 7. Form POST to resume project -> 302 Redirect
+        status, hdrs, body = self.form_request("POST", "/projects/demo/resume",
+                                               {"project": "demo"},
+                                               token="human-token")
+        self.assertEqual(status, 302)
+        self.assertEqual(hdrs.get("Location"), "/status?project=demo")
+
+        # Verify project is resumed
+        html_resumed = board.html_status("demo", token="human-token", human=True)
+        self.assertIn("action='/projects/demo/pause'", html_resumed)
+        self.assertNotIn("action='/projects/demo/resume'", html_resumed)
+
+        # 8. Test JSON response when Accept: application/json
+        status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
+                                               {"grant": "deploy-dev", "project": "demo"},
+                                               token="human-token",
+                                               accept="application/json")
+        self.assertEqual(status, 200)
+        json_resp = json.loads(body)
+        self.assertIn("deploy-dev", json_resp["grants"])
 
 
 if __name__ == "__main__":

@@ -1113,6 +1113,64 @@ if [ "$OWN_SERVER" = 1 ]; then
   grep -q ">$(printf %s "${BOARD_HUMAN:-human}")<" <<<"$HP" \
     && ok "a human-token page says it is signed in as the human" \
     || no "the human-token page does not name the human" "$(grep -o 'badge-sm badge-[a-z]*>[a-z]*' <<<"$HP" | head -3)"
+
+  # Web-UI operator controls on Tavla (T-467)
+  UI_AID=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-ui","session":"ui-session","capabilities":[]}' | jq -r .id)
+  NH_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -X POST -d "grant=deploy-test&project=demo" "$BOARD_URL/agents/$UI_AID/grants")
+  [ "$NH_CODE" = 403 ] && ok "non-human form POST gets 403" \
+    || no "non-human form POST gets 403" "HTTP $NH_CODE"
+
+  G_HDRS=$(curl -si -H "Authorization: Bearer $HUMAN_TOKEN" \
+          -H 'Content-Type: application/x-www-form-urlencoded' \
+          -X POST -d "grant=deploy-test&project=demo" "$BOARD_URL/agents/$UI_AID/grants" | tr -d '\r')
+  G_CODE=$(head -n 1 <<<"$G_HDRS" | cut -d' ' -f2)
+  G_LOC=$(grep -i '^location:' <<<"$G_HDRS" | awk '{print $2}')
+  if [ "$G_CODE" = "302" ] && [ "$G_LOC" = "/status?project=demo" ]; then
+    ok "browser form POST to /agents/<aid>/grants with urlencoded body redirects 302 to /status"
+  else
+    no "browser form POST to /agents/<aid>/grants with urlencoded body redirects 302 to /status" "code: $G_CODE, loc: $G_LOC"
+  fi
+
+  HP_GRANTS=$(curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status")
+  if grep -q "action='/agents/$UI_AID/grants'" <<<"$HP_GRANTS" && \
+     grep -q "action='/agents/$UI_AID/grants/revoke'" <<<"$HP_GRANTS" && \
+     grep -q "deploy-test" <<<"$HP_GRANTS"; then
+    ok "human viewing /status sees grants and add-grant form"
+  else
+    no "human viewing /status sees grants and add-grant form" "$HP_GRANTS"
+  fi
+
+  REV_HDRS=$(curl -si -H "Authorization: Bearer $HUMAN_TOKEN" \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -X POST -d "grant=deploy-test&project=demo" "$BOARD_URL/agents/$UI_AID/grants/revoke" | tr -d '\r')
+  REV_CODE=$(head -n 1 <<<"$REV_HDRS" | cut -d' ' -f2)
+  REV_LOC=$(grep -i '^location:' <<<"$REV_HDRS" | awk '{print $2}')
+  HP_AFTER_REV=$(curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status")
+  if [ "$REV_CODE" = "302" ] && [ "$REV_LOC" = "/status?project=demo" ] && ! grep -q "value='deploy-test'" <<<"$HP_AFTER_REV"; then
+    ok "browser form POST to /agents/<aid>/grants/revoke redirects 302 and revokes grant"
+  else
+    no "browser form POST to /agents/<aid>/grants/revoke redirects 302 and revokes grant" "code: $REV_CODE, loc: $REV_LOC"
+  fi
+  api POST "/agents/$UI_AID/finished" '{"reason":"conformance ui test"}' >/dev/null
+
+  PAUSE_HDRS=$(curl -si -H "Authorization: Bearer $HUMAN_TOKEN" \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              -X POST -d "project=demo" "$BOARD_URL/projects/demo/pause" | tr -d '\r')
+  PAUSE_CODE=$(head -n 1 <<<"$PAUSE_HDRS" | cut -d' ' -f2)
+  PAUSE_LOC=$(grep -i '^location:' <<<"$PAUSE_HDRS" | awk '{print $2}')
+  RESUME_HDRS=$(curl -si -H "Authorization: Bearer $HUMAN_TOKEN" \
+               -H 'Content-Type: application/x-www-form-urlencoded' \
+               -X POST -d "project=demo" "$BOARD_URL/projects/demo/resume" | tr -d '\r')
+  RESUME_CODE=$(head -n 1 <<<"$RESUME_HDRS" | cut -d' ' -f2)
+  RESUME_LOC=$(grep -i '^location:' <<<"$RESUME_HDRS" | awk '{print $2}')
+  if [ "$PAUSE_CODE" = "302" ] && [ "$PAUSE_LOC" = "/status?project=demo" ] && \
+     [ "$RESUME_CODE" = "302" ] && [ "$RESUME_LOC" = "/status?project=demo" ]; then
+    ok "browser form POST to /projects/<p>/pause and /projects/<p>/resume redirects 302"
+  else
+    no "browser form POST to /projects/<p>/pause and /projects/<p>/resume redirects 302" "pause: $PAUSE_CODE/$PAUSE_LOC, resume: $RESUME_CODE/$RESUME_LOC"
+  fi
 fi
 TH=$(curl -sL -c "$J" -b "$J" "$BOARD_URL/t/$TID")
 if grep -q "$TID" <<<"$TH" && grep -q "timeline" <<<"$TH" && grep -q "the owner.s state" <<<"$TH" && grep -q "#201" <<<"$TH"; then
