@@ -385,6 +385,22 @@ check "7d at 70% of 60, resets in 6 days: ceiling unchanged → stop" \
 check "…resets in 12 hours: effective ceiling ~89 → no stop" \
   "$(rstop ",\"resets_at\":$(date -u -d '+12 hours' +%s)")" \
   '.stop==null and .effective_ceilings["7d"]>88 and .effective_ceilings["7d"]<90'
+# review 55: the HTML /status meter must draw THIS agent's effective (ramped) ceiling,
+# not the raw policy 60 — otherwise the page shows red/over for an agent agent_stop
+# still lets run.
+EFF7D=$(api GET '/status?project=rampproject' | jq -r '.projects[0].agents[]|select(.id=="'"$RID"'")|.effective_ceilings["7d"]')
+curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=rampproject" > "$TMP/ramp-status.html"
+TICK=$(python3 -c "
+import re
+html = open('$TMP/ramp-status.html').read()
+m = re.search(r'data-agent[^>]*>.*?<b[^>]*>' + re.escape('$RID') + r'</b>.*?(?=data-agent|\Z)', html, re.S)
+blk = m.group(0) if m else ''
+mm = re.search(r\"<span class=k>7d</span>.*?data-c='([0-9.]+)'\", blk, re.S)
+print(mm.group(1) if mm else -1)
+")
+check "…HTML /status meter draws the ramped ceiling, not raw 60" \
+  "$(jq -nc --argjson tick "${TICK:--1}" --argjson eff "$EFF7D" '{tick:$tick, eff:($eff|round)}')" \
+  '.tick==.eff and .tick>88'
 check "…no resets_at: fixed ceiling → stop" "$(rstop "")" \
   '(.stop|test("7d")) and .effective_ceilings["7d"]==60'
 check "…naive ISO resets_at (no offset) in 12 hours: read as UTC, /status 200, ramped" \

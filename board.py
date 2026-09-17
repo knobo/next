@@ -919,8 +919,10 @@ def owner_view(t):
     if not a:
         return "unknown", None
     st = status_of(a)
+    ceilings = {win_name(k): v for k, v in budget(t["project"])["ceilings"].items()}
     return st, {"last_seen": a["last_seen"], "ctx_pct": a["ctx_pct"],
-                "budget": windows_of(a), "model": a["model"], "status": st}
+                "budget": windows_of(a), "model": a["model"], "status": st,
+                "effective_ceilings": effective_ceilings(a, ceilings)}
 
 
 def brief(t):
@@ -1979,12 +1981,19 @@ def watchline(s):
 def fleet_runway(s):
     """Quota is per HARNESS account, not per agent and not per project (§11) — so the
     runway is per harness. The ceiling drawn is the TIGHTEST ceiling among the projects
-    the page shows: it is the first one the fleet hits."""
+    the page shows: it is the first one the fleet hits.
+
+    Ramped like agent_stop (T-428 review 55): each project's raw ceiling is replaced by
+    the LOOSEST (max) effective ceiling among that project's own agents for the window —
+    a project with no agent near reset keeps its fixed ceiling, one agent near reset
+    stops the runway from showing "over" while it is still correctly working. Still the
+    tightest (min) across projects, same as before."""
     ceil = {}
     for p in s["projects"]:
         for w, c in ((p.get("budget") or {}).get("ceilings") or {}).items():
             w, c = win_name(w), float(c or 0)
-            ceil[w] = min(ceil.get(w, c), c)
+            eff = max([a.get("effective_ceilings", {}).get(w, c) for a in p["agents"]] or [c])
+            ceil[w] = min(ceil.get(w, eff), eff)
     harnesses = sorted({(a.get("harness") or "claude-code")
                         for p in s["projects"] for a in p["agents"]})
     rows = []
@@ -2149,6 +2158,10 @@ FOCUS = "<script>%s</script>" % FOCUS_JS
 
 
 def agent_block(a, ceilings, human=False, project=None):
+    # The ceiling drawn per window is THIS agent's effective (ramped) ceiling — already
+    # computed once in status() — not the raw policy value, or an agent minutes from its
+    # own reset renders red/over while agent_stop still lets it run (T-428 review 55).
+    eff = a.get("effective_ceilings") or ceilings
     roles = " ".join(a["roles"]) if a.get("roles") else ""
     ws = sorted(windows_of(a).items())
     st = a.get("status") or "unknown"
@@ -2192,7 +2205,7 @@ def agent_block(a, ceilings, human=False, project=None):
                 grants_html,
                 add_form,
                 meter("ctx", a["ctx_pct"], 80),
-                "".join(meter(w, pct, ceilings.get(win_name(w))) for w, pct in ws)
+                "".join(meter(w, pct, eff.get(win_name(w))) for w, pct in ws)
                 or "<p class='%s text-xs'>reports no quota</p>" % DIM,
                 ("<p class='mt-1.5 text-sm text-error'>stop: %s</p>" % escape(a["stop"]))
                 if a.get("stop") else ""))
@@ -2445,8 +2458,6 @@ def html_task(tid, token="", human=False):
           % "".join(evs) if evs else
           "<p class='%s text-sm'>No events yet.</p>" % DIM)
     oa = d.get("owner_agent")
-    _ceil = {win_name(k): float(v or 0)
-             for k, v in budget(d["project"]).get("ceilings", {}).items()}
     if oa:
         ab = ("<div class='border-t border-base-300 py-2.5'>"
               "<div class='flex flex-wrap items-baseline gap-x-2'>"
@@ -2458,9 +2469,10 @@ def html_task(tid, token="", human=False):
                   "badge-error" if oa.get("status") == "dead" else "badge-ghost",
                   escape(oa.get("status") or ""),
                   meter("ctx", oa.get("ctx_pct"), 80),
-                  # the red line is the project's ceiling for EXACTLY that window — a
-                  # fixed 85 here was the hardcoded threshold T-164 removes everywhere else
-                  "".join(meter(w, pct, _ceil.get(win_name(w)))
+                  # the red line is the project's EFFECTIVE ceiling for exactly that
+                  # window (T-428 review 55) — a fixed 85 here was the hardcoded
+                  # threshold T-164 removes everywhere else
+                  "".join(meter(w, pct, (oa.get("effective_ceilings") or {}).get(win_name(w)))
                           for w, pct in sorted((oa.get("budget") or {}).items())),
                   MONO, DIM, escape(oa.get("last_seen") or "—")))
     else:
