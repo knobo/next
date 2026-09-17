@@ -466,6 +466,8 @@ def agent_grant_add(aid, b):
         to_add = [str(x).strip() for x in raw if str(x).strip()]
     else:
         to_add = [str(raw).strip()]
+    if not to_add:
+        raise Err(400, "grant is required")
     for g in to_add:
         db.execute(
             "INSERT INTO grants (agent, project, grant_name, source) VALUES (?, ?, ?, 'human') "

@@ -403,17 +403,8 @@ grant)
     aid="${POS[0]}"
     grant="${POS[1]}"
   elif [ ${#POS[@]} -eq 1 ]; then
-    if [ -n "$aid" ]; then
-      grant="${POS[0]}"
-    else
-      if [[ "${POS[0]}" =~ ^[a-z]{2}-.+-[0-9a-f]+$ ]] || [[ "${POS[0]}" =~ ^[a-z]{2}-.+-.+$ ]]; then
-        aid="${POS[0]}"
-        grant=""
-      else
-        grant="${POS[0]}"
-        aid=$(agent_id)
-      fi
-    fi
+    grant="${POS[0]}"
+    [ -z "$aid" ] && aid=$(agent_id)
   fi
   [ -n "$aid" ] || die "agent is required (or run inside an agent session)"
   [ -n "$grant" ] || die "grant is required: board grant <agent> <grant> [--project <proj>]"
@@ -434,17 +425,8 @@ revoke)
     aid="${POS[0]}"
     grant="${POS[1]}"
   elif [ ${#POS[@]} -eq 1 ]; then
-    if [ -n "$aid" ]; then
-      grant="${POS[0]}"
-    else
-      if [[ "${POS[0]}" =~ ^[a-z]{2}-.+-[0-9a-f]+$ ]] || [[ "${POS[0]}" =~ ^[a-z]{2}-.+-.+$ ]]; then
-        aid="${POS[0]}"
-        grant=""
-      else
-        grant="${POS[0]}"
-        aid=$(agent_id)
-      fi
-    fi
+    grant="${POS[0]}"
+    [ -z "$aid" ] && aid=$(agent_id)
   fi
   [ -n "$aid" ] || die "agent is required (or run inside an agent session)"
   [ -n "$grant" ] || die "grant is required: board revoke <agent> <grant> [--project <proj>]"

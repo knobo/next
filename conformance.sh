@@ -1491,6 +1491,12 @@ check "cli revoke as human revokes permission" \
   "$(BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" cli revoke $CLIID deploy-cli --json)" \
   '(.grants|index("deploy-cli"))|not'
 BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" cli revoke $CLIID deploy-cli-2 >/dev/null
+check "cli grant single-arg hyphenated grant" \
+  "$(cd "$CLIDIR" && BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" board grant pr-preview-env --json)" \
+  '.grants|index("pr-preview-env")'
+check "cli revoke single-arg hyphenated grant" \
+  "$(cd "$CLIDIR" && BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" board revoke pr-preview-env --json)" \
+  '(.grants|index("pr-preview-env"))|not'
 
 # Clean up after ourselves. A suite that leaves living agents on a shared board makes the
 # NEXT run lose the role ranking against its own ghost.
