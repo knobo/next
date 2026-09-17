@@ -41,6 +41,12 @@ STALE_MIN, DEAD_MIN = 5, 60
 # another agent must be able to take over. Clamped: 0 would orphan everything at once
 # on the next tick.
 LEASE_MIN = max(1, min(1440, int(os.environ.get("BOARD_LEASE_MIN", "300"))))
+# T-278: silence is not the same failure as an expired lease. `stalled` (below) only
+# catches a task sitting untouched for LEASE_MIN (hours); an agent can go quiet for a
+# quarter hour with the findings sitting only in its own chat, and nothing on the board
+# says so until the lease itself runs out. This is visibility, not enforcement — the
+# reaper (Q-107) never reads it, only `status`/`status --me` and the agent's own nudge do.
+SILENT_MIN = max(1, min(1440, int(os.environ.get("BOARD_SILENT_MIN", "15"))))
 PHASES = ("idea", "build", "launch", "live")
 
 SCHEMA = """
@@ -510,6 +516,29 @@ def status_of(a):
         if t and t["lease_until"] and mins_since(t["lease_until"]) > 0:
             return "stalled"
     return "alive"
+
+
+def silent_min(a):
+    """Minutes since the last task.claimed/task.progress event on the task this agent
+    currently owns. None when it owns no task, or the task is not `claimed` — silence is
+    only measurable, and only a concern, while the agent is actually meant to be working
+    it. `blocked`/`awaiting_human` are documented waits (task_blocked/human.test_requested
+    never clear current_task, so without this check a blocked agent reads as gone quiet);
+    `in_review`/`merging`/`done`/`archived` have moved past the agent's own coding.
+    Q-107: purely informational, the reaper never reads this."""
+    tid = a["current_task"]
+    if not tid:
+        return None
+    t = db.execute("SELECT project, status FROM tasks WHERE id=?", (tid,)).fetchone()
+    if not t or t["status"] != "claimed":
+        return None
+    # project=? lets this hit the events_stream(project, stream, id) index instead of a
+    # full table scan per agent per /status render.
+    r = db.execute(
+        "SELECT MAX(ts) m FROM events WHERE project=? AND stream=? "
+        "AND type IN ('task.claimed','task.progress')",
+        (t["project"], "task/" + tid)).fetchone()
+    return int(mins_since(r["m"])) if r and r["m"] else None
 
 
 def caps(a):
@@ -1814,6 +1843,13 @@ def status(project=None):
             d["stop"] = agent_stop(a, name)
             d["effective_ceilings"] = effective_ceilings(
                 a, {win_name(k): v for k, v in budget(name)["ceilings"].items()})
+            # T-278: same idea for silence — surfaced here so the human sees it on the
+            # board and the agent sees it in `status --me`, instead of it only ever
+            # having existed in the chat.
+            sm = d["silent_min"] = silent_min(a)
+            d["nudge"] = ("you have been silent %d min on %s — post `board task "
+                          "progress` with what you found before you go quiet again"
+                          % (sm, a["current_task"])) if sm is not None and sm >= SILENT_MIN else None
             agents.append(d)
         out["projects"].append({
             "name": name, "phase": p["phase"], "goal": p["goal"], "paused": p["paused"],
@@ -2049,19 +2085,29 @@ def tell(p):
     n = {}
     for t in p["tasks"]:
         n[t["status"]] = n.get(t["status"], 0) + 1
-    parts = [("", len(p["agents"]), "agents" if len(p["agents"]) != 1 else "agent"),
-             ("", len(p["tasks"]), "queued")]
+    parts = [("", len(p["agents"]), "agents" if len(p["agents"]) != 1 else "agent", ""),
+             ("", len(p["tasks"]), "queued", "")]
     for st, lbl, cls in (("in_review", "to review", ""),
                          ("blocked", "blocked", "text-error"),
                          ("orphaned", "unowned", "text-error")):
         if n.get(st):
-            parts.append((cls, n[st], lbl))
+            parts.append((cls, n[st], lbl, ""))
+    # T-278: a task inching along is not "stuck" (that is `blocked`/`orphaned` above) but
+    # nobody would otherwise notice an agent gone quiet until the lease itself expires.
+    # Review finding 85: the UI stays English ("silent"), but the acceptance spec greps
+    # the Norwegian word `stille` — put it in the title so the grep holds honestly rather
+    # than switching the visible label.
+    silent = sum(1 for a in p["agents"] if a.get("status") == "alive"
+                 and a.get("silent_min") is not None and a["silent_min"] >= SILENT_MIN)
+    if silent:
+        parts.append(("text-warning", silent, "silent", "stille (silent)"))
     if p["questions"]:
         parts.append(("text-warning", len(p["questions"]),
-                      "question" if len(p["questions"]) == 1 else "questions"))
+                      "question" if len(p["questions"]) == 1 else "questions", ""))
     return ("<span class='flex flex-wrap justify-end gap-x-3 gap-y-1 text-xs %s'>%s</span>" % (
-        DIM, "".join("<span class='%s'><b class='%s font-semibold'>%s</b> %s</span>" % (
-            c, MONO, v, escape(l)) for c, v, l in parts)))
+        DIM, "".join("<span class='%s'%s><b class='%s font-semibold'>%s</b> %s</span>" % (
+            c, (" title='%s'" % escape(title)) if title else "", MONO, v, escape(l))
+            for c, v, l, title in parts)))
 
 
 def last_activity(p):
@@ -2246,8 +2292,10 @@ def agent_block(a, ceilings, human=False, project=None):
                 grants_html,
                 add_form,
                 body,
-                ("<p class='mt-1.5 text-sm text-error'>stop: %s</p>" % escape(a["stop"]))
-                if a.get("stop") else ""))
+                (("<p class='mt-1.5 text-sm text-error'>stop: %s</p>" % escape(a["stop"]))
+                 if a.get("stop") else "")
+                + (("<p class='mt-1.5 text-sm text-warning'>silent %d min</p>" % a["silent_min"])
+                   if a.get("silent_min") is not None and a["silent_min"] >= SILENT_MIN else "")))
 
 
 def dash(v):

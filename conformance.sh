@@ -1446,6 +1446,50 @@ ME_ERR=$(cd "$TMP" && BOARD_AGENT_ID=A-doesnotexist board status --me 2>&1 >"$TM
 if [ "$ME_RC" -ne 0 ] && [ ! -s "$TMP/me.out" ] && [ -n "$ME_ERR" ]; then
   ok "status --me with no agent in the answer fails loudly (exit≠0 + message), not empty"
 else no "status --me with no agent" "rc=$ME_RC out='$(cat "$TMP/me.out")' err='$ME_ERR'"; fi
+
+if [ "$OWN_SERVER" = 1 ]; then
+  # T-278: the board must notice an agent working in silence — a quarter hour of findings
+  # sitting only in the chat, never posted as task.progress. `silent_min` and `.nudge` are
+  # visibility only; the reaper (Q-107) must not act on silence alone.
+  echo "== silent_min: the board notices an agent gone quiet (T-278, Q-107) =="
+  SILT=$(cli task create --title "silent test" --repo web | jq -r .id)
+  cli task claim "$SILT" >/dev/null
+  sql "UPDATE events SET ts='$PAST' WHERE stream='task/$SILT' AND type IN ('task.claimed','task.progress')"
+  check "status --me reports silent_min and nudges the agent" "$(cli status --me)" \
+    '.agent.current_task=="'"$SILT"'" and .agent.silent_min>=20 and (.nudge|test("silent"))'
+  check "the same silent_min shows up in the /status JSON the human sees" \
+    "$(api GET '/status?project=demo')" \
+    '[.projects[0].agents[]|select(.id=="'"$CLIID"'")][0].silent_min>=20'
+  # Review finding 85: the acceptance spec greps the /status HTML page for the Norwegian
+  # word `stille`, but the visible tile label is English ("silent") like the rest of the
+  # UI. The word lives in a title attribute instead, so the grep holds without switching
+  # the page's language.
+  grep -q 'stille' <<<"$(curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=demo")" \
+    && ok "the /status HTML page says 'stille' when an agent is silent" \
+    || no "the /status HTML page does not say 'stille' for a silent agent" ""
+  cli task progress "$SILT" "back at it" >/dev/null
+  check "fresh progress clears the silence and the nudge" "$(cli status --me)" \
+    '.agent.silent_min<2 and .nudge==null'
+  api POST /reap '{}' >/dev/null
+  check "the reaper does not orphan on silence alone (Q-107)" "$(api GET /tasks/$SILT)" \
+    '.status=="claimed" and .owner=="'"$CLIID"'"'
+  sql "UPDATE tasks SET status='done', owner=NULL WHERE id='$SILT'"
+
+  # T-278 review finding 65: task_blocked never clears agents.current_task, so a `blocked`
+  # task (a documented wait, same as awaiting_human) must not read as an agent gone quiet.
+  echo "== silent_min: a blocked task is a documented wait, not silence =="
+  BLKT=$(cli task create --title "blocked silent test" --repo web | jq -r .id)
+  cli task claim "$BLKT" >/dev/null
+  cli task blocked "$BLKT" "waiting for an answer" >/dev/null
+  sql "UPDATE events SET ts='$PAST' WHERE stream='task/$BLKT' AND type IN ('task.claimed','task.progress')"
+  check "a blocked task does not nudge the agent" "$(cli status --me)" \
+    '.agent.current_task=="'"$BLKT"'" and .agent.silent_min==null and .nudge==null'
+  check "a blocked task is not counted in the silent tile" \
+    "$(api GET '/status?project=demo')" \
+    '[.projects[0].agents[]|select(.id=="'"$CLIID"'")][0].silent_min==null'
+  sql "UPDATE tasks SET status='done', owner=NULL WHERE id='$BLKT'"
+fi
+
 check "task create without --project" "$(cli task create --title "cli task" --repo web)" '.id'
 
 # T-201: a `--repo` the manifest does not know is a silent error at creation time that only
