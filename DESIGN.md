@@ -560,6 +560,28 @@ What is left in code: `POST /questions` with `kind: test` answers 400. The colum
 every `awaiting_human` task goes back to `open` (unowned, with a `task.released` event saying
 why), and every still-open `kind: test` question is closed as answered by `board`.
 
+### 5.1 What is waiting on a human belongs on the task's own card (T-500)
+
+Removing the middle stage left the human's work spread across surfaces: the question that blocks
+a task lived in a table `/t/<id>` never looked at, and the command they were meant to run lived in
+the middle of a note. `T-191` stood `blocked` on the same unanswered question six times over nine
+days, and the one page a human opens never mentioned it.
+
+So `GET /tasks/<id>` carries two more fields, and `/t/<id>` opens with them:
+
+- `questions` — every `open`/`defaulted` question with `task = <id>`, each with its `url`. The
+  card links to `/q/<id>`, and `/q/<id>` links back.
+- `commands` — what somebody is expected to run, each with a `why`, each with a copy button.
+  Two sources: what an agent attached with `--cmd` (`board ask`, `board task blocked`,
+  `board task progress`; repeatable, stored in `questions.cmds` and in the event body), and what
+  it wrote in backticks in a note or a spec. The second source is what makes every card written
+  before the flag existed useful, and that is nearly all of them. The head list in `CMD_HEADS` is
+  a whitelist on purpose: `T-191` and `awaiting_human` are backticked on this board too, and a
+  copy button on those is noise on the one surface that must show only what is actually waiting.
+
+The copy button is the only new script on these pages, and it goes inside the one inline script
+the CSP already hashes — `script-src` stays a single `sha256-`, nothing is widened.
+
 ---
 
 ## 6. The `/next` skill in practice

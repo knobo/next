@@ -362,6 +362,9 @@ for sub in $TASK_SUBS; do
     # --project is handled by the shared with_project/project_name idiom, not a per-command
     # `.project` read.
     if [ "$field" = project ] && grep -qE 'with_project|project_name' <<<"$block"; then continue; fi
+    # --cmd is the same shape: parse() collects it and body() folds it into the request,
+    # once for every subcommand (T-500). There is no per-command literal to grep for.
+    if [ "$field" = cmd ] && grep -qE '\bbody\b' <<<"$block"; then continue; fi
     if grep -qF -- "$flag" <<<"$block"; then continue; fi
     FLAG_MISS="$FLAG_MISS $sub:$flag"
   done
@@ -2104,6 +2107,41 @@ REAPPY
 )
   [ -n "$R2" ] && ok "the reaper spawns a task for an overdue routine" || no "the reaper spawns a task for an overdue routine" "task not spawned"
 fi
+
+echo "== what is waiting on a human, on the task's own card (T-500) =="
+# A question that blocks a task lived in a table the task page never looked at, and a
+# command the human was meant to run lived in the middle of a note. T-191 stood blocked
+# on the same unanswered question six times over nine days without its card saying so.
+WAID=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-w","model":"m","session":"sw"}' | jq -r .id)
+WT=$(api POST /tasks "{\"agent\":\"$WAID\",\"project\":\"demo\",\"title\":\"blocked on a human\",\"spec\":\"kjør \`./conformance.sh\` etterpaa, og se paa \`awaiting_human\`\"}" | jq -r .id)
+api POST /tasks/$WT/claim "{\"agent\":\"$WAID\"}" >/dev/null
+WQ=$(api POST /questions "{\"agent\":\"$WAID\",\"project\":\"demo\",\"task\":\"$WT\",\"text\":\"USD eller tokens?\",\"default\":\"tokens\",\"deadline\":\"8h\",\"cmds\":[\"board answer Q-x --answer \\\"tokens\\\"\"]}" | jq -r .id)
+api POST /tasks/$WT/blocked "{\"agent\":\"$WAID\",\"note\":\"needs human\",\"cmds\":[\"cd ui && ./verify.sh\"]}" >/dev/null
+WS=$(api GET /tasks/$WT)
+check "the task carries the question that blocks it" "$WS" "any(.questions[]; .id==\"$WQ\")"
+check "the question carries its url, so the card can link to it" "$WS" \
+  "any(.questions[]; .id==\"$WQ\" and (.url|test(\"/q/$WQ$\")))"
+check "the question's --cmd is on the task" "$WS" \
+  '[.commands[].cmd] | any(test("^board answer"))'
+check "the blocked note's --cmd is on the task" "$WS" \
+  '[.commands[].cmd] | any(. == "cd ui && ./verify.sh")'
+check "a command written in backticks in the spec is picked up too" "$WS" \
+  '[.commands[].cmd] | any(. == "./conformance.sh")'
+check "a backticked word that is not a command is left alone" "$WS" \
+  '[.commands[].cmd] | any(. == "awaiting_human") | not'
+check "every command says where it came from" "$WS" 'all(.commands[]; .why != null and .why != "")'
+check "the same command is never listed twice" "$WS" '([.commands[].cmd]|length) == ([.commands[].cmd]|unique|length)'
+# The page is the whole point: a link to the question, and a button that copies the command.
+WP=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/t/$WT")
+grep -q "waiting on you" <<<"$WP" && ok "/t opens with what is waiting on a human" || no "/t opens with what is waiting on a human" "no panel"
+grep -q "href='/q/$WQ'" <<<"$WP" && ok "/t links to the question that blocks it" || no "/t links to the question that blocks it" "no link"
+grep -q "data-copy='cd ui &amp;&amp; ./verify.sh'" <<<"$WP" && ok "/t offers the command for copying, verbatim" || no "/t offers the command for copying, verbatim" "no copy button"
+WQP=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/q/$WQ")
+grep -q "href='/t/$WT'" <<<"$WQP" && ok "/q links back to the task it blocks" || no "/q links back to the task it blocks" "no back link"
+# An answered question must leave the card: a surface that keeps showing settled work
+# stops being read at all.
+hum POST /questions/$WQ/answer '{"answer":"tokens","by":"human"}' >/dev/null
+check "an answered question leaves the card" "$(api GET /tasks/$WT)" '.questions|length==0'
 
 echo
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
