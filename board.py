@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS questions (
   id TEXT PRIMARY KEY, project TEXT, task TEXT, asked_by TEXT, kind TEXT NOT NULL, card TEXT,
   text TEXT, options TEXT, default_answer TEXT, deadline TEXT, status TEXT,
-  answer TEXT, answered_by TEXT, answered TEXT, read INTEGER DEFAULT 0, created TEXT);
+  answer TEXT, answered_by TEXT, answered TEXT, read INTEGER DEFAULT 0, cmds TEXT,
+  created TEXT);
 CREATE TABLE IF NOT EXISTS roles (
   project TEXT, role TEXT, agent TEXT, source TEXT, pinned_by TEXT, since TEXT, lease_until TEXT,
   PRIMARY KEY (project, role, agent));
@@ -126,7 +127,8 @@ for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
                           ("tasks", "after", "TEXT"),
                           ("tasks", "human", "INTEGER"),
                           ("tasks", "kind", "TEXT"),
-                          ("tasks", "milestone", "TEXT")):
+                          ("tasks", "milestone", "TEXT"),
+                          ("questions", "cmds", "TEXT")):
 
     try:                                # database from before the column existed
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
@@ -1117,6 +1119,81 @@ def task_costs(project=None):
     return {tid: cost_of(dispatches_of(rows)) for tid, rows in per.items()}
 
 
+# A command the human is meant to run has to be ON the card, ready to paste — not
+# reconstructed from prose on a phone (T-500). Two sources, in this order:
+#   1. what an agent attached explicitly: `board ask --cmd`, `board task blocked --cmd`,
+#      `board task progress --cmd`.
+#   2. what it wrote in backticks in a note or a spec. That is where every command on
+#      the board sat before the flag existed, so without this every card written until
+#      now stays as unusable as it was — and that is nearly all of them.
+CMD_HEADS = ("board ", "git ", "gh ", "tea ", "./", "bash ", "sh ", "npm ", "npx ",
+             "pnpm ", "cd ", "curl ", "kubectl ", "docker ", "python3 ", "python ",
+             "make ", "cargo ", "pytest ", "playwright ", "flutter ", "gradle ")
+
+
+def cmds_in(text):
+    """Backtick-quoted spans that really are commands, in the order they appear.
+
+    The head list is deliberately a whitelist: `T-191`, `awaiting_human` and
+    `total_input_tokens` are all backticked on this board too, and a copy button on
+    those is noise on the one surface that must only show what is actually waiting."""
+    out = []
+    for m in re.finditer(r"`+([^`\n]+)`+", text or ""):
+        c = m.group(1).strip()
+        if c.startswith(CMD_HEADS) and len(c) <= 300:
+            out.append(c)
+    return out
+
+
+def as_cmds(v):
+    """`cmds` off the wire: a list, or one command per line in a single string."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = v.splitlines()
+    return [str(c).strip() for c in v if str(c).strip()]
+
+
+def task_cmds(d):
+    """Every command on this card, deduplicated, in the order a human meets them: what
+    the open questions ask for, what the last notes attached explicitly, then what the
+    notes and the spec say in backticks. Capped — a card is a surface to act on, not a
+    log."""
+    out, seen = [], set()
+
+    def add(cmd, why):
+        c = (cmd or "").strip()
+        if c and c not in seen:
+            seen.add(c)
+            out.append({"cmd": c, "why": why})
+    for q in d.get("questions") or []:
+        for c in q.get("cmds") or []:
+            add(c, q["id"])
+    for e in db.execute("SELECT type, body FROM events WHERE stream=? AND type IN "
+                        "('task.blocked','task.progress','task.comment') "
+                        "ORDER BY id DESC LIMIT 20", ("task/" + d["id"],)):
+        for c in as_cmds(jl(e["body"], {}).get("cmds")):
+            add(c, e["type"].split(".")[-1])
+    for e in d.get("events") or []:
+        for c in cmds_in(e.get("note")):
+            add(c, "note")
+    for c in cmds_in(d.get("spec")):
+        add(c, "spec")
+    return out[:12]
+
+
+def task_questions(tid):
+    """The questions that are still waiting on a human for THIS task. They were only ever
+    reachable from /status, which lists every project's — so a card that had been blocked
+    on the same question for nine days said nothing about it (T-191)."""
+    return [{"id": r["id"], "kind": r["kind"], "status": r["status"], "text": r["text"],
+             "default_answer": r["default_answer"], "deadline": r["deadline"],
+             "answer": r["answer"], "url": "%s/q/%s" % (BASE_URL, r["id"]),
+             "cmds": as_cmds(jl(r["cmds"], []))}
+            for r in db.execute("SELECT * FROM questions WHERE task=? AND "
+                                "status IN ('open','defaulted') ORDER BY id", (tid,))]
+
+
 def task_show(tid):
     """Everything another agent needs to take over, including the last progress note —
     reference/takeover.md asks for it, and before this it only lived in the event log."""
@@ -1160,6 +1237,9 @@ def task_show(tid):
             "SELECT ts, type, actor, body FROM events WHERE stream=? AND type<>'agent.heartbeat' "
             "ORDER BY id DESC LIMIT 200", ("task/" + tid,))][::-1]
     d["waiting_on"] = waiting_on(t)
+    d["questions"] = task_questions(tid)
+    d["commands"] = task_cmds(d)
+    d["url"] = "%s/t/%s" % (BASE_URL, tid)
     ost, oa = owner_view(t)
     d["owner_status"] = ost
     d["owner_agent"] = oa
@@ -1426,7 +1506,8 @@ def task_progress(tid, aid, b):
                       % (", ".join(locked), t["status"]))
         dispatch = dispatch_of(b)
         ev(t["project"], "task/" + tid, "task.progress", aid, note=b.get("note"),
-           dispatch=dispatch, result=b.get("result"))
+           dispatch=dispatch, result=b.get("result"),
+           cmds=as_cmds(b.get("cmds")) or None)
         return {"ok": True}
     owns(t, aid)
     dispatch = dispatch_of(b)
@@ -1438,7 +1519,8 @@ def task_progress(tid, aid, b):
                 plus(LEASE_MIN), now(), tid))
     ev(t["project"], "task/" + tid, "task.progress", aid, note=b.get("note"),
        worktree=b.get("worktree"), branch=b.get("branch"), pr=b.get("pr"),
-       dispatch=dispatch, result=b.get("result"))
+       dispatch=dispatch, result=b.get("result"),
+       cmds=as_cmds(b.get("cmds")) or None)
     return {"ok": True}
 
 
@@ -1582,7 +1664,8 @@ def task_blocked(tid, aid, b):
     else:
         owns(t, aid)
         db.execute("UPDATE tasks SET status='blocked', updated=? WHERE id=?", (now(), tid))
-    ev(t["project"], "task/" + tid, "task.blocked", aid, note=b.get("note"))
+    ev(t["project"], "task/" + tid, "task.blocked", aid, note=b.get("note"),
+       cmds=as_cmds(b.get("cmds")) or None)
     ntfy("⛔ %s %s blocked" % (t["project"], tid), b.get("note") or t["title"],
          "%s/t/%s" % (BASE_URL, tid))
     return {"ok": True}
@@ -1913,7 +1996,8 @@ def question_create(b, actor):
         raise Err(400, m)
     qid = next_id("Q-", "questions")
     db.execute("""INSERT INTO questions (id,project,task,asked_by,kind,text,options,
-                  default_answer,deadline,status,created) VALUES (?,?,?,?,?,?,?,?,?,'open',?)""",
+                  default_answer,deadline,status,cmds,created)
+                  VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)""",
                (qid, project, b.get("task"), actor, kind,
                 # Both spellings. The column, the status payload and `board status --json`
                 # all say `default_answer`; only the request field said `default`. Anyone
@@ -1922,7 +2006,7 @@ def question_create(b, actor):
                 # self-answers, so the agent blocks on it until a human appears.
                 b.get("text"), json.dumps(b.get("options", [])),
                 b.get("default") or b.get("default_answer"),
-                deadline_of(b.get("deadline")), now()))
+                deadline_of(b.get("deadline")), json.dumps(as_cmds(b.get("cmds"))), now()))
     ev(project, "question/" + qid, "question.asked", actor, kind=kind, task=b.get("task"),
        text=b.get("text"))
     ntfy("❓ %s %s" % (project, b.get("task") or ""), b.get("text", ""),
@@ -3299,6 +3383,70 @@ def size_cell(t, human, back):
                 escape(t["id"]), escape(back), MONO, escape(t["id"]), opts, DIM, c))
 
 
+def cmd_list(cmds):
+    """The commands as fenced blocks, so they get the same highlight and per-block
+    Kopier button (numbered 1/n in order) as a ```sh block in a spec. Nobody retypes
+    `board answer Q-199 --answer "..."` off a phone out of a paragraph of prose (T-500)."""
+    if not cmds:
+        return ""
+    # A fence line inside a command would end the block early; defuse it.
+    safe = [re.sub(r"(?m)^(\s*)```", "\\1\u200b```", c["cmd"]) for c in cmds]
+    return "<div class='mt-3'>%s</div>" % md("\n".join("```sh\n%s\n```" % c for c in safe))
+
+
+def waiting_q(q):
+    """One open question, on the card of the task it blocks. The warning edge is the
+    board's mark for 'this is a human's job' — the same one q_card uses on /status."""
+    badge = ("<span class='badge badge-sm badge-warning'>board answered</span>"
+             if q["status"] == "defaulted" else
+             "<span class='badge badge-sm badge-ghost'>%s</span>" % escape(q["kind"] or ""))
+    foot = (("the board answered \u201c%s\u201d — answering now overrides it"
+             % (q["answer"] or "")) if q["status"] == "defaulted" else
+            ("nobody has answered; the agent carries on with: %s"
+             % (q["default_answer"] or "\u2014")))
+    return ("<div class='mt-3 rounded-box border border-base-300 border-l-4 "
+            "border-l-warning bg-base-200 p-4'>"
+            "<h3 class='mb-2 text-base font-semibold'>"
+            "<a class='%s %s' href='/q/%s'>%s</a> %s</h3>"
+            "<p class='max-w-[68ch]'>%s</p>"
+            "<p class='%s mt-2 text-sm'>%s</p>"
+            "<a class='btn btn-outline mt-3 min-h-12' href='/q/%s'>Answer %s</a></div>" % (
+                LINK, MONO, escape(q["id"]), escape(q["id"]), badge,
+                escape(q["text"] or ""), DIM, escape(foot),
+                escape(q["id"]), escape(q["id"])))
+
+
+def waiting_block(d):
+    """Everything on this task that is waiting on a human, at the top of its own card:
+    the questions that block it, the note that blocked it, and the commands to run.
+
+    They all existed before — the question in a table nothing linked to from here, the
+    command in the middle of a paragraph — but the card said nothing, and T-191 stood
+    blocked on the same unanswered question six times over nine days without the one page
+    a human opens ever mentioning it (T-500)."""
+    qs, cmds = d.get("questions") or [], d.get("commands") or []
+    blocked = ""
+    if d.get("status") == "blocked":
+        note = next((e.get("note") for e in reversed(d.get("events") or [])
+                     if e["type"] == "task.blocked" and e.get("note")), "")
+        blocked = ("<div class='mt-3 rounded-box border border-base-300 border-l-4 "
+                   "border-l-error bg-base-200 p-4'>"
+                   "<h3 class='mb-2 text-base font-semibold'>blocked</h3>"
+                   "<p class='max-w-[68ch]'>%s</p></div>"
+                   % escape(note or d.get("title") or ""))
+    if not (qs or cmds or blocked):
+        return ""
+    body = "".join(waiting_q(q) for q in qs) + blocked
+    if cmds:
+        body += ("<div class='mt-3 rounded-box border border-base-300 border-l-4 "
+                 "border-l-warning bg-base-200 p-4'>"
+                 "<h3 class='mb-2 text-base font-semibold'>commands to run</h3>"
+                 "<p class='%s text-sm'>Press Kopier, paste into a terminal.</p>%s</div>"
+                 % (DIM, cmd_list(cmds)))
+    return "<p class='%s'>%s</p>%s" % (
+        LBL, "waiting on you" if (qs or blocked) else "commands", body)
+
+
 def q_card(q, answer=None):
     """The question card is the ONLY surface on the board that is a human's job, and that
     is why it is the only one that gets the accent edge. The edge carries the meaning; it
@@ -3313,7 +3461,10 @@ def q_card(q, answer=None):
                 LINK, MONO, escape(q["id"]), escape(q["id"]),
                 " <span class='badge badge-sm badge-warning'>board answered</span>"
                 if answer is not None else "",
-                DIM, escape(q["kind"]), DIM, MONO, escape(q["task"] or "—"),
+                DIM, escape(q["kind"]), DIM, MONO,
+                ("<a class='%s' href='/t/%s'>%s</a>" % (LINK, escape(q["task"]),
+                                                        escape(q["task"])))
+                if q["task"] else "—",
                 DIM, when(q.get("created")) or "—",
                 ("<dt class='%s'>board's answer<dd>%s" % (DIM, escape(answer)))
                 if answer is not None else "",
@@ -4141,7 +4292,7 @@ def html_task(tid, token="", human=False, project=""):
         prose(d.get("spec"), "md-spec"),
         "".join("<dt class='%s'>%s<dd class='m-0 [overflow-wrap:anywhere]'>%s" % (DIM, k, v)
                 for k, v in facts),
-        task_controls(d, human, project) + plan_form(d, human),
+        waiting_block(d) + task_controls(d, human, project) + plan_form(d, human),
         LBL, cost_block(d), LBL, tl, LBL, ab, escape(d["id"]), LBL, FOCUS))
 
 
@@ -4149,8 +4300,11 @@ def html_question(qid, token="", human=False):
     q = db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     if not q:
         raise Err(404, "unknown question")
+    back = (("<a class='%s %s' href='/t/%s'>%s</a>" % (LINK, MONO, escape(q["task"]),
+                                                      escape(q["task"])))
+            if q["task"] else "")
     if q["status"] not in ("open", "defaulted"):
-        return page(qid, head(qid, human=human) + (
+        return page(qid, head(qid, back, human=human) + (
             "<div class='mt-5 max-w-[42rem] rounded-box border border-base-300 bg-base-200 p-4'>"
             "<p class='text-lg'>Answered: <b class='font-semibold'>%s</b></p>"
             "<p class='%s mt-1 text-sm'>%s</p></div>" % (
@@ -4178,13 +4332,16 @@ def html_question(qid, token="", human=False):
             <input id=freetext class='input w-full' type=text name=answer
               placeholder='your answer'>
             <button class='btn btn-outline mt-3 min-h-12'>Send answer</button>
-          </form>%s</div>""" % (
+          </form>%s%s</div>%s%s""" % (
         # head() escapes on its own. This was the only call site that pre-escaped, and a
         # project name with & or < was then double-escaped and shown as "A&amp;amp;B" in
         # the browser. Project names are not validated, so it really can happen.
-        head(q["project"], "<span class='%s %s text-xs'>%s</span>" % (
-            MONO, DIM, escape(q["task"] or "")), human=human),
-        md(q["text"]), qid, opts, LBL, foot))
+        head(q["project"], "<span class='%s text-xs'>%s</span>" % (DIM, back), human=human),
+        md(q["text"]), qid, opts, LBL, foot,
+        cmd_list([{"cmd": c, "why": qid} for c in as_cmds(jl(q["cmds"], []))]),
+        ("<a class='btn btn-outline mt-4 min-h-12' href='/t/%s'>Task %s</a>"
+         % (escape(q["task"]), escape(q["task"]))) if q["task"] else "",
+        FOCUS))
 
 
 # ---------- routes --------------------------------------------------------
