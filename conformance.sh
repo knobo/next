@@ -981,6 +981,16 @@ check "an agent token can NOT pin a role" \
   "$(hapi PUT /roles/coordinator "$TOKEN" "{\"project\":\"p\",\"agent\":\"$HA\"}")" '.needs_human_token==true'
 check "the human token can pin" \
   "$(hapi PUT /roles/coordinator "$HT" "{\"project\":\"p\",\"agent\":\"$HA\"}")" '.source=="pinned"'
+check "an agent token can NOT grant permissions" \
+  "$(hapi POST "/agents/$HA/grants" "$TOKEN" '{"grant":"merge"}')" '.needs_human_token==true'
+check "the human token can grant permissions" \
+  "$(hapi POST "/agents/$HA/grants" "$HT" '{"grant":"merge"}')" '.grants|index("merge")'
+check "grants GET returns the granted permissions" \
+  "$(hapi GET "/agents/$HA/grants?project=p" "$TOKEN")" '.grants|index("merge")'
+check "an agent token can NOT revoke permissions" \
+  "$(hapi DELETE "/agents/$HA/grants/merge?project=p" "$TOKEN")" '.needs_human_token==true'
+check "the human token can revoke permissions" \
+  "$(hapi DELETE "/agents/$HA/grants/merge?project=p" "$HT")" '(.grants|index("merge"))|not'
 HQ=$(hapi POST /questions "$TOKEN" "{\"agent\":\"$HA\",\"project\":\"p\",\"text\":\"ok?\"}" | jq -r .id)
 check "an agent cannot answer AS the human" \
   "$(hapi POST "/questions/$HQ/answer" "$TOKEN" '{"answer":"yes","by":"human"}')" '.needs_human_token==true'
@@ -1452,9 +1462,41 @@ DOWN2=$(cd "$CLIDIR" && BOARD_URL="http://localhost:$P503" board task pr "$CT" 2
 if [ "$DRC2" -ne 0 ] && grep -q 'the board is down' <<<"$DOWN2"; then
   ok "a command that touches git refuses to act on a cached answer"
 else no "task pr against a board that is down" "rc=$DRC2 $DOWN2"; fi
+DOWN_GRANT=$(cd "$CLIDIR" && BOARD_URL="http://localhost:$P503" board grant $CLIID deploy-cli 2>&1); DG_RC=$?
+if [ "$DG_RC" -ne 0 ] && grep -q "grant/revoke is never queued" <<<"$DOWN_GRANT"; then
+  ok "cli grant against board down is never queued"
+else no "cli grant against board down" "rc=$DG_RC out='$DOWN_GRANT'"; fi
 CACHED=$(cd "$CLIDIR" && board task show "$CT" --json 2>/dev/null)
 check "the error page never landed in the cache" "$CACHED" '.stale != true and (.error|not)'
 kill $DOWNPID 2>/dev/null
+
+check "cli grants shows policy grants" "$(cli grants --json)" '.grants|index("merge")'
+G_ERR=$(cli grant $CLIID deploy-cli 2>&1); G_RC=$?
+if [ "$G_RC" -ne 0 ] && grep -q "needs_human_token" <<<"$G_ERR"; then
+  ok "cli grant without human token is refused"
+else no "cli grant without human token" "rc=$G_RC out='$G_ERR'"; fi
+check "cli grant as human grants permission" \
+  "$(BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" cli grant $CLIID deploy-cli --json)" \
+  '.grants|index("deploy-cli")'
+TERSE_G=$(BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" cli grant $CLIID deploy-cli-2)
+if grep -q "deploy-cli-2" <<<"$TERSE_G"; then
+  ok "cli grant produces terse output"
+else no "cli grant terse" "$TERSE_G"; fi
+check "cli grants shows newly granted permission" "$(cli grants --json)" '.grants|index("deploy-cli")'
+R_ERR=$(cli revoke $CLIID deploy-cli 2>&1); R_RC=$?
+if [ "$R_RC" -ne 0 ] && grep -q "needs_human_token" <<<"$R_ERR"; then
+  ok "cli revoke without human token is refused"
+else no "cli revoke without human token" "rc=$R_RC out='$R_ERR'"; fi
+check "cli revoke as human revokes permission" \
+  "$(BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" cli revoke $CLIID deploy-cli --json)" \
+  '(.grants|index("deploy-cli"))|not'
+BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" cli revoke $CLIID deploy-cli-2 >/dev/null
+check "cli grant single-arg hyphenated grant" \
+  "$(cd "$CLIDIR" && BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" board grant pr-preview-env --json)" \
+  '.grants|index("pr-preview-env")'
+check "cli revoke single-arg hyphenated grant" \
+  "$(cd "$CLIDIR" && BOARD_AS_HUMAN=1 BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" board revoke pr-preview-env --json)" \
+  '(.grants|index("pr-preview-env"))|not'
 
 # Clean up after ourselves. A suite that leaves living agents on a shared board makes the
 # NEXT run lose the role ranking against its own ghost.

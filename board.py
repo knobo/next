@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS agents (
   last_seen TEXT, status TEXT, registered TEXT,
   ctx_pct REAL, budget TEXT, current_task TEXT);
 CREATE TABLE IF NOT EXISTS grants (
-  agent TEXT, project TEXT, grant_name TEXT, PRIMARY KEY (agent, project, grant_name));
+  agent TEXT, project TEXT, grant_name TEXT, source TEXT DEFAULT 'policy', PRIMARY KEY (agent, project, grant_name));
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, project TEXT, repo TEXT, title TEXT, spec TEXT, status TEXT,
   requires TEXT, needs_grants TEXT, touches TEXT, risk TEXT, owner TEXT, lease_until TEXT,
@@ -94,7 +94,8 @@ db.create_function("ulower", 1, lambda v: v.lower() if isinstance(v, str) else v
 db.executescript(SCHEMA)
 for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
                           ("agents", "budget", "TEXT"),
-                          ("tasks", "routine", "TEXT")):
+                          ("tasks", "routine", "TEXT"),
+                          ("grants", "source", "TEXT DEFAULT 'policy'")):
 
     try:                                # database from before the column existed
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
@@ -187,9 +188,9 @@ def pr_html(pr):
     return escape(label)
 
 
-def ev(project, stream, type_, actor, **body):
+def ev(project_, stream, type_, actor, **body):
     db.execute("INSERT INTO events (ts,project,stream,type,actor,body) VALUES (?,?,?,?,?,?)",
-               (now(), project or "_global", stream, type_, actor, json.dumps(body)))
+               (now(), project_ or "_global", stream, type_, actor, json.dumps(body)))
 
 
 def policy():
@@ -444,6 +445,49 @@ def agent_grants(aid, project):
         "SELECT grant_name FROM grants WHERE agent=? AND project=?", (aid, project))}
 
 
+def agent_grants_get(aid, q):
+    a = agent(aid)
+    project = q.get("project", [None])[0] or a["current_project"]
+    return {"id": aid, "project": project, "grants": sorted(agent_grants(aid, project))}
+
+
+def agent_grant_add(aid, b):
+    b = b or {}
+    human_only(b, "granting permissions")
+    a = agent(aid)
+    project = b.get("project") or a["current_project"]
+    ensure_project(project)
+    raw = b.get("grant") or b.get("grants")
+    if not raw:
+        raise Err(400, "grant is required")
+    if isinstance(raw, str):
+        to_add = [x.strip() for x in raw.split(",") if x.strip()]
+    elif isinstance(raw, list):
+        to_add = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        to_add = [str(raw).strip()]
+    if not to_add:
+        raise Err(400, "grant is required")
+    for g in to_add:
+        db.execute(
+            "INSERT INTO grants (agent, project, grant_name, source) VALUES (?, ?, ?, 'human') "
+            "ON CONFLICT(agent, project, grant_name) DO UPDATE SET source='human'",
+            (aid, project, g)
+        )
+        ev(project, "agent/" + aid, "agent.granted", HUMAN, grant=g, project=project)
+    return {"id": aid, "project": project, "grants": sorted(agent_grants(aid, project))}
+
+
+def agent_grant_del(aid, grant, b, q):
+    human_only(b or {}, "revoking permissions")
+    a = agent(aid)
+    project = (b or {}).get("project") or q.get("project", [None])[0] or a["current_project"]
+    ensure_project(project)
+    db.execute("DELETE FROM grants WHERE agent=? AND project=? AND grant_name=?", (aid, project, grant))
+    ev(project, "agent/" + aid, "agent.revoked", HUMAN, grant=grant, project=project)
+    return {"id": aid, "project": project, "grants": sorted(agent_grants(aid, project))}
+
+
 def same_project(a, project):
     """§3.2: an agent cannot touch another project's tasks by accident."""
     if project and a["current_project"] and project != a["current_project"]:
@@ -470,12 +514,13 @@ def register(b):
                (aid, harness, host, b.get("model"), session, project,
                 json.dumps(b.get("capabilities", [])), b.get("preference"), now(), now()))
     ensure_project(project)
-    db.execute("DELETE FROM grants WHERE agent=? AND project=?", (aid, project))
+    db.execute("DELETE FROM grants WHERE agent=? AND project=? AND (source='policy' OR source IS NULL)", (aid, project))
     g = grants_for(harness, host, project)
-    db.executemany("INSERT INTO grants VALUES (?,?,?)", [(aid, project, x) for x in g])
+    db.executemany("INSERT OR IGNORE INTO grants (agent, project, grant_name, source) VALUES (?,?,?,'policy')", [(aid, project, x) for x in g])
+    all_g = sorted(agent_grants(aid, project))
     ev(project, "agent/" + aid, "agent.registered", aid, harness=harness, host=host,
-       model=b.get("model"), capabilities=b.get("capabilities", []), grants=g)
-    return {"id": aid, "grants": g, "project": project}
+       model=b.get("model"), capabilities=b.get("capabilities", []), grants=all_g)
+    return {"id": aid, "grants": all_g, "project": project}
 
 
 def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=None):
@@ -2506,6 +2551,9 @@ ROUTES = [
     ("POST",   r"/agents/([^/]+)/heartbeat$",   lambda h, m, b, q: heartbeat(m[0], b)),
     ("PUT",    r"/agents/([^/]+)/capabilities$",lambda h, m, b, q: set_caps(m[0], b)),
     ("PUT",    r"/agents/([^/]+)/preference$",  lambda h, m, b, q: set_pref(m[0], b)),
+    ("GET",    r"/agents/([^/]+)/grants$",      lambda h, m, b, q: agent_grants_get(m[0], q)),
+    ("POST",   r"/agents/([^/]+)/grants$",      lambda h, m, b, q: agent_grant_add(m[0], b)),
+    ("DELETE", r"/agents/([^/]+)/grants/([^/]+)$", lambda h, m, b, q: agent_grant_del(m[0], m[1], b, q)),
     ("POST",   r"/agents/cleanup$",             lambda h, m, b, q: agents_cleanup(
         (b or {}).get("project") or q.get("project", [None])[0],
         (b or {}).get("older_than") or q.get("older_than", ["24h"])[0], b)),

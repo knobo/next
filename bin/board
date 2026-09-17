@@ -188,6 +188,7 @@ offline() {  # the board is not answering
   fi
   case "$path" in
     /roles/*/claim) echo '{"error":"board down — a role claim is never queued (DESIGN §3.8)"}' >&2; return 1;;
+    /agents/*/grants*) echo '{"error":"board down — grant/revoke is never queued"}' >&2; return 1;;
   esac
   jq -nc --arg m "$method" --arg p "$path" --arg d "$data" '{method:$m,path:$p,body:$d}' >> "$OUTBOX"
   echo '{"queued":true}'
@@ -389,6 +390,64 @@ finished)
 inbox)
   parse "$@"; as=$(jq -r '.as // empty' <<<"$(body)")
   req GET "/agents/$(agent_id)/inbox${as:+?as=$as}" ;;
+
+grant)
+  # board grant <agent> <grant> [--project <proj>] [--json]
+  # board grant <grant> [--agent <agent>] [--project <proj>] [--json]
+  parse "$@"
+  b=$(body)
+  aid=$(jq -r '.agent // empty' <<<"$b")
+  proj=$(project_name "$(jq -r '.project // empty' <<<"$b")")
+  grant=""
+  if [ ${#POS[@]} -ge 2 ]; then
+    aid="${POS[0]}"
+    grant="${POS[1]}"
+  elif [ ${#POS[@]} -eq 1 ]; then
+    grant="${POS[0]}"
+    [ -z "$aid" ] && aid=$(agent_id)
+  fi
+  [ -n "$aid" ] || die "agent is required (or run inside an agent session)"
+  [ -n "$grant" ] || die "grant is required: board grant <agent> <grant> [--project <proj>]"
+  b_req=$(jq -nc --arg g "$grant" ${proj:+--arg p "$proj"} '{grant:$g} + (if $p then {project:$p} else {} end)')
+  r=$(req POST "/agents/$aid/grants" "$b_req") || { echo "$r"; exit 1; }
+  jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
+  jq -r '"\(.id) (\(.project)): " + (.grants | join(" "))' <<<"$r" ;;
+
+revoke)
+  # board revoke <agent> <grant> [--project <proj>] [--json]
+  # board revoke <grant> [--agent <agent>] [--project <proj>] [--json]
+  parse "$@"
+  b=$(body)
+  aid=$(jq -r '.agent // empty' <<<"$b")
+  proj=$(project_name "$(jq -r '.project // empty' <<<"$b")")
+  grant=""
+  if [ ${#POS[@]} -ge 2 ]; then
+    aid="${POS[0]}"
+    grant="${POS[1]}"
+  elif [ ${#POS[@]} -eq 1 ]; then
+    grant="${POS[0]}"
+    [ -z "$aid" ] && aid=$(agent_id)
+  fi
+  [ -n "$aid" ] || die "agent is required (or run inside an agent session)"
+  [ -n "$grant" ] || die "grant is required: board revoke <agent> <grant> [--project <proj>]"
+  r=$(req DELETE "/agents/$aid/grants/$grant${proj:+?project=$proj}") || { echo "$r"; exit 1; }
+  jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
+  jq -r '"\(.id) (\(.project)): " + (.grants | join(" "))' <<<"$r" ;;
+
+grants)
+  # board grants [agent] [--project <proj>] [--json]
+  parse "$@"
+  b=$(body)
+  aid=$(jq -r '.agent // empty' <<<"$b")
+  proj=$(project_name "$(jq -r '.project // empty' <<<"$b")")
+  if [ -n "${POS[0]:-}" ]; then
+    aid="${POS[0]}"
+  fi
+  [ -z "$aid" ] && aid=$(agent_id)
+  [ -n "$aid" ] || die "agent is required: board grants [agent] [--project <proj>]"
+  r=$(req GET "/agents/$aid/grants${proj:+?project=$proj}") || { echo "$r"; exit 1; }
+  jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
+  jq -r '"\(.id) (\(.project)): " + (.grants | join(" "))' <<<"$r" ;;
 
 agent|agents)
   sub="${1:-}"; shift || true; parse "$@"
