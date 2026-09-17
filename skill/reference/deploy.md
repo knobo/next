@@ -1,6 +1,6 @@
 # Deploy and downtime
 
-Loaded at step 12, when the project declares `deploy` in its manifest.
+Loaded at step 13, when the project declares `deploy` in its manifest.
 
 ## Downtime tolerance follows the phase
 

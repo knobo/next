@@ -48,10 +48,14 @@ The loop in SKILL.md is the same for everyone. Only these lines differ:
 
 | Role | Which tasks | Who types the code | Merges? |
 |---|---|---|---|
-| `coordinator` | `board task next` — anything you qualify for, orphans first | a dispatched subagent (step 5) | yes, after the gate |
-| `implementer` | same queue, but you take the task and **write the code yourself** — skip step 5, do the work in your own worktree | you | no — hand it over (below) |
+| `coordinator` | `board task next` — anything you qualify for, orphans first | a dispatched subagent (step 6) | yes, after the gate |
+| `implementer` | same queue, but you take the task and **write the code yourself** — skip step 6, do the work in your own worktree | you | no — hand it over (below) |
 | `reviewer` | `board task list --status in_review` first | nobody; you are READ-ONLY (`prompts/reviewer.md` applies to you) | no |
 | `tester` | tasks with `requires: browser-test`, and open cards in `board tests` | nobody; you run the tests | no |
+
+Whoever writes the code plans first (loop step 4), and the plan goes on the board before the
+first edit. An implementer has no coordinator holding a plan for them — so theirs is the only
+one there is, and a takeover has nothing else to read.
 
 **The implementer's hand-off is two commands, and the second one is not optional:**
 `board task progress $T --status in_review --note "<what you did, what you verified>"`, then
