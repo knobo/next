@@ -16,8 +16,8 @@ POLICY    = os.environ.get("BOARD_POLICY", "board-policy.json")
 NTFY_URL  = os.environ.get("NTFY_URL", "")
 NTFY_AUTH = os.environ.get("NTFY_AUTH", "")
 # A token only the human holds. Without it `by: "<human>"` is a claim any agent can
-# write, and then it can pin itself as coordinator or answer its own risk=high
-# question and open the merge gate (T-71, T-72, T-143, Q-156).
+# write, and then it can pin itself as coordinator or answer its own question in the
+# human's name (T-71, T-72, T-143, Q-156).
 HUMAN_TOKEN = os.environ.get("BOARD_HUMAN_TOKEN", "")          # "Bearer tk_..." or "Basic ..."
 # The human's name on the board: the actor string that shows up in events,
 # `answered_by`, `pinned_by` and on the HTML pages. Configurable because the owner of
@@ -42,8 +42,6 @@ STALE_MIN, DEAD_MIN = 5, 60
 # on the next tick.
 LEASE_MIN = max(1, min(1440, int(os.environ.get("BOARD_LEASE_MIN", "300"))))
 PHASES = ("idea", "build", "launch", "live")
-# §3.6: which risk levels require a human OK before merge, per phase.
-HUMAN_MERGE = {"idea": (), "build": (), "launch": ("high",), "live": ("low", "normal", "high")}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -60,6 +58,8 @@ CREATE TABLE IF NOT EXISTS agents (
   ctx_pct REAL, budget TEXT, current_task TEXT);
 CREATE TABLE IF NOT EXISTS grants (
   agent TEXT, project TEXT, grant_name TEXT, source TEXT DEFAULT 'policy', PRIMARY KEY (agent, project, grant_name));
+-- tasks.human_test and questions.kind='test'/card are legacy from the removed test stage
+-- (T-352). Kept so old databases load; nothing reads or writes them any more.
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, project TEXT, repo TEXT, title TEXT, spec TEXT, status TEXT,
   requires TEXT, needs_grants TEXT, touches TEXT, risk TEXT, owner TEXT, lease_until TEXT,
@@ -110,6 +110,30 @@ if {"rl5_pct", "rl7_pct"} <= _cols:      # T-164: existing database, old columns
         if _r["rl7_pct"] is not None:
             _ws.append({"window": "7d", "used_pct": _r["rl7_pct"]})
         db.execute("UPDATE agents SET budget=? WHERE id=?", (json.dumps(_ws), _r["id"]))
+# T-352: the human test stage is gone, and nothing moves a task out of `awaiting_human`
+# any more. These rows are not fresh work: a PR means the task is `in_review`, a
+# worktree/branch with no PR means it was `orphaned` (matches how the reaper and
+# task_claim already treat existing work — see agents_cleanup and task_next). Only a
+# row with neither goes back to `open`. Idempotent: a second boot finds no rows.
+_NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+for _r in db.execute("SELECT id, project, pr, branch, worktree FROM tasks "
+                     "WHERE status='awaiting_human'").fetchall():
+    if _r["pr"]:
+        _status = "in_review"
+    elif _r["branch"] or _r["worktree"]:
+        _status = "orphaned"
+    else:
+        _status = "open"
+    db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=%s "
+               "WHERE id=?" % _NOW, (_status, _r["id"]))
+    db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (_r["id"],))
+    db.execute("INSERT INTO events (ts,project,stream,type,actor,body) VALUES (%s,?,?,?,?,?)" % _NOW,
+               (_r["project"] or "_global", "task/" + _r["id"],
+                "task.orphaned" if _status == "orphaned" else "task.released", "board",
+                json.dumps({"note": "human test stage removed (T-352)", "status": _status})))
+db.execute("UPDATE questions SET status='answered', answered_by='board', read=1, answered=%s, "
+           "answer='withdrawn: human test stage removed (T-352)' "
+           "WHERE kind='test' AND status='open'" % _NOW)
 db.commit()
 
 
@@ -685,8 +709,8 @@ def agents_cleanup(project=None, older_than="24h", b=None):
             m = mins_since(a["last_seen"])
             if m >= min_mins:
                 for t in db.execute("SELECT id, status FROM tasks WHERE owner=?", (a["id"],)):
-                    keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "orphaned"
-                    db.execute("UPDATE tasks SET status=?, owner=NULL, human_test=NULL, lease_until=NULL, updated=? WHERE id=?",
+                    keep = t["status"] if t["status"] == "in_review" else "orphaned"
+                    db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                                (keep, now(), t["id"]))
                     db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (t["id"],))
                     ev(a["current_project"], "task/" + t["id"], "task." + ("released" if keep != "orphaned" else "orphaned"),
@@ -746,8 +770,8 @@ def task_create(b, actor):
         raise Err(400, "project and title are mandatory")
     ensure_project(project)
     # Only on what comes from outside. The board itself creates follow-up tasks that
-    # INHERIT the repo from a task already on the board (a FAIL on a test card for a done
-    # task). If the manifest's `repos` shrinks afterwards, the human's FAIL message must
+    # INHERIT the repo from a task already on the board (an overridden default on a done
+    # task). If the manifest's `repos` shrinks afterwards, the human's answer must
     # not blow up with a 400 and roll back the whole write — the repo is not their input.
     if actor != "board":
         check_repo(project, b.get("repo"))
@@ -1147,16 +1171,13 @@ def gate_merge(tid, aid):
         owns(t, aid)
     except Err as e:
         reasons.append(e.body["error"])
-    if t["human_test"] == "fail":
-        reasons.append("the human test failed — file a new card after the fix")
     # "One PR merged at a time" is a prompt rule PER agent. With several agents in the
     # same project a mechanical mutex is needed: two simultaneous merges invalidate each
     # other's worktrees and leave a rebase tangle nobody asked for. The lock is released
     # by `done`, and by the reaper if whoever held it died.
     # The lock covers the merge window itself, not the rest of the task. If merge_sha is
-    # set the merge HAS landed — what remains (deploy, test card, done) does not touch
-    # anyone else's branches, and `done` can wait on a human for hours. Without this one
-    # task with an open test card locked the whole queue for everyone else.
+    # set the merge HAS landed — what remains (deploy, done) does not touch anyone
+    # else's branches, and holding the lock through it locked the queue for everyone.
     other = db.execute("SELECT id, owner FROM tasks WHERE project=? AND status='merging' "
                        "AND merge_sha IS NULL AND id<>?", (t["project"], tid)).fetchone()
     if other:
@@ -1187,9 +1208,6 @@ def gate_merge(tid, aid):
             reasons.append("the agent lacks the merge grant in %s" % t["project"])
         if not set(jl(t["needs_grants"])) <= agent_grants(aid, t["project"]):
             reasons.append("missing grants: %s" % ",".join(jl(t["needs_grants"])))
-    if (t["risk"] or "normal") in HUMAN_MERGE[phase] and t["human_test"] != "ok":
-        reasons.append("phase %s requires a human-OK for risk=%s (board test request)"
-                       % (phase, t["risk"]))
     # Simplification: CI status is not yet queried from Forgejo (needs forge credentials
     # on the board). Branch protection is the mechanical safeguard meanwhile — §8.1.
     return {"ok": not reasons, "reasons": reasons, "phase": phase, "risk": t["risk"]}
@@ -1324,13 +1342,10 @@ def release(tid, aid, b):
     """Release IS the implementer→coordinator hand-off: a task that stands `in_review`
     keeps its status and merely becomes unowned. Without that, finished work with an open
     PR became invisible to `task next` and locked by `owns()` — deadlock on exactly what
-    was worth the most. `awaiting_human` is kept for the same reason, but the other way
-    around: it is waiting for a test card the human has not answered yet. If it became
-    `open`, finished work came out of `task next` first as new work, and the next agent
-    re-implemented it."""
+    was worth the most."""
     t = task(tid)
     owns(t, aid)
-    keep = t["status"] if t["status"] in ("in_review", "awaiting_human") else "open"
+    keep = t["status"] if t["status"] == "in_review" else "open"
     db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (keep, now(), tid))
     
@@ -1341,10 +1356,7 @@ def release(tid, aid, b):
     return {"ok": True}
 
 
-# ---------- questions, test cards, messages -------------------------------
-
-CARD_FIELDS = ("repo", "env", "url", "steps", "expected", "risk", "rollback")
-
+# ---------- questions, messages -------------------------------
 
 DUR = {"m": 1, "h": 60, "d": 1440}
 
@@ -1368,51 +1380,30 @@ def question_create(b, actor):
     kind = b.get("kind", "question")
     if not project:
         raise Err(400, "project is missing")
-    card = b.get("card")
     if kind == "test":
-        if not isinstance(card, dict):
-            raise Err(400, "the test card is missing `card`")
-        missing = [f for f in CARD_FIELDS if not card.get(f)]
-        if missing:
-            raise Err(400, "the test card is missing fields: %s" % ",".join(missing))
-        if len(card["steps"]) != len(card["expected"]):
-            raise Err(400, "steps and expected must have the same length")
-        if b.get("default"):
-            raise Err(400, "a test card can never default (§5b)")
-    elif not b.get("text"):
+        # The human test stage is gone (T-352): whoever builds a change tests it with the
+        # CLI, playwright or test code, and the human tests after deploy.
+        raise Err(400, "test cards were removed — test it yourself (CLI, playwright, test "
+                       "code); the human tests in dev/prod after deploy")
+    if not b.get("text"):
         raise Err(400, "text is missing")
     qid = next_id("Q-", "questions")
-    db.execute("""INSERT INTO questions (id,project,task,asked_by,kind,card,text,options,
-                  default_answer,deadline,status,created) VALUES (?,?,?,?,?,?,?,?,?,?,'open',?)""",
-               (qid, project, b.get("task"), actor, kind, json.dumps(card) if card else None,
+    db.execute("""INSERT INTO questions (id,project,task,asked_by,kind,text,options,
+                  default_answer,deadline,status,created) VALUES (?,?,?,?,?,?,?,?,?,'open',?)""",
+               (qid, project, b.get("task"), actor, kind,
                 b.get("text"), json.dumps(b.get("options", [])), b.get("default"),
                 deadline_of(b.get("deadline")), now()))
-    if kind == "test" and b.get("task"):
-        # The card blocks ONLY when the phase requires a human-OK before merge
-        # (launch/live, §3.6). Otherwise the intent is the opposite: merge, deploy, and
-        # let the human test what is actually running. Nothing waits for an answer.
-        t = db.execute("SELECT * FROM tasks WHERE id=?", (b["task"],)).fetchone()
-        blocking = t and (t["risk"] or "normal") in HUMAN_MERGE[phase_of(project)]
-        if blocking:
-            db.execute("UPDATE tasks SET status='awaiting_human', human_test=NULL, updated=? "
-                       "WHERE id=?", (now(), b["task"]))
-        ev(project, "task/" + b["task"], "human.test_requested", actor, question=qid,
-           blocking=blocking)
     ev(project, "question/" + qid, "question.asked", actor, kind=kind, task=b.get("task"),
        text=b.get("text"))
-    if kind == "test":
-        ntfy("🧪 %s test waiting (%s)" % (project, b.get("task") or qid),
-             card.get("url", ""), "%s/tests" % BASE_URL)
-    else:
-        ntfy("❓ %s %s" % (project, b.get("task") or ""), b.get("text", ""),
-             "%s/q/%s" % (BASE_URL, qid))
+    ntfy("❓ %s %s" % (project, b.get("task") or ""), b.get("text", ""),
+         "%s/q/%s" % (BASE_URL, qid))
     return {"id": qid, "status": "open"}
 
 
 def question_answer(qid, answer, who, note="", b=None):
-    # A question answered by the human opens the merge gate for risk=high. The human
-    # identity must therefore be PROVEN: without this an agent could ask its own
-    # question, answer it as the human, and merge high risk with nobody looking (T-143).
+    # An answer signed as the human is taken as the human's decision. The identity must
+    # therefore be PROVEN: without this an agent could ask its own question and answer
+    # it in the human's name, with nobody looking (T-143).
     if who == HUMAN and not as_human(b or {}):
         raise Err(403, "only the human token can answer as %s; answer under your own "
                        "agent id if you have an opinion about the question" % HUMAN,
@@ -1430,54 +1421,6 @@ def question_answer(qid, answer, who, note="", b=None):
                "WHERE id=?", (answer, who, now(), qid))
     ev(q["project"], "question/" + qid, "question.answered", who, answer=answer,
        **({"overrode_default": q["answer"]} if was_defaulted else {}))
-    if q["kind"] == "test" and q["task"]:
-        ok = answer.strip().lower().startswith("ok")
-        # `human_test` is what the gate reads to let risk=high past. It must therefore be
-        # set only by a HUMAN. Without this an agent could answer its own test card under
-        # its OWN id — not as the human, so human_only did not trigger — and still open
-        # the gate. An agent answer is still logged, it just does not count as an OK.
-        by_human = as_human(b or {})
-        # SELECT * and not a narrower column list: the follow-up block at the bottom reads
-        # t["repo"], t["title"], t["pr"] and t["merge_sha"] from the same row.
-        t = db.execute("SELECT * FROM tasks WHERE id=?", (q["task"],)).fetchone()
-        # A task that finished while the card was out must not rise again from a late
-        # answer — if it is done, a FAIL is handled as a new task further down.
-        if t and t["status"] != "done":
-            if t["owner"]:
-                # Back to the owner as `claimed` WITH owner and a fresh lease. Without
-                # those last two the row went invisible to both task_next (not
-                # open/orphaned) and task_claim (not taken).
-                db.execute("UPDATE tasks SET human_test=CASE WHEN ?1 THEN ?2 ELSE human_test END, "
-                           "status='claimed', lease_until=?3, updated=?4 WHERE id=?5",
-                           (1 if by_human else 0, "ok" if ok else "fail",
-                            plus(LEASE_MIN), now(), q["task"]))
-            elif t["status"] == "awaiting_human":
-                # Unowned because the owner put it down while the card was out (release),
-                # not because it died: the branch stands, and the answer applies to it.
-                # `claimed` without an owner is invisible to task next and untouchable
-                # until the lease expires — hence `open`.
-                db.execute("UPDATE tasks SET human_test=CASE WHEN ?1 THEN ?2 ELSE human_test END, "
-                           "status='open', updated=?3 WHERE id=?4",
-                           (1 if by_human else 0, "ok" if ok else "fail", now(), q["task"]))
-            else:
-                # The owner was reaped away. The human-OK applied to ITS branch: it does
-                # not carry over to the next claimant, who never filed the test card. The
-                # task is left open.
-                db.execute("UPDATE tasks SET human_test=NULL, updated=? WHERE id=?",
-                           (now(), q["task"]))
-        ev(q["project"], "task/" + q["task"], "human.test_result", who,
-           ok=ok, note=note or answer, by_human=by_human)
-        # Already merged and done? Then a FAIL is a NEW task, not a reopening: the code
-        # is out in production, and what is needed is a fix with the finding as its spec.
-        if not ok and t and t["status"] == "done":
-            nid = task_create({"project": q["project"], "repo": t["repo"],
-                               "title": "FAIL from human test of %s: %s" % (q["task"], (note or answer)[:80]),
-                               "spec": "Test card %s on %s failed.\n\n%s wrote: %s\n\n"
-                                       "Original task: %s\nPR: %s\nMerge: %s"
-                                       % (qid, q["task"], HUMAN, note or answer, t["title"],
-                                          t["pr"], t["merge_sha"]),
-                               "risk": t["risk"], "priority": 90}, "board")
-            ev(q["project"], "task/" + q["task"], "task.created", "board", followup=nid["id"])
     # T-198: a human who overrides the board's own default must reach the WORK that was
     # done on the guess. Without this the loop does not close: the only delivery path was
     # inbox(), which hits EXACTLY the agent id that asked — and only if it is alive and
@@ -1487,13 +1430,12 @@ def question_answer(qid, answer, who, note="", b=None):
     # Same normalization as the SQL in inbox(): a human who confirms the default with
     # "Yes" or "yes " in the free-text field has overridden nothing, and must not trigger
     # a follow-up task at priority 90.
-    if (was_defaulted and q["task"] and q["kind"] != "test"
+    if (was_defaulted and q["task"]
             and str(answer).strip().lower() != str(q["answer"] or "").strip().lower()):
         t = db.execute("SELECT * FROM tasks WHERE id=?", (q["task"],)).fetchone()
         ev(q["project"], "task/" + q["task"], "task.default_overridden", who,
            question=qid, was=q["answer"], now=answer)
-        # Done and merged? Then the answer is new work, not a reopening — same rule as a
-        # FAIL on a test card for a done task just above.
+        # Done and merged? Then the answer is new work, not a reopening.
         if t and t["status"] == "done":
             nid = task_create({
                 "project": q["project"], "repo": t["repo"], "risk": t["risk"], "priority": 90,
@@ -1676,20 +1618,17 @@ def reap():
                              "the role is free", "%s/status" % BASE_URL)
     dead = {r["id"] for r in db.execute("SELECT id FROM agents WHERE status IN ('dead','finished')")}
     for t in db.execute("SELECT * FROM tasks WHERE status NOT IN ('done','open','orphaned','archived')").fetchall():
-        # `awaiting_human` and `blocked` are documented waits, not stops: they wait on a
-        # human for hours and must not be orphaned by the lease running out. If the owner
-        # dies (dead/finished) they must still be takeable.
+        # `blocked` is a documented wait, not a stop: it waits on a human for hours and
+        # must not be orphaned by the lease running out. If the owner dies (dead/finished)
+        # it must still be takeable.
         expired = (t["lease_until"] and mins_since(t["lease_until"]) > 0
-                   and t["status"] not in ("awaiting_human", "blocked"))
+                   and t["status"] != "blocked")
         # An unowned row in an owner state is impossible: nobody can claim it (wrong
         # status), and everything else requires ownership. Then it is wedged forever.
         # Release it.
         stuck = t["owner"] is None and t["status"] in ("claimed", "merging")
         if expired or stuck or (t["owner"] in dead):
-            # human_test is cleared: the human-OK applied to the previous owner's branch,
-            # and must not let the next claimant through gate_merge on a card it never
-            # filed.
-            db.execute("UPDATE tasks SET status='orphaned', owner=NULL, human_test=NULL, "
+            db.execute("UPDATE tasks SET status='orphaned', owner=NULL, "
                        "updated=? WHERE id=?", (now(), t["id"]))
             db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (t["id"],))
             ev(t["project"], "task/" + t["id"], "task.orphaned", "board", was_owner=t["owner"])
@@ -1789,16 +1728,6 @@ def status(project=None):
     return out
 
 
-def tests_open(project=None):
-    rows = db.execute(
-        """SELECT q.*, p.phase FROM questions q JOIN projects p ON p.name=q.project
-           WHERE q.kind='test' AND q.status='open' %s
-           ORDER BY CASE p.phase WHEN 'live' THEN 0 WHEN 'launch' THEN 1 WHEN 'build' THEN 2
-                    ELSE 3 END, q.created""" % ("AND q.project=?" if project else ""),
-        (project,) if project else ())
-    return [dict(r) for r in rows]
-
-
 # ---------- HTML ----------------------------------------------------------
 
 # The stylesheet is built by ui/build.sh and is CHECKED IN as board.css: the board is
@@ -1833,7 +1762,7 @@ def whoami(human):
     """Which identity the cookie in this browser carries.
 
     A page rendered with an agent token looks exactly like one rendered with the human
-    token — the same tasks, the same test cards, the same answer buttons — and then
+    token — the same tasks, the same answer buttons — and then
     refuses every answer. The login appears to have worked right up until the moment you
     try to use it, which is the worst possible place to find out. So the page says it,
     always, on the surface where the confusion happens: the phone."""
@@ -1880,8 +1809,7 @@ def answer_saved_page(qid, human):
         "<p class='%s mt-1 text-sm'>The agent picks it up in its inbox and carries on. "
         "Nothing is waiting on you for this one.</p>"
         "<div class='mt-4 flex flex-wrap gap-3'>"
-        "<a class='btn btn-primary min-h-12 flex-1' href='/tests'>Test queue</a>"
-        "<a class='btn btn-outline min-h-12 flex-1' href='/status'>The board</a>"
+        "<a class='btn btn-primary min-h-12 flex-1' href='/status'>The board</a>"
         "%s</div></div>" % (DIM, task_link)))
 
 
@@ -1900,7 +1828,7 @@ def not_human_page(what):
         "<p class='%s mt-3 text-sm'>Everything renders, but only %s can answer. Run this "
         "in your own shell — not inside an agent session — and scan the code again:</p>"
         "<p class='mt-2'><code class='rounded bg-base-100 px-1 font-mono text-sm'>"
-        "board open tests --qr</code></p></div>" % (escape(what), DIM, escape(HUMAN))))
+        "board open --qr</code></p></div>" % (escape(what), DIM, escape(HUMAN))))
 
 
 def meter(label, pct, ceiling=None):
@@ -1923,18 +1851,16 @@ def meter(label, pct, ceiling=None):
                 escape(label), cls, round(min(v, 100)), tick, round(v)))
 
 
-SPINE = {"awaiting_human": "spine-wait", "blocked": "spine-stop", "orphaned": "spine-stop",
+SPINE = {"blocked": "spine-stop", "orphaned": "spine-stop",
          "merged": "spine-land", "done": "spine-land", "archived": ""}
 
-BADGE = {"awaiting_human": "badge-warning", "blocked": "badge-error", "orphaned": "badge-error",
+BADGE = {"blocked": "badge-error", "orphaned": "badge-error",
          "merged": "badge-success", "done": "badge-success", "archived": "badge-ghost"}
 
 
 def waiting_on_you(p):
-    """What requires a human in this project. Test cards are questions with kind=test,
-    so they are already part of `questions` — they are not counted twice here."""
-    return (len([t for t in p["tasks"] if t["status"] == "awaiting_human"])
-            + len(p["questions"]))
+    """What requires a human in this project."""
+    return len(p["questions"])
 
 
 def stuck(p):
@@ -1953,8 +1879,7 @@ def watchline(s):
     # an anchor that does not exist on the page.
     first = lambda gen, dflt: next(gen, dflt)
     wait_url = first((("/q/%s" % q["id"]) for p in s["projects"] for q in p["questions"]),
-                     first((("/t/%s" % t["id"]) for p in s["projects"] for t in p["tasks"]
-                            if t["status"] == "awaiting_human"), "/tests"))
+                     "/status")
     stop_url = first((("/t/%s" % t["id"]) for p in s["projects"] for t in p["tasks"]
                       if t["status"] in ("blocked", "orphaned")), "/status")
     n = lambda v, cls, href, txt: (
@@ -2012,7 +1937,6 @@ def tell(p):
     parts = [("", len(p["agents"]), "agents" if len(p["agents"]) != 1 else "agent"),
              ("", len(p["tasks"]), "queued")]
     for st, lbl, cls in (("in_review", "to review", ""),
-                         ("awaiting_human", "waiting on you", "text-warning"),
                          ("blocked", "blocked", "text-error"),
                          ("orphaned", "unowned", "text-error")):
         if n.get(st):
@@ -2295,7 +2219,7 @@ def html_status(project, token="", human=False):
     s = status(project)
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
         MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")),
-        (("/tests", "test queue"),), human, show_all_btn=True)]
+        (), human, show_all_btn=True)]
     if s.get("ntfy_failures_since_success", 0) > 0:
         fails = s["ntfy_failures_since_success"]
         h.append("<div class='mt-4 rounded-box border border-l-4 border-base-300 "
@@ -2488,53 +2412,6 @@ def html_task(tid, token="", human=False):
         LBL, tl, LBL, ab, escape(d["id"]), LBL))
 
 
-def test_card(q):
-    c = jl(q["card"], {})
-    steps = "".join(
-        "<li class='my-1'>%s <span class='%s'>→ %s</span></li>" % (escape(s), DIM, escape(e))
-        for s, e in zip(c.get("steps", []), c.get("expected", [])))
-    url = c.get("url", "")
-    rows = (("project", escape(q["project"])), ("repo", escape(c.get("repo", "—"))),
-            ("environment", escape(c.get("env", "—"))),
-            ("risk", escape(str(c.get("risk", "—")))),
-            ("log in", escape(c.get("login", "—"))),
-            ("roll back", "<code class='rounded bg-base-100 px-1 font-mono text-xs "
-                          "[overflow-wrap:anywhere]'>%s</code>" % escape(c.get("rollback", "—"))))
-    return ("""<div class='rounded-box border border-base-300 border-l-4 border-l-warning
-        bg-base-200 p-4'>
-        <h3 class='mb-1 text-base font-semibold %s'>%s</h3>
-        %s
-        <dl class='mb-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-sm'>%s</dl>
-        %s<ol class='my-2 list-decimal pl-5 text-sm'>%s</ol>
-        <form method=post action='/q/%s/answer'>
-          <label class='%s' for='n-%s'>What did you see, if something failed?</label>
-          <input id='n-%s' class='input w-full' type=text name=note
-            placeholder='short description'>
-          <div class='mt-3 flex flex-wrap gap-3'>
-            <button class='btn btn-success min-h-12 flex-1' name=answer value=ok>It all worked</button>
-            <button class='btn btn-error btn-outline min-h-12 flex-1' name=answer value=fail>
-              Something failed</button>
-          </div>
-        </form></div>""" % (
-        MONO, escape(q["task"] or q["id"]),
-        # WHAT is to be verified was not on the card at all — only the id and the steps.
-        # Then the human has to guess the intent from the steps.
-        ("<p class='mb-3 max-w-[68ch]'>%s</p>" % escape(q["text"])) if q["text"] else "",
-        "".join("<dt class='%s'>%s<dd class='m-0'>%s" % (DIM, k, v) for k, v in rows),
-        ("<p class='mb-2'><a class='%s [overflow-wrap:anywhere]' href='%s'>Open %s</a></p>"
-         % (LINK, escape(url), escape(url))) if url else "",
-        steps, q["id"], LBL, q["id"], q["id"]))
-
-
-def html_tests(project, token="", human=False):
-    cards = [test_card(q) for q in tests_open(project)]
-    body = ("<div class='mt-5 grid gap-4 md:grid-cols-2'>%s</div>" % "".join(cards) if cards
-            else "<div class='mt-8 rounded-box border border-dashed border-base-300 px-4 "
-                 "py-10 text-center %s'>No tests are waiting.<br>Cards show up here when an "
-                 "agent needs you to try something yourself.</div>" % DIM)
-    return page("test queue", head("test queue", human=human) + body)
-
-
 def html_question(qid, token="", human=False):
     q = db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     if not q:
@@ -2545,8 +2422,6 @@ def html_question(qid, token="", human=False):
             "<p class='text-lg'>Answered: <b class='font-semibold'>%s</b></p>"
             "<p class='%s mt-1 text-sm'>%s</p></div>" % (
                 escape(q["answer"] or ""), DIM, escape(q["status"]))))
-    if q["kind"] == "test":
-        return html_tests(q["project"], token, human)
     opts = "".join("<button class='btn btn-primary min-h-12 flex-1' name=answer value='%s'>%s"
                    "</button>" % (escape(o), escape(o)) for o in jl(q["options"]))
     # defaulted = the board answered itself when the deadline ran out — but a human can
@@ -2620,8 +2495,7 @@ ROUTES = [
         (b or {}).get("older_than") or q.get("older_than", ["0"])[0], b)),
     ("POST",   r"/tasks/([^/]+)/release$",      lambda h, m, b, q: release(m[0], actor(q, b), b)),
     ("POST",   r"/questions$",                  lambda h, m, b, q: question_create(b, actor(q, b))),
-    ("GET",    r"/questions$",                  lambda h, m, b, q: {"questions": tests_open(
-        q.get("project", [None])[0]) if q.get("kind") == ["test"] else [
+    ("GET",    r"/questions$",                  lambda h, m, b, q: {"questions": [
         # 'defaulted' is still overridable by a human — it must not disappear from this
         # list. .status tells the two apart.
         dict(r) for r in db.execute("SELECT * FROM questions WHERE status IN ('open','defaulted')")]}),
@@ -3114,8 +2988,6 @@ class Handler(BaseHTTPRequestHandler):
         human = getattr(self, "is_human", False)
         if path in ("/", "/status"):
             return html_status(q.get("project", [None])[0], token, human)
-        if path == "/tests":
-            return html_tests(q.get("project", [None])[0], token, human)
         m = re.match(r"^/q/([^/]+)$", path)
         if m and method == "GET":
             return html_question(m.group(1), token, human)

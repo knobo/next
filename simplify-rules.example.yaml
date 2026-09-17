@@ -2,8 +2,7 @@
 #
 # Put this file next to project.yaml (or point $BOARD_SIMPLIFY_RULES at it) and drop the
 # `.example`. It is optional: without it, `board simplify` still closes retracted tasks,
-# consolidates the board's own human-test follow-ups, and turns open test cards into one
-# machine-verification task.
+# and consolidates the board's own follow-ups.
 #
 # What belongs here is DOMAIN knowledge — your repo names, your vocabulary, the shape of
 # your backlog. That is why it is a file and not code: the same simplify.py serves every
@@ -14,22 +13,13 @@
 retracted:
   title_any: [RETRACTED, WITHDRAWN]
 
-# Follow-ups the board created itself when a human test failed or a default was
-# overridden. The defaults match the strings board.py writes; change them only if you
-# have changed those.
+# Follow-ups the board created itself when a default was overridden ("FAIL from human
+# test" is the marker of the removed test stage, kept for old tasks).
 verification:
   title_any: ["FAIL from human test", "overridden default on"]
   title: "consolidated verification of {n} follow-ups ({ids})"
   prefix: "consolidated verification"     # used to find an already-created consolidation
   priority: 60
-
-# Open `kind: test` questions, gathered into one task an agent can verify by machine.
-# `env` picks which environment URL from project.yaml goes into the spec.
-test_cards:
-  title: "consolidated machine verification of {n} test cards ({ids})"
-  prefix: "consolidated machine verification"
-  priority: 65
-  env: dev
 
 # Your own clusters, applied in order. A task joins the first cluster that matches it.
 # A cluster with fewer than two matching tasks is reported but never consolidated —

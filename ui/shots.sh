@@ -35,7 +35,7 @@ curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -X POS
 
 t(){ A -X POST "$B/api/v1/tasks" -d "{\"project\":\"$1\",\"title\":\"$2\",\"repo\":\"$3\",\"risk\":\"$4\",\"priority\":$5,\"agent\":\"$A1\"}" | jq -r .id; }
 T1=$(t board "the board gets a UI framework: Tailwind + daisyUI, built in and checked in" . normal 99)
-T2=$(t board "test-level files human cards where there is no human judgement to give" . normal 96)
+T2=$(t board "the merge gate no longer waits on a human test" . normal 96)
 T3=$(t board "the coordinator's own cost per task" . low 45)
 T4=$(t board "a statusline heartbeat every 1-3 s captures 85% of the events" . low 30)
 T5=$(t shopfront "per-item try/catch in the scheduled sweep" api high 80)
@@ -50,14 +50,13 @@ A -X POST "$B/api/v1/tasks/$T3/blocked" -d "{\"agent\":\"$A1\",\"note\":\"waitin
 A -X POST "$B/api/v1/tasks/$T5/claim" -d "{\"agent\":\"$A3\"}" >/dev/null
 QP=$(A -X POST "$B/api/v1/questions" -d "{\"project\":\"board\",\"task\":\"$T3\",\"kind\":\"product\",\"text\":\"Should the board measure the coordinator's own share in USD (cumulative, but only one harness reports it), or should the task be closed as unbuildable?\",\"default\":\"a unit-tagged optional field\",\"options\":[\"usd\",\"close\"],\"deadline\":\"8h\",\"agent\":\"$A1\"}" | jq -r .id)
 QD=$(A -X POST "$B/api/v1/questions" -d "{\"project\":\"board\",\"task\":\"$T4\",\"kind\":\"question\",\"text\":\"Should the heartbeat fire on every statusline render, or be throttled to every 20 seconds?\",\"default\":\"throttle to 20s\",\"deadline\":\"1s\",\"agent\":\"$A1\"}" | jq -r .id)
-A -X POST "$B/api/v1/questions" -d "{\"project\":\"shopfront\",\"task\":\"$T5\",\"kind\":\"test\",\"text\":\"check that the invoice page still lets you pay\",\"agent\":\"$A3\",\"card\":{\"repo\":\"web\",\"env\":\"dev\",\"risk\":\"high\",\"login\":\"demo@example.com via the identity provider\",\"url\":\"https://dev.example.com/invoices\",\"steps\":[\"open the invoice list\",\"pick an unpaid invoice\",\"press Pay and finish with the test card\"],\"expected\":[\"the list shows at least one unpaid\",\"the details match the list\",\"the receipt arrives, and the invoice reads as paid\"],\"rollback\":\"kubectl -n shopfront rollout undo deploy/web\"}}" >/dev/null
 echo "QP=$QP QD=$QD"; sleep 2; curl -s "$B/status" -H "Authorization: Bearer $T" >/dev/null
 
 cat > "$D/shot.js" <<JS
 const { chromium } = require('playwright');
 (async () => {
   const b = await chromium.launch();
-  const pages = [['status','/status'],['task','/t/$T1'],['tests','/tests'],['q','/q/$QP'],['blocked','/t/$T3']];
+  const pages = [['status','/status'],['task','/t/$T1'],['q','/q/$QP'],['blocked','/t/$T3']];
   for (const scheme of ['light','dark']) {
     for (const vp of [[1280,900,'wide'],[390,844,'phone']]) {
       const c = await b.newContext({colorScheme: scheme, viewport: {width: vp[0], height: vp[1]},

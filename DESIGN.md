@@ -2,7 +2,7 @@
 
 **Status:** this began as a design document, written before the code. Most of it is now
 implemented; where it still describes an intention rather than a fact, it says so. The section
-numbers here (§3.7, §5b, §8.1) are referenced from comments throughout the code.
+numbers here (§3.7, §8.1) are referenced from comments throughout the code.
 
 **Scope: user-global.** The skill lives in `~/.claude/skills/next/` and one board serves *all* of
 an owner's projects across machines. That is the design constraint that shapes everything else: a
@@ -29,14 +29,15 @@ nothing about layout and reads it from a manifest instead (§3.2b).
    `context_window`); a dead process is a silent heartbeat. (§3.5)
 5. **Questions never block**: `board ask` → next task; the board pushes a notification with an
    answer form; the answer is collected in `board inbox`. (§4)
-6. **Phase per project** (`phase:` in the manifest) drives the test level, the merge gate, prod
-   deploys and the model choice. (§3.6)
+6. **Phase per project** (`phase:` in the manifest) drives the merge gate, prod deploys and the
+   model choice. (§3.6)
 7. **Capabilities are self-declared, grants are assigned**; matched at claim time. Roles: a human
    pin wins, otherwise a deterministic ranking — no consensus protocol. (§3.7–3.8)
 8. **The merge gate is enforced mechanically**: branch protection on the forge plus a
    `PreToolUse` hook that asks `board gate`. (§8)
-9. **The test queue is the question table with `kind: test`**, in one place (`/tests`) across
-   projects; OK/FAIL wakes the agent that asked. (§5b)
+9. **No middle test stage**: whoever builds a change tests it (CLI, playwright, test code); the
+   human tests in dev or prod after deploy. No test cards, no test queue, no human OK in the
+   gate. (§5)
 10. **Context is a hard budget**: SKILL.md ≤80 lines, prompt templates read by the subagents, the
     board is the memory; roughly 7k tokens per task. (§6.2–6.5)
 11. **Phase 0 has value on its own**: board + CLI + heartbeat + push replaces a hand-edited
@@ -120,7 +121,7 @@ Two more facts about the environment shaped the design rather than the failures:
 | Per project (namespace) | Per agent/session (global) | Per (agent, project) |
 |---|---|---|
 | phase, goal, manifest path, repos | id, harness, host, model, heartbeat, token quota | grants |
-| tasks, questions, test cards | capabilities, preference | role (`coordinator` is a singleton *per project*) |
+| tasks, questions | capabilities, preference | role (`coordinator` is a singleton *per project*) |
 | the coordinator role | `current_project` (what the manifest at cwd resolved to) | |
 
 **Isolation:** every read and write on tasks/questions/roles takes `project` from the agent's
@@ -163,7 +164,7 @@ worktrees: "../{repo}-worktrees/{branch}"   # default
 docs: docs/                      # where status is written; default: the manifest directory
 onboarding: docs/AGENT_ONBOARDING.md         # optional; read by the skill if present
 forge: { kind: forgejo, url: https://git.example.com, org: myorg, login: claude }
-environments:                    # used by the test queue (§5b) to derive a test URL from the phase
+environments:                    # where and how the agent tests a surface itself (§5)
   # `requires`: which capabilities the test actually needs. Omitted = [browser-test], which is
   # right for an e2e test and wrong for a shell script — a command-line test sets
   # `requires: []` and can then be run by an agent with no browser (T-142).
@@ -270,19 +271,20 @@ CREATE TABLE grants (                    -- per (agent, project); only the polic
 );
 CREATE TABLE tasks (
   id TEXT PRIMARY KEY, project TEXT, repo TEXT, title TEXT, spec TEXT,
-  status TEXT,          -- open|claimed|in_review|awaiting_human|merging|done|blocked|orphaned|archived
+  status TEXT,          -- open|claimed|in_review|merging|done|blocked|orphaned|archived
   requires TEXT,        -- JSON: capabilities needed ['browser-test','kubectl-dev']
   needs_grants TEXT,    -- JSON: grants needed ['merge','deploy-prod']
   touches TEXT,         -- JSON: file surfaces (a collision hint)
   risk TEXT,            -- low|normal|high  (auth/payment/migration/prod-infra = high)
   owner TEXT, lease_until TEXT,
   worktree TEXT, branch TEXT, pr TEXT, merge_sha TEXT,
+  human_test TEXT,      -- legacy, unused since T-352 (kept so old databases load)
   created TEXT, updated TEXT, priority INTEGER
 );
-CREATE TABLE questions (      -- questions AND test cards: same lifecycle, different `kind` (§5b)
+CREATE TABLE questions (
   id TEXT PRIMARY KEY, project TEXT, task TEXT, asked_by TEXT,
-  kind TEXT NOT NULL,             -- question | test
-  card TEXT,                      -- JSON for kind=test: {repo, env, url, login, steps[], expected[], risk, rollback}
+  kind TEXT NOT NULL,             -- question  (kind=test is refused since T-352; old rows are plain questions)
+  card TEXT,                      -- legacy, unused since T-352
   text TEXT, options TEXT, default_answer TEXT, deadline TEXT,
   status TEXT,          -- open|answered|defaulted
   answer TEXT, answered_by TEXT, answered TEXT
@@ -309,7 +311,6 @@ CREATE TABLE messages (   -- an agent→agent inbox
 `task.orphaned`, `task.deployed`, `task.done`, `task.archived`, `task.comment`,
 `task.default_overridden`,
 `question.asked`, `question.answered`, `question.defaulted`, `message.sent`,
-`human.test_requested`, `human.test_result`,
 `role.pinned`, `role.unpinned`, `role.claimed`, `role.released`, `role.recommended`.
 
 Heartbeats are written to `events` like everything else. A nightly job can compact
@@ -358,8 +359,8 @@ one 5-hour window without progress is `stalled` — not out of quota, something 
 another agent can take over. `stalled` never counts as `alive` for `task next` or the role
 ranking, but it shows in `board status` and it does not strip a role a human pinned.
 
-The reaper also never orphans `awaiting_human` or `blocked`: those are documented waits on a
-human, not stalls. If the *owner* dies, they can still be taken over.
+The reaper also never orphans `blocked`: it is a documented wait on a human, not a stall. If
+the *owner* dies, it can still be taken over.
 
 ### 3.6 Project phase — the declared input
 
@@ -373,8 +374,8 @@ readable when the board is down). `/next` mirrors the file to the board at start
 
 | | `idea` | `build` | `launch` | `live` |
 |---|---|---|---|---|
-| **Test level (§5)** | direct production testing is fine, breaking changes are fine | dev; non-breaking only | dev always; a human OK for `risk=high` | mandatory automated levels; human OK for anything visual; migrations need a rollback plan |
-| **Merge gate** | the mechanical checks | + review findings closed | + `risk=high` → human OK | + every risk level → human OK |
+| **Testing (§5)** | direct production testing is fine, breaking changes are fine | the agent tests in dev; non-breaking only | the agent tests in dev | the agent tests in dev; migrations need a rollback plan |
+| **Merge gate** | the mechanical checks | + review findings closed | + review findings closed | + review findings closed |
 | **Prod deploy** | free | free for non-breaking | a merge that auto-deploys is **treated as a deploy decision** | requires an explicit `deploy-prod` grant per task |
 | **Model (default)** | one notch cheaper: sonnet for design too | the table in §6.3 | the table in §6.3 | + an Opus review in addition to the Sonnet finders on `risk=high` |
 
@@ -541,90 +542,22 @@ the cost of a false pass is a merge nobody approved.
 
 ---
 
-## 5. Browser testing — the level derived from phase + change class
+## 5. Testing — no middle stage
 
-Three levels:
+**Decision (T-351/T-352): everyone who uses the board tests their own work, with the CLI,
+playwright or test code. The human tests in dev or prod after deploy.** There is no human test
+stage between review and merge.
 
-| Level | What | Who | Cost |
-|---|---|---|---|
-| **L0 mock** | Playwright against a mock backend, or a local dev server plus screenshots | the agent itself | minutes |
-| **L1 dev** | The dev environment from the manifest — Playwright against a live stack, or a human | the agent (with `playwright`) or the human | minutes–hours |
-| **L2 prod** | Production | the human, exceptionally an agent | real risk |
+This replaced a phase × change-class table (`board test-level`), test cards (`kind: test`
+questions), a test queue (`board tests`, `/tests`), and a gate rule that required a human OK in
+`launch`/`live`. In practice the cards piled up where there was no human judgement to give, the
+table rated changes wrongly from file extensions, and the gate waited on a queue nobody worked.
 
-**The change class** is derived mechanically from the diff: `ui` (only markup/css/i18n), `logic`
-(code without a migration), `contract` (OpenAPI/DTO/route change), `data` (SQL/migrations),
-`infra` (helm/k8s/CI), `money-auth` (paths under payments or auth).
-
-**The decision table (the agent looks it up; it does not use judgement):**
-
-| Phase \ class | ui | logic | contract | data | infra | money-auth |
-|---|---|---|---|---|---|---|
-| idea | L0 | L0 | L0 | L2 ok | L2 ok | L1 |
-| build | L0+L1(auto) | L0+L1(auto) | L1(auto) | L1 + human | L1 | L1 + human |
-| launch | L0+L1(auto) | L1(auto) | L1 + human | L1 + human + rollback plan | human | L1 + human |
-| live | L0+L1(auto) | L1 + human | L1 + human | L1 + human + rollback plan + backup check | human | L1 + human + Opus review |
-
-"(auto)" = an agent with the `playwright` capability runs it itself; "human" = a test card goes to
-the human, the task becomes `awaiting_human`, and the agent takes the next task.
-
-**Two corrections the table alone does not capture**, both learned the hard way and both now in
-`board test-level`:
-
-- **`auto` with nothing to run means nobody looks.** If the agent lacks `browser-test`, or the
-  manifest declares no `environments.<env>.how` for that surface, the answer is `human` whatever
-  the table says — and `why` says which. The temptation is to work around it by declaring the
-  capability; the fix is to add the automation, or file the card.
-- **A visual change is always `human`.** `how` can prove the API works. It can never prove the
-  page looks right. Any diff touching markup, CSS or a template goes to a human regardless of
-  class.
-
-**The test card** (what the agent writes for the human) — a fixed template, at most 12 lines,
-pushed as a notification and shown at `/tests`:
-
-```
-T-42 · web · L1 dev · ~3 min · risk: normal
-URL: https://dev.example.com/queues/123/config   Log in as: e2e-owner (pass claude/e2e-owner)
-1. Open the "Products" tab → expect: a new "Show on board" button under each product
-2. Turn it on for "Coffee", open /screen/<token> in a new tab → expect: "Coffee" within 5 s
-3. Turn it off → expect: gone within 5 s, no console errors
-If it fails: answer "fail: <what you saw>" — the agent picks it up in its inbox.
-Rollback: `kubectl -n myproj rollout undo deploy/web`
-Answer: [OK] [FAIL]
-```
-
-The card must contain *an expectation per step* and *a rollback command* — without them it is not
-valid, and `board test request` refuses it (a schema check, not an AI check).
-
-### 5b. The test queue — one definite place for "what do I test today"
-
-**Decision: the test queue IS the question table with `kind: test`** — same table, same inbox,
-same notification path, same answer form, same "the agent moves on and is resumed by the answer".
-A test card is a question with a structured body ("does this work?") and a structured answer
-(`ok` | `fail: …`). Giving it its own lifecycle would have produced two inboxes, two reaper rules
-and two places the human has to look — without anything getting better. What *is* specific to it
-is the card's schema and its rendering:
-
-- **One place:** `board tests` (CLI) and `/tests` (HTML) — **across all projects**, sorted by phase
-  (live > launch > build > idea), then risk, then age. Each entry shows everything needed without a
-  lookup: project/repo/PR, **environment and URL derived from the phase × class table and the
-  manifest's `environments`**, login, numbered steps with expectations, the risk if it is broken,
-  the rollback command, and two buttons: **OK** / **FAIL** (+ free text).
-- **A schema check at submission** (`board test request`): every field in `card` is mandatory;
-  `steps`/`expected` must be the same length; `env` must exist in the manifest. An invalid card →
-  400, the card never reaches the queue, and the agent gets the error — not the human.
-- **The way back:** OK → `human.test_result {ok}` → the task returns from `awaiting_human` to
-  `claimed` with its owner and a fresh lease; the owner sees it in `board inbox` and carries on to
-  the gate. FAIL → `human.test_result {fail, note}` → the owner dispatches a fix round with the
-  note as its spec and files a new card. The answer unblocks the agent exactly as a question
-  answer does — it is the same code.
-- **No defaults on tests.** A `deadline` is allowed (the card is marked as old), but a test card
-  can never `default` to OK. An unanswered question can be guessed; an unverified UI cannot.
-- **A project's own test-plan documents become an *export*.** `board tests --project X` generates
-  them. The board is the source.
-
-The human's morning routine, concretely: a push says "3 tests waiting (myproj 2, otherproj 1)" →
-open `/tests` on the phone → work down from the top → each answer wakes the right agent. No
-reading of PRs, logs or the entry file.
+What is left in code: `POST /questions` with `kind: test` answers 400. The columns
+`tasks.human_test` and `questions.card` stay in the schema, unused, so old databases load; old
+`kind: test` rows render as ordinary questions. On startup the board migrates legacy rows once:
+every `awaiting_human` task goes back to `open` (unowned, with a `task.released` event saying
+why), and every still-open `kind: test` question is closed as answered by `board`.
 
 ---
 
@@ -643,8 +576,8 @@ An agent that is going to work all night has a context budget, and the logs that
 design show four agents killed by token limits mid-task. Hence three principles, in priority
 order:
 
-1. **The service is the memory, not the prompt.** Tasks, roles, capabilities, questions and the
-   test queue are *fetched* from the board with short calls when needed; none of it is baked into
+1. **The service is the memory, not the prompt.** Tasks, roles, capabilities and questions
+   are *fetched* from the board with short calls when needed; none of it is baked into
    SKILL.md or into the entry file. The entry file is read **only at bootstrap** — when the board
    has no tasks for the project yet. After that the board is the queue, and the file is a human
    summary that is *written*, not read.
@@ -692,7 +625,7 @@ covered; an empty answer is never permission to keep claiming.
 | `SKILL.md` | the loop, the stop rules, the hard rules (≤80 lines) | `/next` | the coordinator, once |
 | `prompts/implementer.md` | the implementation subagent's mandate: commit in the worktree, never push/PR/merge, the TDD rule, the report format | at dispatch | **the subagent**, never the coordinator |
 | `prompts/reviewer.md` | the READ-ONLY mandate, three angles, 0–100 scoring, the JSON format | at dispatch | **the reviewer subagent** |
-| `reference/testing.md` | the phase × class table (§5), the test card template, the `environments` lookup | step 9 returns `human` | the coordinator, only then |
+| `reference/testing.md` | how the agent tests its own work (§5), the `environments` lookup | when testing | the coordinator, only then |
 | `reference/takeover.md` | orphan takeover, `merge_requested` without `merged`, re-landing, board down / outbox | `task next` returns orphaned; a merge wrapper fails; the CLI answers `queued` | the coordinator, only then |
 | `reference/roles.md` | pin/claim/ranking (§3.8), what a new coordinator does | `/next <role>`; `role recommend` points at you; a 409 on claim | the coordinator, only then |
 | `reference/handoff.md` | the closing block when the queue is empty or quota runs out | at the end of a run | the coordinator |
@@ -717,7 +650,6 @@ the implementation subagent, where the cost dies with that context.
 | Per task: the verification command (`tail -30`) | ~0.8k | |
 | Per task: 3 review reports + 1 fix round | ~2.5k | |
 | Per task: PR/gate/merge/verify/cleanup | ~1.2k | |
-| Per task: a test card (when human) | ~0.6k | |
 | **Sum per task** | **~7k** | against 50–150k if the coordinator implemented it itself |
 | Rewriting ENTRY every fifth task | ~2.5k | |
 
@@ -743,7 +675,7 @@ as a *proxy* — Claude's is different, but the pattern holds):
 | Form | Chars | Tokens | Readable? |
 |---|---|---|---|
 | Prose — a full paragraph explaining the gate, what a non-zero exit means, and what to do | 498 | **138** | yes |
-| **Compact, readable** — "Merge only after `board gate merge $T` = 0. Not 0 → do what the reason says (CI red: wait; findings open: fix; phase needs a human: test card), go to step 1. The task stays yours." | 175 | **60** | yes |
+| **Compact, readable** — "Merge only after `board gate merge $T` = 0. Not 0 → do what the reason says (CI red: wait; findings open: fix), go to step 1. The task stays yours." | 175 | **60** | yes |
 | Abbreviated — "Mrg only if `board gate merge $T`=0. ≠0→do rsn (CI red→wait; fndgs opn→fix; ph req hmn→tstcard), goto st1. Tsk stays urs." | 121 | **53** | barely |
 | Cryptic — "mrg⇐gate($T)==0; !0→act(reason)∧goto 1; own(T)↑" | 47 | **26** | no |
 
@@ -782,7 +714,7 @@ write it out again.
 | Situation | What happens | Why it is safe |
 |---|---|---|
 | **The board is down** | The CLI queues writes in the outbox and reads from cache with `stale:true`. The agent carries on with the task it has. A `board task next` served from cache can hand out a task somebody else took meanwhile → the CAS fails at flush; the agent notices at its next `board status` and releases it. | The board runs next to the forge and the cluster. If it is down, merge and CI are usually down too — nothing is lost by the board being away. It is *designed* so that the board's uptime need not exceed the forge's. |
-| **An agent dies mid-task with an open worktree** | The heartbeat stops → `stale` after 5 min, `dead` after 60 → the lease expires → the reaper sets `task.orphaned`. If the process is alive but not progressing, the lease is not renewed (only `claim` and `task.progress` renew it), the agent shows as `stalled`, and the task is orphaned the same way. `awaiting_human` and `blocked` are never orphaned by lease expiry. The next `board task next` returns the orphaned task **first**, with `worktree`, `branch`, `pr` and the last `progress` note. The new agent runs `git -C <worktree> status` and continues. | Everything needed for a takeover is structured on the board, because writing progress after every step is mandatory. The worktree directory is on the machine that died — if the new agent is elsewhere, it rebuilds from the pushed branch instead (`board task worktree` does this, and reports `base: origin`). |
+| **An agent dies mid-task with an open worktree** | The heartbeat stops → `stale` after 5 min, `dead` after 60 → the lease expires → the reaper sets `task.orphaned`. If the process is alive but not progressing, the lease is not renewed (only `claim` and `task.progress` renew it), the agent shows as `stalled`, and the task is orphaned the same way. `blocked` is never orphaned by lease expiry. The next `board task next` returns the orphaned task **first**, with `worktree`, `branch`, `pr` and the last `progress` note. The new agent runs `git -C <worktree> status` and continues. | Everything needed for a takeover is structured on the board, because writing progress after every step is mandatory. The worktree directory is on the machine that died — if the new agent is elsewhere, it rebuilds from the pushed branch instead (`board task worktree` does this, and reports `base: origin`). |
 | **Two agents take the same task** | `UPDATE … WHERE owner IS NULL` → one gets 1 row, the other 0 → 409. | SQLite serializes writes. With the board down (outbox) both can *believe* they have it; at flush the first wins and the second gets a 409 and must release — worst case duplicated work on one task, never corrupt state, because they have *separate worktrees*. |
 | **Out of tokens mid-merge** | `task.merge_requested` is written before the merge. A taking-over agent sees `merge_requested` without `merge_verified` → runs only the verification step (ancestry, the PR's state on the forge) — it does **not** re-merge. | Merge is one idempotent operation on the forge; the state is read from the forge, not from the board. The stop rule "do not start a merge near the ceiling" makes this rare. |
 | **A question unanswered for hours** | The deadline passes → `question.defaulted`. The agent has already implemented the default; the PR is marked. `risk=high` is never merged on a default. | Better a PR that assumes B and says so than no PR. And if the human later answers differently, the board turns the override into a new task — the loop closes even when the work is already merged (T-198). |
@@ -790,7 +722,7 @@ write it out again.
 | **The coordinator dies** | The lease expires → the top of the ranking among the living claims it → `role.claimed` plus a push. The new coordinator runs `inbox --as coordinator` and receives answers to the dead one's open questions. | Role state, questions and task ownership live on the board (§3.8); the dead coordinator held nothing exclusively in memory that was not also written as `task.progress`. |
 | **Two agents believe they are coordinator** | Impossible on the board: a unique index plus a CAS. It can only happen as a *belief* while the board is down — and a role claim is not allowed then (it is not queued in the outbox), so both keep their previous role. When contact returns, the row decides. | One truth, no distributed state. |
 | **A pinned coordinator dies while the human sleeps** | The pin is released on `dead` (60 min) → an ordinary election → a push. If the human comes back with `/next coordinator`, the elected one steps aside. | Without release, the project stands without a coordinator until morning; with it, the human can always override. |
-| **Production crash-loops after a merge that auto-deploys** | The deploy verification step notices (readiness, restarts) and creates a P0 "rollback" task that is taken first; `kubectl rollout undo` is in the test card's rollback line. | A known trap, and the reason the deploy step exists between merge and done rather than after it. |
+| **Production crash-loops after a merge that auto-deploys** | The deploy verification step notices (readiness, restarts) and creates a P0 "rollback" task that is taken first; `kubectl rollout undo` is the rollback. | A known trap, and the reason the deploy step exists between merge and done rather than after it. |
 
 ---
 
@@ -810,8 +742,8 @@ show that this does not hold. Three mechanical layers, in order of cost:
    board hiccups would be worked around within a day, and then it protects nothing.
 3. **The gate on the board is data-driven, not trust-based.** It requires
    `task.review_result.open == 0`, requires that the review event came from an agent id other than
-   the task's owner, requires `human.test_result == ok` when the phase table says so, checks that
-   the agent holds the `merge` grant, and holds a mutex so only one merge is in flight per project.
+   the task's owner, checks that the agent holds the `merge` grant, and holds a mutex so only one
+   merge is in flight per project.
    An agent cannot set grants (a policy file; only `board` or the human as actor).
 
 In addition, cheap protections already learned: review agents are never forks; `model:` is always
@@ -833,7 +765,7 @@ does not close it.
 | **0 — The board** | `board.py` (stdlib, SQLite, HTTP, the `/q/<id>` and `/status` pages), the `board` CLI with its outbox, the k8s manifest and ingress, the statusline heartbeat, the `SessionEnd` hook, push on `question.asked`/`task.blocked`, the reaper. A conformance suite: one bash script with curl that runs every operation in §4. | **Yes:** real-time "who is alive, how much quota do they have, what do they own" plus questions that reach the phone. Replaces a hand-edited file listing active agents. | 1 day |
 | **1 — `/next` v1** | SKILL.md (§6), manifest discovery (§3.2b) + `board project init`, a `project.yaml` per project, the PreToolUse gate hook, `board task create` from the entry points. Run first *with a human awake* — and on an idea-phase project with no users before anything else. | The loop runs end to end on one repository with Sonnet workers, in three projects of different shapes. | 1–2 days |
 | **2 — Robustness** | Leases and orphan takeover tested by killing a session on purpose; branch protection (a user step); an onboarding prompt for foreign harnesses using the same CLI; installation on a second machine. | Several agents, harnesses and machines without collisions. | 1 day |
-| **3 — The human loop** | The test card schema and the `/t/<id>` page, `human.test_result`, the phase table in the gate, an Opus review on `risk=high`. | Night work in `launch` phase becomes defensible. | 1 day |
+| **3 — The human loop** | The `/t/<id>` page, the phase table in the gate, an Opus review on `risk=high`. (The test card / human-test stage built here was removed again in T-352, §5.) | Night work in `launch` phase becomes defensible. | 1 day |
 | **4 — Optional** | An alternative backend behind the same API in shadow mode, held to the conformance suite; additional notification channels; heartbeat compaction. | Dogfooding another store without risk. | open |
 
 Phase 0 can be built by a Sonnet agent with the spec = the §4 table + the §3.4 schema + the

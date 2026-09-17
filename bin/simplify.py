@@ -6,12 +6,11 @@ small tasks in the same file cost twenty review-and-merge cycles instead of one.
 command finds groups that belong together and turns each group into a single task whose
 spec is the concatenation of the originals.
 
-Three rules are built in and need no configuration:
+Two rules are built in and need no configuration:
 
   retracted     tasks a human withdrew          -> closed and archived
-  verification  follow-ups the board itself made from failed human tests
-                (`task.created` with a "FAIL from human test" title) -> one task
-  test cards    open `kind: test` questions     -> one task that answers them by machine
+  verification  follow-ups the board itself made (an overridden default, or the legacy
+                "FAIL from human test" of the removed test stage) -> one task
 
 Everything else is DOMAIN knowledge and therefore configuration, not code: which repos a
 project has, which words mark a cluster, what the consolidated task should be called.
@@ -55,17 +54,6 @@ def get_tasks(project=None):
     return data.get("tasks", []) if isinstance(data, dict) else data
 
 
-def get_test_cards(project=None):
-    args = ["tests"]
-    if project:
-        args.extend(["--project", project])
-    try:
-        data = json.loads(run_board(args))
-        return data.get("questions", []) if isinstance(data, dict) else data
-    except Exception:
-        return []
-
-
 def manifest():
     try:
         return json.loads(run_board(["project", "show"]))
@@ -84,10 +72,6 @@ DEFAULT_RULES = {
                      "title": "consolidated verification of {n} follow-ups ({ids})",
                      "prefix": "consolidated verification",
                      "priority": 60},
-    "test_cards": {"title": "consolidated machine verification of {n} test cards ({ids})",
-                   "prefix": "consolidated machine verification",
-                   "priority": 65,
-                   "env": "dev"},
     "clusters": [],
 }
 
@@ -105,7 +89,7 @@ def rules_path(root):
 
 def load_rules(root):
     """Built-in defaults, with the project's own rules file merged over them. A missing
-    file is the normal case: the three built-in rules are useful on their own, and a
+    file is the normal case: the built-in rules are useful on their own, and a
     project only writes a file when it has clusters of its own to declare."""
     out = {k: (dict(v) if isinstance(v, dict) else list(v)) for k, v in DEFAULT_RULES.items()}
     p = rules_path(root)
@@ -114,7 +98,7 @@ def load_rules(root):
     if yaml is None:
         sys.exit("%s exists but PyYAML is not installed" % p)
     user = yaml.safe_load(open(p, encoding="utf-8")) or {}
-    for key in ("retracted", "verification", "test_cards"):
+    for key in ("retracted", "verification"):
         if isinstance(user.get(key), dict):
             out[key].update(user[key])
     if isinstance(user.get("clusters"), list):
@@ -144,7 +128,7 @@ def matches(task, match):
     return "title_any" not in match and "text_any" not in match and "ids" not in match
 
 
-def analyze(tasks, test_cards, rules):
+def analyze(tasks, rules):
     claimable = [t for t in tasks if t.get("status") in ("open", "orphaned")]
     used, groups = set(), []
 
@@ -164,7 +148,7 @@ def analyze(tasks, test_cards, rules):
     for c in rules["clusters"]:
         take(c.get("name", "cluster"), c, lambda t, c=c: matches(t, c.get("match")))
 
-    return {"open_count": len(claimable), "groups": groups, "test_cards": test_cards or []}
+    return {"open_count": len(claimable), "groups": groups}
 
 
 # ---------- reporting -----------------------------------------------------
@@ -176,7 +160,6 @@ def fmt(template, tasks):
 
 
 def format_report(analysis, project, rules, rules_file):
-    tc = rules["test_cards"]
     out = ["# Task analysis for project: %s" % project,
            "Open or unowned tasks: %d" % analysis["open_count"],
            "Rules: %s" % (rules_file or "built-in only"), ""]
@@ -200,31 +183,11 @@ def format_report(analysis, project, rules, rules_file):
                 out.append("- **Why:** %s" % g["benefit"])
         out.append("")
 
-    cards = analysis["test_cards"]
-    if cards:
-        n += 1
-        out.append("## %d. Open test cards ready for machine verification (%d)" % (n, len(cards)))
-        for c in cards:
-            card = card_of(c)
-            out.append("- **%s** (%s) [%s]: %s (%d steps)" % (
-                c.get("id"), c.get("task"), card.get("repo", "-"), card.get("url", ""),
-                len(card.get("steps", []))))
-        out += ["", "### Proposal:",
-                "- **Title:** " + fmt(tc["title"], cards),
-                "- **Priority:** %s" % tc.get("priority", 65),
-                "- **Why:** moves verification from human to agent; the agent drives the "
-                "surface itself and answers each card with `board answer`.", ""]
-
     if n == 0:
         out.append("No obvious clusters or redundant tasks found.")
     else:
         out += ["---", "Run `board simplify --apply` to carry this out on the board."]
     return "\n".join(out)
-
-
-def card_of(q):
-    raw = q.get("card")
-    return json.loads(raw) if isinstance(raw, str) else (raw or {})
 
 
 # ---------- applying ------------------------------------------------------
@@ -295,42 +258,6 @@ def consolidate(group, project):
     return actions
 
 
-def consolidate_test_cards(cards, project, rules, env_url):
-    if not cards:
-        return []
-    spec_rule = rules["test_cards"]
-    title = fmt(spec_rule["title"], cards)
-    existing = find_existing(project, spec_rule.get("prefix"))
-    if existing:
-        return ["Reusing existing test-verification task %s" % existing]
-
-    spec = ["# %s\n" % title,
-            "Verify the open test cards by machine%s.\n" % (" against %s" % env_url if env_url else ""),
-            "For each card, drive the surface the card names (HTTP, CLI or a browser) and",
-            "check every expectation. Answer the card on the board with:",
-            '  `BOARD_WHO="$(cat ~/.cache/board/agent)" board answer <id> "<result>"`\n',
-            "## Cards to verify:\n"]
-    for c in cards:
-        card = card_of(c)
-        spec.append("### %s (belongs to %s) [%s]" % (c.get("id"), c.get("task"),
-                                                     card.get("repo", "-")))
-        spec.append("- URL: %s" % card.get("url", ""))
-        spec.append("- Log in: %s" % card.get("login", ""))
-        for i, (s, e) in enumerate(zip(card.get("steps", []), card.get("expected", [])), 1):
-            spec.append("  %d. Step: %s" % (i, s))
-            spec.append("     Expected: %s" % e)
-        spec.append('- Sign off: `BOARD_WHO="$(cat ~/.cache/board/agent)" board answer %s '
-                    '"Verified by machine: [details]"`\n' % c.get("id"))
-    try:
-        new_id = json.loads(run_board(
-            ["task", "create", "--title", title, "--priority",
-             str(spec_rule.get("priority", 65)), "--spec-file", "-"],
-            stdin="\n".join(spec))).get("id")
-        return ["Created test-verification task %s: '%s'" % (new_id, title)]
-    except Exception as e:
-        return ["Could not create test-verification task: %s" % e]
-
-
 def archive_done_tasks(project):
     """Archive every task with status 'done', so it drops out of ordinary lists and
     searches while staying in the event log."""
@@ -344,7 +271,7 @@ def archive_done_tasks(project):
     return actions
 
 
-def apply_all(analysis, project, rules, env_url):
+def apply_all(analysis, project, rules):
     actions = []
     try:
         run_board(["heartbeat"])
@@ -360,7 +287,6 @@ def apply_all(analysis, project, rules, env_url):
                     actions.append("Could not close/archive %s: %s" % (t["id"], e))
         else:
             actions += consolidate(g, project)
-    actions += consolidate_test_cards(analysis["test_cards"], project, rules, env_url)
     actions += archive_done_tasks(project)
     return actions
 
@@ -376,8 +302,6 @@ def main():
     m = manifest()
     project = args.project or m.get("project") or "default"
     rules, rules_file = load_rules(m.get("root"))
-    env_url = ((m.get("environments") or {}).get(rules["test_cards"].get("env", "dev"))
-               or {}).get("url", "")
 
     if args.archive_done:
         actions = archive_done_tasks(project)
@@ -389,10 +313,10 @@ def main():
                 print("- " + a)
         return
 
-    analysis = analyze(get_tasks(project), get_test_cards(project), rules)
+    analysis = analyze(get_tasks(project), rules)
 
     if args.apply:
-        actions = apply_all(analysis, project, rules, env_url)
+        actions = apply_all(analysis, project, rules)
         if args.json:
             print(json.dumps({"project": project, "actions": actions}, indent=2))
         else:
@@ -406,7 +330,6 @@ def main():
             "open_count": analysis["open_count"],
             "groups": {g["name"]: [t["id"] for t in g["tasks"]]
                        for g in analysis["groups"] if g["tasks"]},
-            "test_cards": [c["id"] for c in analysis["test_cards"]],
         }, indent=2))
     else:
         print(format_report(analysis, project, rules, rules_file))

@@ -8,8 +8,7 @@ commands. **You never need to set environment variables** — `board` fetches th
 
 ```bash
 board open            # opens /status in a browser here
-board open tests      # straight to the test queue
-board open tests --qr # a QR code in the terminal — scan it with your phone
+board open --qr       # a QR code in the terminal — scan it with your phone
 ```
 
 The token is 43 characters and impossible to type on a phone, so `--qr` is the way there: scan
@@ -24,21 +23,16 @@ the plain addresses are enough:
 |---|---|
 | `/status` | phase per project, living agents with context and quota usage, tasks, open questions |
 | `/t/<id>` | one task: PR number, review findings, timeline, and whether its owner is alive |
-| `/tests` | **your user tests**, sorted live > launch > build > idea |
 | `/q/<id>` | one question, with answer buttons |
 
-**On the phone:** `board open tests --qr` and scan. After that every push notification is
+**On the phone:** `board open --qr` and scan. After that every push notification is
 clickable straight through.
 
-## The morning routine
+## Testing
 
-1. A push says, for example, "3 tests waiting (myproj 2, otherproj 1)".
-2. Open `/tests` on the phone. Each card has everything you need without a lookup: URL, login,
-   numbered steps **with an expectation per step**, risk and a rollback command.
-3. Press **OK** or **FAIL** (+ what you saw). The answer wakes the agent that asked — it picks it
-   up in `board inbox` and carries on by itself.
-
-You do not need to read PRs, logs or the entry file to answer.
+There is no test queue. The agents test their own work with the CLI, playwright or test code
+before merge; you test in dev or prod after deploy. Found something? `board task create`, or
+comment on the task at `/t/<id>`.
 
 ## The commands you actually use
 
@@ -52,10 +46,7 @@ board status --me                 # your own row + .stop: the board's finished s
                                   # fails (exit 2) if you are not registered; if the ceilings are
                                   # missing from the policy the block says so with
                                   # ceilings_missing + note
-board tests                       # the test queue in the terminal
 board answer Q-9 "unlimited"      # answer a question
-board answer Q-9 ok               # approve a test
-board answer Q-9 "fail: the button never appeared"
 board tail --since 2h             # what happened overnight
 ```
 
@@ -84,20 +75,19 @@ agent could pin itself as coordinator or answer its own high-risk question.
 | An agent shows as `stalled` | alive, but no progress for longer than the lease | something other than quota is wrong; the reaper hands the task on at the next tick |
 | `{"queued":true}` from an agent | the board was down, the call is in the outbox | nothing — it flushes on the next call |
 | `{"stale":true}` on a read | board down, this is cache | nothing; the agent carries on |
-| A question went `defaulted` | the deadline passed | the PR is marked "assumes X, Q-n unanswered". A test card can **never** default to OK |
+| A question went `defaulted` | the deadline passed | the PR is marked "assumes X, Q-n unanswered" |
 | The board does not answer | the pod is down | `kubectl -n board rollout restart deploy/board` |
 
 ## Phase drives the strictness
 
-The phase is in the project's `project.yaml` and is mirrored to the board. It decides the test
-level, the merge gate, prod deploys and the model choice — see `DESIGN.md` §3.6.
+The phase is in the project's `project.yaml` and is mirrored to the board. It decides the merge gate, prod deploys and the model choice — see `DESIGN.md` §3.6.
 
 | Phase | A merge requires |
 |---|---|
 | `idea` | nothing beyond the mechanical checks |
 | `build` | + review findings closed |
-| `launch` | + a human OK when `risk=high` |
-| `live` | + a human OK on everything |
+| `launch` | + review findings closed |
+| `live` | + review findings closed |
 
 Change phase: `board project set --project myproj --phase live`.
 
@@ -114,7 +104,7 @@ file (`next-prompt.md` or `docs/next-prompt.md`), the onboarding file (`AGENT_ON
 `CLAUDE.md`), and the forge type from `git remote get-url origin`.
 
 **Two fields you must set yourself**, and that is deliberate: `phase:` and `goal:`. The phase
-drives the merge gate, the test level and prod deploys — it cannot be read out of files, and an
+drives the merge gate and prod deploys — it cannot be read out of files, and an
 agent must not be able to give itself slacker rules by guessing it.
 
 ```bash
@@ -131,7 +121,7 @@ run on the general rules alone (§10).
 - **Branch protection** on the forge. The agent's token is not an admin token. Without branch
   protection, prompt text is the only thing stopping "push straight to main" — see `DESIGN.md`
   §8.1.
-- **Approving a high-risk merge** in `launch`/`live` — that is the entire point of the test queue.
+- **Testing after deploy** in dev or prod — the merge does not wait for it.
 
 ## Useful, but not the board
 

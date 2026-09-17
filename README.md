@@ -48,7 +48,7 @@ flowchart LR
     A3 <--> Q
     P --> Q
     Q --> L
-    Q -->|"push: questions,<br/>test cards, blocks"| H
+    Q -->|"push: questions,<br/>blocks"| H
     H -->|"answers, pins,<br/>phase changes"| Q
     A1 -->|"PR, merge"| F
 ```
@@ -70,7 +70,6 @@ these is true:
 | An agent grants itself permission | Grants come from a policy file on the board, keyed on `harness@host`. An agent cannot write them. |
 | Quota is shared across sessions and machines | The board takes the highest reading per window name per harness account and answers `.stop` — the agent does not re-derive thresholds. |
 | A human decision is needed at 3 a.m. | `board ask` returns immediately with a default. The agent builds the default, marks the PR, and moves on. The human overrides later, and the board turns that into new work. |
-| The agent needs a human to *look* at something | A test card goes into one queue, answerable from a phone in three taps. Nothing blocks on it. |
 
 ## The loop
 
@@ -97,7 +96,7 @@ sequenceDiagram
     C->>F: merge in a dedicated merge worktree
     C->>B: board task merged --sha …
     C->>C: board task deploy T-42
-    C->>B: test card if the change is visual → board task done
+    C->>B: board task done (the human tests after deploy)
 ```
 
 Two rules shape everything else:
@@ -116,10 +115,8 @@ stateDiagram-v2
     [*] --> open
     open --> claimed: claim
     claimed --> in_review: implementer hands off
-    claimed --> awaiting_human: test card, launch/live
     claimed --> blocked: needs a human
     in_review --> claimed: coordinator picks it up
-    awaiting_human --> claimed: human answers
     claimed --> merging: gate passed
     merging --> claimed: merged --sha
     claimed --> done: deployed
@@ -131,15 +128,15 @@ stateDiagram-v2
     done --> [*]
 ```
 
-`awaiting_human` and `blocked` are **documented waits** — the reaper never orphans them for lease
+`blocked` is a **documented wait** — the reaper never orphans it for lease
 expiry, because waiting hours on a human is correct behaviour, not a stall. But if the owner
-*dies*, they can still be taken over.
+*dies*, it can still be taken over.
 
 ## What is in here
 
 | File | What |
 |---|---|
-| `board.py` | The whole service: stdlib HTTP + SQLite, an append-only `events` table plus projections, push notifications, the reaper, and the HTML pages `/status`, `/tests`, `/q/<id>`, `/t/<task>` |
+| `board.py` | The whole service: stdlib HTTP + SQLite, an append-only `events` table plus projections, push notifications, the reaper, and the HTML pages `/status`, `/q/<id>`, `/t/<task>` |
 | `bin/board` | The CLI the agents use. Queues writes to `~/.cache/board/<board>/outbox.jsonl` when the board is down, and reads from cache with `stale:true` — the agent is never blocked |
 | `bin/manifest.py` | Finds and reads `project.yaml`, searching upwards like git finds `.git` |
 | `bin/simplify.py` | Consolidates a fragmented queue. Three rules are built in; domain clusters come from `simplify-rules.yaml` |
@@ -247,15 +244,18 @@ browser logs no CSP violation in light and dark mode, on a wide screen and on a 
 ## Phase: how strict the gate is
 
 Every project declares a phase in `project.yaml`. It is the one field a human must set, and the
-reason is structural: the phase decides the merge gate, the test level and whether a prod deploy
+reason is structural: the phase decides the merge gate and whether a prod deploy
 is allowed, so an agent that could infer it could give itself milder rules.
 
 | Phase | What it means | A merge requires |
 |---|---|---|
 | `idea` | Break things freely, no users | the mechanical checks |
 | `build` | Under development | + review findings closed |
-| `launch` | Heading for users | + a human OK when `risk=high` |
-| `live` | Users in production | + a human OK on everything |
+| `launch` | Heading for users | + review findings closed |
+| `live` | Users in production | + review findings closed |
+
+There is no human test stage before merge: agents test their own work (CLI, playwright, test
+code), and the human tests in dev or prod after deploy.
 
 ## Security
 

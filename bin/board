@@ -84,7 +84,7 @@ mkdir -p "$CACHE/cache"
 
 die() { echo "board: $*" >&2; exit 2; }
 
-# Reads the file argument of --spec-file/--card-file. `-` means stdin, and it MUST be
+# Reads the file argument of --spec-file. `-` means stdin, and it MUST be
 # read into a variable first: otherwise jq shares fd 0 with the here-string that is the
 # JSON input, and both come out empty. An empty file is worse than no file — we get a
 # task with no description that is claimed by somebody who cannot do it — so we die
@@ -834,81 +834,6 @@ message)
   to="${1:?board message <agent> --text \"...\"}"; shift; parse "$@"
   req POST /messages "$(with_agent "$(body to "$to")")" ;;
 
-test)
-  sub="${1:-}"; shift || true; parse "$@"
-  case "$sub" in
-    request) t="${POS[0]:-}"; f=$(jq -r '.card_file // empty' <<<"$(body)")
-             [ -n "$f" ] || die "board test request T-42 --card-file card.json"
-             card=$(slurp "$f") || exit 2
-             jq -e . >/dev/null 2>&1 <<<"$card" || die "the card file is not valid JSON: $f"
-             req POST /questions "$(jq -c --arg t "$t" --arg a "$(agent_id)" \
-               --arg p "$(project_name "$(jq -r '.project // empty' <<<"$card")")" --argjson c "$card" \
-               '{kind:"test", task:$t, agent:$a, project:$p, card:$c}' <<<'{}')" ;;
-    *) die "board test request T-42 --card-file card.json" ;;
-  esac ;;
-
-test-level)
-  # Phase × change class (DESIGN.md §5). The class is derived from the diff, not from judgement.
-  t="${1:?board test-level T-42}"
-  manifest_sh
-  info=$(req GET "/tasks/$t"); wt=$(jq -r '.worktree // empty' <<<"$info")
-  files=$(git -C "${wt:-$ROOT}" diff --name-only origin/main 2>/dev/null)
-  class=ui
-  grep -qE '\.(ts|kt|java|py|go)$' <<<"$files" && class=logic
-  grep -qE '(openapi|\.proto$|dto|routes?/.*\+server)' <<<"$files" && class=contract
-  grep -qE '(migration|flyway|\.sql$)' <<<"$files" && class=data
-  grep -qE '(helm|k8s|\.ya?ml$|Dockerfile|\.forgejo|\.github)' <<<"$files" && class=infra
-  grep -qiE '(payment|auth|keycloak|billing|stripe)' <<<"$files" && class=money-auth
-  risk=$(jq -r '.risk // "normal"' <<<"$info")
-  case "$PHASE:$class" in
-    idea:*)                      lvl=auto; env=mock ;;
-    build:data|build:money-auth) lvl=human; env=dev ;;
-    build:*)                     lvl=auto; env=dev ;;
-    launch:contract|launch:data|launch:money-auth) lvl=human; env=dev ;;
-    launch:infra)                lvl=human; env=dev ;;
-    launch:*)                    lvl=auto; env=dev ;;
-    live:ui)                     lvl=auto; env=dev ;;
-    live:*)                      lvl=human; env=dev ;;
-  esac
-  [ "$risk" = high ] && [ "$PHASE" != idea ] && lvl=human
-  # Phase×class says what SHOULD be tested. `auto` additionally requires two things the
-  # table knows nothing about: that the agent CAN run it, and that an automatic test for
-  # the surface EXISTS. If either is missing, auto means in practice that nobody looks at
-  # it — and then the answer is human. This holds for every project, not just this one.
-  # HTML/CSS is a surface a human looks at. `how` can prove that the API works, never that
-  # the page looks right — so visual changes always go to a human.
-  diffbody=$(git -C "${wt:-$ROOT}" diff origin/main 2>/dev/null | grep '^[+-]' | head -400)
-  if grep -qE '\.(html|css|scss|svelte|vue|tsx|jsx)$' <<<"$files" \
-     || grep -qE '<style|</?(div|table|form|button|h[1-9])|class=|CSS = ' <<<"$diffbody"; then
-    lvl=human; why="the change touches a visual surface; an automatic test does not cover appearance"
-  fi
-  if [ "$lvl" = auto ]; then
-    # Same fallback as before (env, otherwise mock), but we take the WHOLE environment,
-    # not just .how — `requires` must come from the environment the test actually runs in.
-    envjson=$("$MANIFEST" | jq -c --arg e "$env" \
-      '[.environments[$e], .environments.mock] | map(select(.!=null and .how!=null)) | first // {}')
-    how=$(jq -r '.how // empty' <<<"$envjson")
-    # What the test requires is a property of the TEST, not an assumption in the CLI:
-    # ./conformance.sh needs no browser, `pnpm test:e2e` does. An omitted `requires:`
-    # keeps the old behaviour (browser-test) — T-142.
-    need=$(jq -r '(.requires // ["browser-test"])[]' <<<"$envjson")
-    if [ -z "$how" ]; then lvl=human; why="the manifest does not say how this surface is tested automatically"
-    else
-      have=$(req GET "/status" | jq -r --arg a "$(agent_id)" \
-        '[.projects[].agents[]?|select(.id==$a)|.capabilities]|first // "[]"')
-      for cap in $need; do
-        # playwright counts as browser-test; otherwise the name is the name.
-        case "$cap" in browser-test) pat='browser-test\|playwright' ;; *) pat="$cap" ;; esac
-        grep -q "$pat" <<<"$have" || { lvl=human; why="the agent lacks $cap"; break; }
-      done
-    fi
-  fi
-  jq -nc --arg l "$lvl" --arg c "$class" --arg e "$env" --arg p "$PHASE" \
-     --arg w "${why:-}" --arg h "${how:-}" \
-     '{level:$l, class:$c, env:$e, phase:$p} + (if $w=="" then {} else {why:$w} end)
-      + (if $h=="" then {} else {how:$h} end)' ;;
-
-
 routines|routine)
   parse "$@"; b=$(body); p=$(jq -r '.project // empty' <<<"$b"); st=$(jq -r '.status // empty' <<<"$b")
   [ -z "$p" ] && p=$("$MANIFEST" 2>/dev/null | jq -r '.project // empty')
@@ -918,10 +843,6 @@ routines|routine)
   r=$(req GET "/routines?$qs")
   jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
   jq -r '.routines[]? | "\(.name) \(.interval // "-") \(if .next_due then "due:"+.next_due else "-" end) \(.status) \(.title[0:56])"' <<<"$r" ;;
-
-tests)
-  parse "$@"; p=$(jq -r '.project // empty' <<<"$(body)")
-  req GET "/questions?kind=test&status=open${p:+&project=$p}" ;;
 
 role)
   sub="${1:-}"; shift || true; parse "$@"
@@ -956,7 +877,7 @@ status)
       "\(.name) \(.phase)\(if .paused then " PAUSED: "+.paused else "" end)",
       (.agents[]? | "  \(.id) \(.status) \(.model//"?"|sub("claude-";"")) ctx\(.ctx_pct//0|floor) \([(.budget//[])[]|"\(.window):\(.used_pct//0|floor)"]|join(" ")) \(.current_task//"-") \(.roles|join(","))"),
       (.tasks[]? | select(.status != "done" and .status != "archived") | "  \(.id) \(.status) \(.owner//"-"|sub("^(?<h>[a-z]{2})-[^-]+-"; .h+"-")) \(.title[0:52])"),
-      (.questions[]? | "  ? \(.id) \(.kind) \(.task//"-") \((.text//"test card")[0:52])")' <<<"$r"
+      (.questions[]? | "  ? \(.id) \(.kind) \(.task//"-") \((.text//"-")[0:52])")' <<<"$r"
     exit 0
   fi
   if jq -e '.md' >/dev/null <<<"$b"; then
@@ -990,7 +911,7 @@ open)
   # WHICH identity this link hands out. The human token is fetched from `pass` only when
   # no harness was derived (§3.7), so inside an agent session $BOARD_TOKEN is the AGENT
   # token — and that is the failure this block exists to prevent. A phone logged in with
-  # an agent token renders every page perfectly: status, the test queue, the answer
+  # an agent token renders every page perfectly: status, the tasks, the answer
   # buttons. Only when you press one does it refuse, with a raw 403, on a phone. The
   # login looks like it worked for as long as you are not trying to do anything.
   if [ -n "$BOARD_HUMAN_TOKEN" ]; then

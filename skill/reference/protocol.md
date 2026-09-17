@@ -24,7 +24,7 @@ known answer from the cache with `"stale":true`. **The agent always carries on.*
 | Gate | `board gate merge T-42` → exit 0/1 + a JSON reason | `GET /tasks/T-42/gate/merge` | Checks: review `open==0`, phase policy, grant, the merge mutex, and `human.test_result` when required. |
 | Merge markers | `board task merging T-42` / `board task merged T-42 --sha abc` | `POST …/merge_requested`, `…/merge_verified` | Two events around the merge itself (§7c). `merging` refuses while the task's working copy is dirty; `merged` refuses a sha that is not on `origin/main`. |
 | Task done | `board task done T-42` | `POST /tasks/T-42/done` | Requires `merge_verified` (or `--no-merge` for docs-only), and a deploy event when the manifest declares one. |
-| Release | `board task release T-42 --note "out of tokens"` | `POST /tasks/T-42/release` | Back to `open` with all context preserved. An `in_review` or `awaiting_human` keeps its status. |
+| Release | `board task release T-42 --note "out of tokens"` | `POST /tasks/T-42/release` | Back to `open` with all context preserved. An `in_review` keeps its status. |
 | Ask | `board ask --task T-42 --default "B" --deadline 8h "Should X be A or B?"` → `{id: Q-9}` | `POST /questions` | **Returns immediately.** The board pushes a notification with a link to `/q/Q-9`. |
 | Inbox | `board inbox` | `GET /agents/{id}/inbox` | Answered questions plus messages. The agent checks before each new task and after each subagent. |
 | Answer | `board answer Q-9 "A"` (the human) | `POST /questions/Q-9/answer` | At the deadline with no answer: `question.defaulted` with `default_answer` — the agent carries on with the default and *marks the PR* "assumes A, Q-9 unanswered". |
