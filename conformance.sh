@@ -764,6 +764,11 @@ check "the status is still in_review after the claim" "$(api GET /tasks/$T3ID)" 
 api POST /tasks/$T3ID/release "{\"agent\":\"$BID\"}" >/dev/null
 
 if [ "$OWN_SERVER" = 1 ]; then
+# blocked (T-407): owned by someone else is still refused via owns() — T2ID was released
+# (owner NULL) above, so re-claim it first to set that case up.
+api POST /tasks/$T2ID/claim "{\"agent\":\"$AID\"}" >/dev/null
+check "blocking a task owned by someone else is refused" \
+  "$(api POST /tasks/$T2ID/blocked "{\"agent\":\"$BID\",\"note\":\"not mine\"}")" '.error'
 check "blocked notifies" "$(api POST /tasks/$T2ID/blocked "{\"agent\":\"$AID\",\"note\":\"classifier refused\"}")" '.ok'
 for _ in $(seq 50); do grep -q "classifier refused" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
 N=$(cat "$TMP/ntfy" 2>/dev/null || true)
@@ -781,6 +786,33 @@ N=$(cat "$TMP/ntfy" 2>/dev/null || true)
 grep -B2 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
   && ok "finished links to the agent's current task" \
   || no "finished links to the agent's current task" "$(grep -B2 'click check' <<<"$N")"
+# But T3ID is unowned (in_review, released above): the root fix claims it for whoever
+# blocks it instead of refusing outright — a blocked task always ends up owned.
+# T-407: the self-claim branch must validate the agent (like task_claim) before making it
+# the owner — a phantom id would make the task unclaimable by anyone real.
+check "blocking an unowned task with an unknown agent id is refused" \
+  "$(api POST /tasks/$T3ID/blocked "{\"agent\":\"nonexistent-agent\",\"note\":\"phantom\"}")" '.error'
+check "the phantom-agent block attempt did not claim the task" "$(api GET /tasks/$T3ID)" \
+  '.owner==null and .status=="in_review"'
+# T-407: same_project() must also gate the self-claim branch, like task_claim/task_patch.
+OID=$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s-t407"}' | jq -r .id)
+check "blocking an unowned task from a different project is refused" \
+  "$(api POST /tasks/$T3ID/blocked "{\"agent\":\"$OID\",\"note\":\"wrong project\"}")" '.error'
+check "the cross-project block attempt did not claim the task" "$(api GET /tasks/$T3ID)" \
+  '.owner==null and .status=="in_review"'
+check "blocking an unowned task claims it for the caller" \
+  "$(api POST /tasks/$T3ID/blocked "{\"agent\":\"$BID\",\"note\":\"waiting on a design call\"}")" '.ok'
+check "the claim-and-block sticks" "$(api GET /tasks/$T3ID)" \
+  '.status=="blocked" and .owner=="'"$BID"'"'
+# T-407: self-claim must also update agents.current_task, like task_claim does.
+check "the self-claim updates agents.current_task" \
+  "$(api POST /agents/$BID/heartbeat '{}')" '.task=="'"$T3ID"'"'
+# Retire both now they have served their purpose: left blocked+owned, the owning agent's
+# later /finished plus a reap cycle would legitimately hand them back as 'orphaned' (owner
+# dead/finished — by design, see reap()) and they would then compete with the WIP-limit
+# fixture further down.
+api POST /tasks/$T2ID/archive "{\"agent\":\"$AID\",\"note\":\"conformance cleanup\"}" >/dev/null
+api POST /tasks/$T3ID/archive "{\"agent\":\"$BID\",\"note\":\"conformance cleanup\"}" >/dev/null
 fi
 check "project isolation (403)" "$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' >/dev/null; api POST /tasks/$TID/claim "{\"agent\":\"$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' | jq -r .id)\"}")" '.error'
 check "finished releases everything" "$(api POST /agents/$AID/finished '{"reason":"queue empty"}')" '.ok'
@@ -858,6 +890,20 @@ d=sqlite3.connect(sys.argv[1],timeout=5); d.execute(sys.argv[2]); d.commit()' "$
   check "dispatch+tokens on an orphaned task is still 409" \
     "$(apic POST /tasks/$T3ID/progress "{\"agent\":\"$CID\",\"dispatch\":\"tester:sonnet\",\"tokens\":1,\"result\":\"x\"}")" \
     '.code==409 and (.body.error|test("no longer yours")) and .body.status=="orphaned"'
+
+  echo "== recovering a pre-existing blocked+owner-NULL row (T-407) =="
+  # task_blocked now requires ownership, so this state cannot be produced through the API
+  # any more — but rows already stuck in it (the dead end this task fixes) must still
+  # recover through the ordinary claim path.
+  T3B=$(api POST /tasks "{\"agent\":\"$CID\",\"project\":\"demo\",\"title\":\"legacy dead end\"}" | jq -r .id)
+  sql "UPDATE tasks SET status='blocked', owner=NULL WHERE id='$T3B'"
+  check "a pre-existing blocked task with owner NULL can still be claimed" \
+    "$(api POST /tasks/$T3B/claim "{\"agent\":\"$EID\"}")" '.owner=="'"$EID"'"'
+  check "recovering it produces a normal claimed task, not blocked" "$(api GET /tasks/$T3B)" \
+    '.status=="claimed"'
+  # Retire it: left claimed, EID finishing later plus a reap cycle would hand it back as
+  # 'orphaned' (by design) and it would then compete with the WIP-limit fixture below.
+  api POST /tasks/$T3B/archive "{\"agent\":\"$EID\",\"note\":\"conformance cleanup\"}" >/dev/null
 
   echo "== the reaper tells waiting apart from stopping =="
   T6ID=$(api POST /tasks "{\"agent\":\"$EID\",\"project\":\"demo\",\"title\":\"blocked\"}" | jq -r .id)
@@ -1199,9 +1245,13 @@ else
 fi
 # A task of its own for this check: the earlier ones were closed by the tests above, and
 # /status does not show `done`. The test must measure the rendering, not the ordering.
-SLID=$(jq -r .id <<<"$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"status link\"}")")
-api POST /tasks/$SLID/claim "{\"agent\":\"$AID\"}" >/dev/null
-api POST /tasks/$SLID/progress "{\"agent\":\"$AID\",\"pr\":\"http://pr/1\"}" >/dev/null
+# A fresh agent, not $AID/$BID: both are `finished` by now (see above), and a claim by a
+# finished agent silently fails — this must show ITS OWN pr, not ride on some other task's
+# leftover one.
+SLA=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","session":"sl"}' | jq -r .id)
+SLID=$(jq -r .id <<<"$(api POST /tasks "{\"agent\":\"$SLA\",\"project\":\"demo\",\"title\":\"status link\"}")")
+api POST /tasks/$SLID/claim "{\"agent\":\"$SLA\"}" >/dev/null
+api POST /tasks/$SLID/progress "{\"agent\":\"$SLA\",\"pr\":\"http://pr/1\"}" >/dev/null
 STHTML=$(curl -sL -c "$J" -b "$J" "$BOARD_URL/status")
 # `>pr<` and not `<th>pr`: the check must see that the PR has its OWN COLUMN, not that the
 # header cell has no attributes. The previous form made every class on a <th> a conformance
