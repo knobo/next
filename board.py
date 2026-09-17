@@ -1108,6 +1108,13 @@ def task_claim(tid, aid):
     if not cur:
         raise Err(409, "the task is taken", owner=t["owner"], status=t["status"])
     db.execute("UPDATE agents SET current_task=? WHERE id=?", (tid, aid))
+    # A new owner means new code under review: results given for the previous owner's work
+    # must not pass the gate for this one. Same owner re-claiming keeps its round.
+    prev = db.execute("SELECT actor FROM events WHERE stream=? AND type='task.claimed' "
+                      "ORDER BY id DESC LIMIT 1", ("task/" + tid,)).fetchone()
+    if prev and prev["actor"] != aid:
+        ev(t["project"], "task/" + tid, "task.review_round", aid, reason="new owner")
+        db.execute("UPDATE tasks SET review_open=NULL, review_fixed=NULL WHERE id=?", (tid,))
     ev(t["project"], "task/" + tid, "task.claimed", aid, lease_until=plus(LEASE_MIN))
     return {"id": tid, "owner": aid, "lease_until": plus(LEASE_MIN),
             "worktree": t["worktree"], "branch": t["branch"], "pr": t["pr"]}
@@ -1296,10 +1303,12 @@ def task_review(tid, aid, b):
         ev(t["project"], "task/" + tid, "task.review_round", aid)
     ev(t["project"], "task/" + tid, "task.review_result", aid,
        open=int(b.get("open", 0)), fixed=int(b.get("fixed", 0)), sha=b.get("sha"))
-    # The columns are derived (UI, status, WIP counter): the worst result in this round.
-    rs = review_round(tid).values()
+    # The columns are derived (UI, status, WIP counter): the worst NON-OWNER result in this
+    # round, same as the gate. Only the owner's word → NULL, i.e. still unreviewed.
+    rs = [r for a, r in review_round(tid).items() if a != t["owner"]]
     db.execute("UPDATE tasks SET review_open=?, review_fixed=?, status='in_review', updated=? WHERE id=?",
-               (max(r.get("open", 0) for r in rs), max(r.get("fixed", 0) for r in rs), now(), tid))
+               (max((r.get("open", 0) for r in rs), default=None),
+                max((r.get("fixed", 0) for r in rs), default=None), now(), tid))
     return {"ok": True}
 
 

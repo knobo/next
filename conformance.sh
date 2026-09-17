@@ -1059,7 +1059,9 @@ api POST "/tasks/$W1/claim" "{\"agent\":\"$WAG\"}" >/dev/null
 check "a hand-off is NEVER blocked by the limit" \
   "$(api POST "/tasks/$W1/release" "{\"agent\":\"$WAG\",\"note\":\"back\"}")" '.ok'
 api POST "/tasks/$W1/claim" "{\"agent\":\"$WAG\"}" >/dev/null
-api POST "/tasks/$W1/review" "{\"agent\":\"$WAG\",\"open\":0}" >/dev/null
+# A review by someone other than the owner — the owner's own word does not count (T-282).
+WRV=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","session":"wip-rev","capabilities":["merge"]}' | jq -r .id)
+api POST "/tasks/$W1/review" "{\"agent\":\"$WRV\",\"open\":0}" >/dev/null
 api POST "/tasks/$W1/release" "{\"agent\":\"$WAG\"}" >/dev/null
 check "a review lowers the counter" "$(api GET '/tasks?project=demo')" \
   '[.tasks[]|select(.status=="in_review" and .review_open==null and (.title|startswith("wip")))]|length == 4'
@@ -1793,6 +1795,20 @@ cli task review "$RR" --open 0 --fixed 1 --round >/dev/null
 check "a new round started by the owner alone: the gate is closed" "$(cli gate merge "$RR")" '.ok==false'
 REVB task review "$RR" --open 0 --fixed 0 >/dev/null
 check "new round + B open=0: the gate opens" "$(cli gate merge "$RR")" '.ok==true'
+# T-282 review [40]: the derived columns follow the gate — the owner's own word is not a review.
+check "review_open/review_fixed come from non-owner results only" \
+  "$(api GET "/tasks/$RR")" '.review_open==0 and .review_fixed==0'
+# T-282 review [45]: a new owner's claim starts a fresh round; the same owner re-claiming does not.
+cli task release "$RR" >/dev/null
+cli task claim "$RR" >/dev/null
+check "the same owner re-claiming keeps the round: the gate stays open" "$(cli gate merge "$RR")" '.ok==true'
+cli task release "$RR" >/dev/null
+REVC task claim "$RR" >/dev/null
+check "a new owner's claim drops the previous owner's review results" \
+  "$(REVC gate merge "$RR")" '.ok==false and ([.reasons[]|select(test("no review result"))]|length)==1'
+check "a new owner's claim resets the derived review columns" \
+  "$(api GET "/tasks/$RR")" '.review_open==null and .review_fixed==null'
+REVC task release "$RR" >/dev/null
 api POST "/agents/$REVBID/finished" '{"reason":"conformance done"}' >/dev/null
 api POST "/agents/$REVCID/finished" '{"reason":"conformance done"}' >/dev/null
 api POST "/agents/$REVID/finished" '{"reason":"conformance done"}' >/dev/null
