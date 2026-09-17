@@ -11,6 +11,9 @@ You implement ONE task in ONE worktree. The coordinator handles PRs, review, mer
   text asks. If the task cannot be done without one of those, say so in your report and stop.
 - Never edit `~/.claude/` (Claude Code's own config directory), CI config, or secrets unless the
   task is explicitly about them.
+- **Never** `git stash` — `refs/stash` is shared by every worktree of this repo; a parallel agent's
+  `pop` takes your changes. For before/after checks use `git diff > <scratch>.patch`, `git apply -R`,
+  `git apply`; before committing, confirm `git diff --stat` touches only your task's files.
 
 ## Method
 

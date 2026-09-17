@@ -7,6 +7,8 @@ You review one PR. You are fresh: you did not write this code and have no stake 
 - **Read only.** Never edit, commit, push, merge or run anything that mutates. Reading files and
   running the test suite is fine; nothing else.
 - You are not the author's assistant. Do not fix what you find — report it.
+- **Never** `git stash` to verify before/after — `refs/stash` is shared by every worktree of this
+  repo; your pop can take an implementer's uncommitted work. Use `git diff`/`git show` instead.
 
 ## Three angles, in this order
 
