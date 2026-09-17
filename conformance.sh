@@ -858,9 +858,11 @@ api POST /tasks/$CLKID/claim "{\"agent\":\"$CLKAG\"}" >/dev/null
 api POST "/agents/$CLKAG/finished" '{"reason":"click check"}' >/dev/null
 for _ in $(seq 50); do grep -q "click check" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
 N=$(cat "$TMP/ntfy" 2>/dev/null || true)
-grep -B2 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
+# The reason lives in the TITLE line now (finished() names it there), so CLICK is the
+# line AFTER the match, not before.
+grep -A1 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
   && ok "finished links to the agent's current task" \
-  || no "finished links to the agent's current task" "$(grep -B2 'click check' <<<"$N")"
+  || no "finished links to the agent's current task" "$(grep -A1 'click check' <<<"$N")"
 # But T3ID is unowned (in_review, released above): the root fix claims it for whoever
 # blocks it instead of refusing outright — a blocked task always ends up owned.
 # T-407: the self-claim branch must validate the agent (like task_claim) before making it
@@ -890,15 +892,47 @@ api POST /tasks/$T2ID/archive "{\"agent\":\"$AID\",\"note\":\"conformance cleanu
 api POST /tasks/$T3ID/archive "{\"agent\":\"$BID\",\"note\":\"conformance cleanup\"}" >/dev/null
 fi
 check "project isolation (403)" "$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' >/dev/null; api POST /tasks/$TID/claim "{\"agent\":\"$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' | jq -r .id)\"}")" '.error'
-check "finished releases everything" "$(api POST /agents/$AID/finished '{"reason":"queue empty"}')" '.ok'
 if [ "$OWN_SERVER" = 1 ]; then
-for _ in $(seq 50); do grep -q "queue empty" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
-N=$(cat "$TMP/ntfy" 2>/dev/null || true)
-grep -B2 "queue empty" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
-  && ok "finished with no current task links to /status" \
-  || no "finished with no current task links to /status" "$(grep -B2 'queue empty' <<<"$N")"
+  QLINES=$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)
+fi
+check "finished releases everything" "$(api POST /agents/$AID/finished '{}')" '.ok'
+if [ "$OWN_SERVER" = 1 ]; then
+  sleep .3
+  [ "$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)" = "$QLINES" ] \
+    && ok "finished with no reason (the real queue-empty caller, SKILL.md:71) pushes nothing" \
+    || no "finished with no reason (the real queue-empty caller, SKILL.md:71) pushes nothing" \
+       "$(tail -n +$((QLINES + 1)) "$TMP/ntfy" 2>/dev/null)"
+  # Other routine, expected exits: "queue empty" said explicitly, and "session end" from
+  # the SessionEnd hook (hooks/session-end.sh) that fires on every clean exit. Case
+  # varies to prove the match is case-insensitive.
+  for r in "Queue Empty" "session end"; do
+    QLINES=$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)
+    api POST /agents/$AID/finished "$(jq -nc --arg r "$r" '{reason:$r}')" >/dev/null
+    sleep .3
+    [ "$(wc -l < "$TMP/ntfy" 2>/dev/null || echo 0)" = "$QLINES" ] \
+      && ok "finished with routine reason '$r' pushes nothing" \
+      || no "finished with routine reason '$r' pushes nothing" \
+         "$(tail -n +$((QLINES + 1)) "$TMP/ntfy" 2>/dev/null)"
+  done
+  # finished() must still link to /status when a non-routine reason has no current task
+  # (T-389's fallback) — the routine reasons above no longer push at all, so that path
+  # needs its own agent with a real reason to stay covered.
+  NOTASKAG=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"nt","session":"nt"}' | jq -r .id)
+  api POST "/agents/$NOTASKAG/finished" '{"reason":"no task click check"}' >/dev/null
+  for _ in $(seq 50); do grep -q "no task click check" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
+  N=$(cat "$TMP/ntfy" 2>/dev/null || true)
+  # The reason lives in the TITLE line now, so CLICK is the line AFTER the match.
+  grep -A1 "no task click check" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
+    && ok "finished with no current task links to /status" \
+    || no "finished with no current task links to /status" "$(grep -A1 'no task click check' <<<"$N")"
 fi
 api POST "/agents/$BID/finished" '{"reason":"conformance"}' >/dev/null
+if [ "$OWN_SERVER" = 1 ]; then
+  for _ in $(seq 20); do grep -q "agent finished (conformance): $BID" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
+  grep -q "agent finished (conformance): $BID" "$TMP/ntfy" 2>/dev/null \
+    && ok "finished with a real reason pushes and names it in the title" \
+    || no "finished with a real reason pushes and names it in the title" "$(cat "$TMP/ntfy" 2>/dev/null)"
+fi
 
 echo "== lease: heartbeat is life, task.progress is progress (Q-107) =="
 C=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","session":"s4"}')
