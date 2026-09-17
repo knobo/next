@@ -1188,6 +1188,33 @@ else
   no "status links and the PR column" "$STHTML"
 fi
 
+if [ "$OWN_SERVER" = 1 ]; then
+  # T-284: a dead agent's ctx meter drew a precision that stopped being true the moment it
+  # stopped reporting, and 12 of 13 rows doing that is most of /status's height. agent_block()
+  # must render a live agent with a ctx meter and a non-alive one without — last seen instead.
+  MCA=$(jq -r .id <<<"$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-mctx","session":"s-mctx-a"}')")
+  api POST /agents/$MCA/heartbeat '{"ctx_pct":42}' >/dev/null
+  MCD=$(jq -r .id <<<"$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-mctx","session":"s-mctx-d"}')")
+  api POST /agents/$MCD/heartbeat '{"ctx_pct":42}' >/dev/null
+  sql "UPDATE agents SET last_seen='$PAST' WHERE id='$MCD'"
+  MCHTML=$(curl -sSL -m 5 -c "$J" -b "$J" "$BOARD_URL/status?t=$TOKEN")
+  MCRES=$(python3 -c "
+import sys
+html, alive_id, dead_id = sys.argv[1], sys.argv[2], sys.argv[3]
+def block(aid):
+    i = html.find(\">%s<\" % aid)
+    if i < 0: return None
+    start = html.rfind('<div data-agent', 0, i)
+    end = html.find('<div data-agent', i)
+    return html[start:end if end > 0 else len(html)]
+a, d = block(alive_id), block(dead_id)
+have_ctx = lambda b: b is not None and '<span class=k>ctx</span>' in b
+print('ok' if have_ctx(a) and not have_ctx(d) else 'fail alive=%s dead=%s' % (have_ctx(a), have_ctx(d)))
+" "$MCHTML" "$MCA" "$MCD")
+  [ "$MCRES" = ok ] && ok "status: a dead agent's row has no ctx meter, a live one does" \
+    || no "status: dead agent ctx meter" "$MCRES"
+fi
+
 echo "== prometheus metrics =="
 M_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BOARD_URL/metrics")
 [ "$M_CODE" = 200 ] && ok "GET /metrics returns 200 without token" || no "GET /metrics returns 200 without token" "HTTP $M_CODE"
