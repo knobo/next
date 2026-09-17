@@ -311,7 +311,6 @@ CREATE TABLE messages (   -- an agent→agent inbox
 `task.orphaned`, `task.deployed`, `task.done`, `task.archived`, `task.comment`,
 `task.default_overridden`,
 `question.asked`, `question.answered`, `question.defaulted`, `message.sent`,
-`human.test_requested`, `human.test_result`,
 `role.pinned`, `role.unpinned`, `role.claimed`, `role.released`, `role.recommended`.
 
 Heartbeats are written to `events` like everything else. A nightly job can compact
@@ -743,8 +742,8 @@ show that this does not hold. Three mechanical layers, in order of cost:
    board hiccups would be worked around within a day, and then it protects nothing.
 3. **The gate on the board is data-driven, not trust-based.** It requires
    `task.review_result.open == 0`, requires that the review event came from an agent id other than
-   the task's owner, requires `human.test_result == ok` when the phase table says so, checks that
-   the agent holds the `merge` grant, and holds a mutex so only one merge is in flight per project.
+   the task's owner, checks that the agent holds the `merge` grant, and holds a mutex so only one
+   merge is in flight per project.
    An agent cannot set grants (a policy file; only `board` or the human as actor).
 
 In addition, cheap protections already learned: review agents are never forks; `model:` is always
