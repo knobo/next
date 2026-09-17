@@ -307,6 +307,18 @@ if grep -qE ';;|\$\(' <<<"$HELPTOP"; then no "board help has no shell syntax" "$
 else ok "board help has no shell syntax"; fi
 if grep -qE ';;|\$\(' <<<"$HELPTASK"; then no "board help task has no shell syntax" "$HELPTASK"
 else ok "board help task has no shell syntax"; fi
+# Derived from the real top-level case labels, not the help table — mirrors TASK_SUBS
+# below, so a top-level command added or removed (e.g. T-352 dropped test/test-level/
+# tests, T-466 added grant/revoke/grants) fails this instead of the table silently
+# drifting from the case statement again.
+TOPLEVEL_SUBS=$(awk '/^case "\$cmd" in$/{f=1; next} f && /^esac$/{exit} f && /^[a-zA-Z0-9_|.-]+\)$/' "$SRC/bin/board" \
+  | sed 's/)$//' | tr '|' '\n' | grep -v '^-' | sort -u)
+TOP_LISTED=$(awk '/^HELP_TOPLEVEL=/{f=1; next} f && /^EOF$/{exit} f' "$SRC/bin/board" \
+  | awk -F'::' '{print $1}' | tr '|' '\n' | sort -u)
+TOP_MISSING=""
+for s in $TOPLEVEL_SUBS; do grep -qx -- "$s" <<<"$TOP_LISTED" || TOP_MISSING="$TOP_MISSING $s"; done
+[ -z "$TOP_MISSING" ] && ok "board help lists every top-level command ($(wc -w <<<"$TOPLEVEL_SUBS") found)" \
+  || no "board help lists every top-level command" "missing:$TOP_MISSING"
 # Derived from the real case statement, not the help table — so a new task subcommand
 # added without help text fails this instead of the check trusting its own list.
 TASK_SUBS=$(awk '/^task\|tasks\)/{f=1; next} f && /^[a-zA-Z][a-zA-Z_-]*(\|[a-zA-Z_-]+)*\)$/{exit} f' "$SRC/bin/board" \

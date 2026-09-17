@@ -263,6 +263,9 @@ heartbeat::board heartbeat [--budget <json>]::Send a liveness heartbeat with con
 caps::board caps [--add <c,c>] [--remove <c,c>] [--prefer <model>]::Set this agent's capabilities or model preference.
 finished::board finished::Mark this agent's session finished.
 inbox::board inbox [--as <role>]::List this agent's pending questions and messages.
+grant::board grant <agent> <grant> [--project <p>] [--json]::Grant a capability to an agent.
+revoke::board revoke <agent> <grant> [--project <p>] [--json]::Revoke a capability from an agent.
+grants::board grants [agent] [--project <p>] [--json]::List an agent's grants.
 agent|agents::board agent cleanup [--older-than <dur>] [--project <p>] [--all]::Agent maintenance (cleanup dead agents).
 project::board project detect|show|init|sync|set::Project manifest operations.
 caps-probe|probe::board caps-probe::Probe this host's tool capabilities.
@@ -271,10 +274,7 @@ gate::board gate [merge] [task-id]::Check whether a task's merge/deploy gate is 
 ask::board ask "<question>"::Ask the board (or a human) a question.
 answer::board answer <question-id> "<answer>" [--note <note>]::Answer a pending question.
 message::board message <agent> --text "..."::Send a free-text message to an agent.
-test::board test request <task-id> --card-file <f>::Request/record a manual test card for a task.
-test-level::board test-level <task-id>::Report which test level (auto/human) a task needs.
 routines|routine::board routines [--project <p>] [--status <s>] [--json]::List scheduled routines.
-tests::board tests [--project <p>]::List open test cards.
 role::board role pin|unpin|claim|recommend [role]::Claim, release, or recommend a coordination role.
 pause|resume::board pause|resume [note]::Pause or resume a project.
 status::board status [--project <p>] [--json|--md|--me]::Show agents, tasks and open questions.
