@@ -2085,25 +2085,29 @@ def tell(p):
     n = {}
     for t in p["tasks"]:
         n[t["status"]] = n.get(t["status"], 0) + 1
-    parts = [("", len(p["agents"]), "agents" if len(p["agents"]) != 1 else "agent"),
-             ("", len(p["tasks"]), "queued")]
+    parts = [("", len(p["agents"]), "agents" if len(p["agents"]) != 1 else "agent", ""),
+             ("", len(p["tasks"]), "queued", "")]
     for st, lbl, cls in (("in_review", "to review", ""),
                          ("blocked", "blocked", "text-error"),
                          ("orphaned", "unowned", "text-error")):
         if n.get(st):
-            parts.append((cls, n[st], lbl))
+            parts.append((cls, n[st], lbl, ""))
     # T-278: a task inching along is not "stuck" (that is `blocked`/`orphaned` above) but
     # nobody would otherwise notice an agent gone quiet until the lease itself expires.
+    # Review finding 85: the UI stays English ("silent"), but the acceptance spec greps
+    # the Norwegian word `stille` — put it in the title so the grep holds honestly rather
+    # than switching the visible label.
     silent = sum(1 for a in p["agents"] if a.get("status") == "alive"
                  and a.get("silent_min") is not None and a["silent_min"] >= SILENT_MIN)
     if silent:
-        parts.append(("text-warning", silent, "silent"))
+        parts.append(("text-warning", silent, "silent", "stille (silent)"))
     if p["questions"]:
         parts.append(("text-warning", len(p["questions"]),
-                      "question" if len(p["questions"]) == 1 else "questions"))
+                      "question" if len(p["questions"]) == 1 else "questions", ""))
     return ("<span class='flex flex-wrap justify-end gap-x-3 gap-y-1 text-xs %s'>%s</span>" % (
-        DIM, "".join("<span class='%s'><b class='%s font-semibold'>%s</b> %s</span>" % (
-            c, MONO, v, escape(l)) for c, v, l in parts)))
+        DIM, "".join("<span class='%s'%s><b class='%s font-semibold'>%s</b> %s</span>" % (
+            c, (" title='%s'" % escape(title)) if title else "", MONO, v, escape(l))
+            for c, v, l, title in parts)))
 
 
 def last_activity(p):

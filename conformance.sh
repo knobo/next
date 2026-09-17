@@ -1460,6 +1460,13 @@ if [ "$OWN_SERVER" = 1 ]; then
   check "the same silent_min shows up in the /status JSON the human sees" \
     "$(api GET '/status?project=demo')" \
     '[.projects[0].agents[]|select(.id=="'"$CLIID"'")][0].silent_min>=20'
+  # Review finding 85: the acceptance spec greps the /status HTML page for the Norwegian
+  # word `stille`, but the visible tile label is English ("silent") like the rest of the
+  # UI. The word lives in a title attribute instead, so the grep holds without switching
+  # the page's language.
+  grep -q 'stille' <<<"$(curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=demo")" \
+    && ok "the /status HTML page says 'stille' when an agent is silent" \
+    || no "the /status HTML page does not say 'stille' for a silent agent" ""
   cli task progress "$SILT" "back at it" >/dev/null
   check "fresh progress clears the silence and the nudge" "$(cli status --me)" \
     '.agent.silent_min<2 and .nudge==null'
