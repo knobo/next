@@ -920,7 +920,8 @@ status)
     a=$(agent_id)
     me=$(jq -c --arg a "$a" 'first(.projects[] | select(.agents|any(.id==$a)))
       | {project:.name, phase:.phase, budget:.budget,
-         agent:(.agents[]|select(.id==$a))} | .stop = .agent.stop' <<<"$r")
+         agent:(.agents[]|select(.id==$a))} | .stop = .agent.stop
+      | .budget.effective_ceilings = .agent.effective_ceilings' <<<"$r")
     [ -n "$me" ] || die "could not find agent '${a:-<no id>}' on the board${p:+ (project $p)} — \
 register with 'board register', or run from a directory that has project.yaml"
     echo "$me"

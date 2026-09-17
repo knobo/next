@@ -268,8 +268,13 @@ def window_minutes(name):
     """"5h" → 300. The window name IS the length of the window, and the length is the
     filter the reading is remembered within (T-192). An unknown shape is remembered for
     seven days: too long is safe, too short is a silent quota blackout."""
+    return known_minutes(name) or 7 * 24 * 60
+
+
+def known_minutes(name):
+    """Window length when the name states it ("5h" → 300), else None."""
     m = re.fullmatch(r"(\d+)\s*([mhdw])", win_name(name))
-    return int(m.group(1)) * WIN_UNIT[m.group(2)] if m else 7 * 24 * 60
+    return int(m.group(1)) * WIN_UNIT[m.group(2)] if m else None
 
 
 def windows_of(a):
@@ -283,6 +288,51 @@ def windows_of(a):
         if pct is not None and w.get("window") is not None:
             # the name is the key the max is taken per, and "5H" and "5h" are one window
             out[win_name(w["window"])] = max(out.get(win_name(w["window"]), 0.0), pct)
+    return out
+
+
+def resets_of(a):
+    """{name: minutes until reset} for the agent's windows that report `resets_at` (ISO
+    text or epoch seconds — the statusline passes on whatever the harness gives)."""
+    raw = a.get("budget") if isinstance(a, dict) else a["budget"]
+    out = {}
+    for w in (raw if isinstance(raw, list) else jl(raw)):
+        if not isinstance(w, dict) or w.get("window") is None or w.get("resets_at") in (None, ""):
+            continue
+        t = reset_time(w["resets_at"])
+        left = (t - datetime.now(timezone.utc)).total_seconds() / 60 if t else None
+        # A reset already past is a stale reading from the previous cycle: no ramp.
+        if left is not None and left > 0:
+            out[win_name(w["window"])] = left
+    return out
+
+
+def reset_time(r):
+    """`resets_at` (ISO text or epoch seconds) as an aware UTC datetime, or None when it is
+    not a usable time. Naive ISO is read as UTC. Never raises: one bad heartbeat must not
+    break /status or the stop rules for the fleet."""
+    try:
+        t = (datetime.fromtimestamp(num(r), timezone.utc) if num(r) is not None
+             else ts(str(r)))
+        if t is None:
+            return None
+        return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def effective_ceilings(a, ceilings):
+    """«Use up the quota before reset» (T-428, assumes Q-249 default): over the last 25 %
+    of a window's length before `resets_at` the ceiling rises linearly to 100 — quota left
+    unspent at reset is lost anyway. A window with no `resets_at` keeps its fixed ceiling."""
+    left = resets_of(a)
+    out = {}
+    for name, ceil in ceilings.items():
+        c = float(ceil)
+        if name in left and known_minutes(name):     # unknown length → no ramp
+            progress = min(1.0, max(0.0, 1 - left[name] / (0.25 * known_minutes(name))))
+            c += (100 - c) * progress
+        out[name] = round(c, 1)
     return out
 
 
@@ -328,15 +378,17 @@ def agent_stop(a, project):
     # Same harness as the agent itself: quota is per vendor account, not per machine.
     b, acct = budget(project), quota_max(a["harness"] or "claude-code")
     ceilings = {win_name(k): v for k, v in b["ceilings"].items()}
-    mine = windows_of(a)
+    # The ramp uses this agent's own resets_at against the account-wide max: same account
+    # means same reset time, and a missing/past resets_at falls back to the fixed ceiling.
+    mine, eff = windows_of(a), effective_ceilings(a, ceilings)
     for name in sorted(mine):
         pct = max(mine[name], acct.get(name, 0.0))
-        ceil = ceilings.get(name)
+        ceil = eff.get(name)
         if ceil is None:
             return ("window %s has no ceiling in the policy — set budget.%s.ceilings.%s"
                     % (name, project, name))
-        if pct >= float(ceil):
-            return "%s: %g%% used of the %s%% ceiling (per account, all sessions)" % (name, pct, ceil)
+        if pct >= ceil:
+            return "%s: %g%% used of the %g%% ceiling (per account, all sessions)" % (name, pct, ceil)
     if mine:
         return None
     # `reports-quota` is self-declared (§3.7) and is set by `board probe` only when the
@@ -637,6 +689,9 @@ def budget_in(b):
         raise Err(400, "budget must be a list of windows, not %s" % type(b["budget"]).__name__)
     if isinstance(b.get("budget"), list):
         ws = [w for w in b["budget"] if isinstance(w, dict) and num(w.get("used_pct")) is not None]
+        for w in ws:                    # garbage resets_at is dropped here, not stored
+            if w.get("resets_at") not in (None, "") and reset_time(w["resets_at"]) is None:
+                del w["resets_at"]
         # A list that SHRINKS to empty is not the same as an empty list: the statusline
         # hook sends {window:"5h", used_pct:null} every time `rate_limits` is missing from
         # the payload (API key, Bedrock, or a miss). If we wrote that, an agent that just
@@ -864,8 +919,10 @@ def owner_view(t):
     if not a:
         return "unknown", None
     st = status_of(a)
+    ceilings = {win_name(k): v for k, v in budget(t["project"])["ceilings"].items()}
     return st, {"last_seen": a["last_seen"], "ctx_pct": a["ctx_pct"],
-                "budget": windows_of(a), "model": a["model"], "status": st}
+                "budget": windows_of(a), "model": a["model"], "status": st,
+                "effective_ceilings": effective_ceilings(a, ceilings)}
 
 
 def brief(t):
@@ -1722,6 +1779,8 @@ def status(project=None):
             # the board answers in full: if `stop` is set, the agent must stop. Thresholds
             # belong here, not spread across every SKILL that reads the board (T-164).
             d["stop"] = agent_stop(a, name)
+            d["effective_ceilings"] = effective_ceilings(
+                a, {win_name(k): v for k, v in budget(name)["ceilings"].items()})
             agents.append(d)
         out["projects"].append({
             "name": name, "phase": p["phase"], "goal": p["goal"], "paused": p["paused"],
@@ -1922,12 +1981,19 @@ def watchline(s):
 def fleet_runway(s):
     """Quota is per HARNESS account, not per agent and not per project (§11) — so the
     runway is per harness. The ceiling drawn is the TIGHTEST ceiling among the projects
-    the page shows: it is the first one the fleet hits."""
+    the page shows: it is the first one the fleet hits.
+
+    Ramped like agent_stop (T-428 review 55): each project's raw ceiling is replaced by
+    the LOOSEST (max) effective ceiling among that project's own agents for the window —
+    a project with no agent near reset keeps its fixed ceiling, one agent near reset
+    stops the runway from showing "over" while it is still correctly working. Still the
+    tightest (min) across projects, same as before."""
     ceil = {}
     for p in s["projects"]:
         for w, c in ((p.get("budget") or {}).get("ceilings") or {}).items():
             w, c = win_name(w), float(c or 0)
-            ceil[w] = min(ceil.get(w, c), c)
+            eff = max([a.get("effective_ceilings", {}).get(w, c) for a in p["agents"]] or [c])
+            ceil[w] = min(ceil.get(w, eff), eff)
     harnesses = sorted({(a.get("harness") or "claude-code")
                         for p in s["projects"] for a in p["agents"]})
     rows = []
@@ -2092,6 +2158,10 @@ FOCUS = "<script>%s</script>" % FOCUS_JS
 
 
 def agent_block(a, ceilings, human=False, project=None):
+    # The ceiling drawn per window is THIS agent's effective (ramped) ceiling — already
+    # computed once in status() — not the raw policy value, or an agent minutes from its
+    # own reset renders red/over while agent_stop still lets it run (T-428 review 55).
+    eff = a.get("effective_ceilings") or ceilings
     roles = " ".join(a["roles"]) if a.get("roles") else ""
     ws = sorted(windows_of(a).items())
     st = a.get("status") or "unknown"
@@ -2135,7 +2205,7 @@ def agent_block(a, ceilings, human=False, project=None):
                 grants_html,
                 add_form,
                 meter("ctx", a["ctx_pct"], 80),
-                "".join(meter(w, pct, ceilings.get(win_name(w))) for w, pct in ws)
+                "".join(meter(w, pct, eff.get(win_name(w))) for w, pct in ws)
                 or "<p class='%s text-xs'>reports no quota</p>" % DIM,
                 ("<p class='mt-1.5 text-sm text-error'>stop: %s</p>" % escape(a["stop"]))
                 if a.get("stop") else ""))
@@ -2388,8 +2458,6 @@ def html_task(tid, token="", human=False):
           % "".join(evs) if evs else
           "<p class='%s text-sm'>No events yet.</p>" % DIM)
     oa = d.get("owner_agent")
-    _ceil = {win_name(k): float(v or 0)
-             for k, v in budget(d["project"]).get("ceilings", {}).items()}
     if oa:
         ab = ("<div class='border-t border-base-300 py-2.5'>"
               "<div class='flex flex-wrap items-baseline gap-x-2'>"
@@ -2401,9 +2469,10 @@ def html_task(tid, token="", human=False):
                   "badge-error" if oa.get("status") == "dead" else "badge-ghost",
                   escape(oa.get("status") or ""),
                   meter("ctx", oa.get("ctx_pct"), 80),
-                  # the red line is the project's ceiling for EXACTLY that window — a
-                  # fixed 85 here was the hardcoded threshold T-164 removes everywhere else
-                  "".join(meter(w, pct, _ceil.get(win_name(w)))
+                  # the red line is the project's EFFECTIVE ceiling for exactly that
+                  # window (T-428 review 55) — a fixed 85 here was the hardcoded
+                  # threshold T-164 removes everywhere else
+                  "".join(meter(w, pct, (oa.get("effective_ceilings") or {}).get(win_name(w)))
                           for w, pct in sorted((oa.get("budget") or {}).items())),
                   MONO, DIM, escape(oa.get("last_seen") or "—")))
     else:

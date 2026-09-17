@@ -58,6 +58,7 @@ else
 {"grants": {"demo": {"claude-code@*": ["merge","deploy-dev"], "codex@*": ["deploy-dev"], "*": []}},
  "budget": {"demo": {"ceilings": {"5h": 85, "7d": 75}},
             "zerobudget": {"ceilings": {"7d": 0}},
+            "rampproject": {"ceilings": {"7d": 60, "session": 60}},
             "fallbackproject": {"ceilings": {"5h": 85}, "fallback": {"max_tasks": 1}},
             "oldshape": {"rl7_ceiling": 60}},
  "roles": {"coordinator": {"singleton": true, "requires": ["merge"], "prefer_model": ["fable","opus","sonnet"]},
@@ -371,6 +372,53 @@ api POST /agents/$QID/finished '{"reason":"conformance done"}' >/dev/null
 api POST /tasks/$FT/release "{\"agent\":\"$FID\"}" >/dev/null
 api POST /tasks/$FT/done "{\"agent\":\"$FID\",\"no_merge\":true}" >/dev/null
 api POST /agents/$FID/finished '{"reason":"conformance done"}' >/dev/null
+
+# T-428 (assumes Q-249 default): quota unspent at reset is lost, so over the last 25 % of a
+# window before resets_at the ceiling rises linearly toward 100. Own harness, so no other
+# agent's 7d reading leaks in.
+RID=$(api POST /agents '{"project":"rampproject","harness":"ramp","host":"h","session":"r1"}' | jq -r .id)
+rstop() { api POST /agents/$RID/heartbeat "{\"budget\":[{\"window\":\"7d\",\"used_pct\":70$1}]}" >/dev/null
+  api GET '/status?project=rampproject' | jq -c '.projects[0].agents[]|select(.id=="'"$RID"'")'; }
+check "7d at 70% of 60, resets in 6 days: ceiling unchanged → stop" \
+  "$(rstop ",\"resets_at\":\"$(date -u -d '+6 days' +%FT%TZ)\"")" \
+  '(.stop|test("60% ceiling")) and .effective_ceilings["7d"]==60'
+check "…resets in 12 hours: effective ceiling ~89 → no stop" \
+  "$(rstop ",\"resets_at\":$(date -u -d '+12 hours' +%s)")" \
+  '.stop==null and .effective_ceilings["7d"]>88 and .effective_ceilings["7d"]<90'
+# review 55: the HTML /status meter must draw THIS agent's effective (ramped) ceiling,
+# not the raw policy 60 — otherwise the page shows red/over for an agent agent_stop
+# still lets run.
+EFF7D=$(api GET '/status?project=rampproject' | jq -r '.projects[0].agents[]|select(.id=="'"$RID"'")|.effective_ceilings["7d"]')
+curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=rampproject" > "$TMP/ramp-status.html"
+TICK=$(python3 -c "
+import re
+html = open('$TMP/ramp-status.html').read()
+m = re.search(r'data-agent[^>]*>.*?<b[^>]*>' + re.escape('$RID') + r'</b>.*?(?=data-agent|\Z)', html, re.S)
+blk = m.group(0) if m else ''
+mm = re.search(r\"<span class=k>7d</span>.*?data-c='([0-9.]+)'\", blk, re.S)
+print(mm.group(1) if mm else -1)
+")
+check "…HTML /status meter draws the ramped ceiling, not raw 60" \
+  "$(jq -nc --argjson tick "${TICK:--1}" --argjson eff "$EFF7D" '{tick:$tick, eff:($eff|round)}')" \
+  '.tick==.eff and .tick>88'
+check "…no resets_at: fixed ceiling → stop" "$(rstop "")" \
+  '(.stop|test("7d")) and .effective_ceilings["7d"]==60'
+check "…naive ISO resets_at (no offset) in 12 hours: read as UTC, /status 200, ramped" \
+  "$(rstop ",\"resets_at\":\"$(date -u -d '+12 hours' +%FT%T)\"")" \
+  '.stop==null and .effective_ceilings["7d"]>88'
+check "…garbage resets_at is dropped at ingest: fixed ceiling → stop" \
+  "$(rstop ",\"resets_at\":\"not-a-time\"")" \
+  '(.stop|test("7d")) and .effective_ceilings["7d"]==60 and (.budget[0]|has("resets_at")|not)'
+check "…resets_at already past: no ramp → stop" \
+  "$(rstop ",\"resets_at\":$(date -u -d '-1 hour' +%s)")" \
+  '(.stop|test("7d")) and .effective_ceilings["7d"]==60'
+api POST /agents/$RID/finished '{"reason":"conformance done"}' >/dev/null
+UID_=$(api POST /agents '{"project":"rampproject","harness":"ramp2","host":"h","session":"u1"}' | jq -r .id)
+api POST /agents/$UID_/heartbeat "{\"budget\":[{\"window\":\"session\",\"used_pct\":70,\"resets_at\":\"$(date -u -d '+1 hour' +%FT%TZ)\"}]}" >/dev/null
+check "unknown window name near reset: length unknown → no ramp" \
+  "$(api GET '/status?project=rampproject' | jq -c '.projects[0].agents[]|select(.id=="'"$UID_"'")')" \
+  '.effective_ceilings.session==60 and (.stop|test("session"))'
+api POST /agents/$UID_/finished '{"reason":"conformance done"}' >/dev/null
 
 SA=$(api GET '/status?project=otherproject')
 check "a project with no budget line has no ceiling — stop, not free rein" "$SA" \
@@ -1202,7 +1250,7 @@ check "cli status --json exposes ntfy_failures_since_success" "$(cli status --js
 # the answer: empty output with exit 0 reads as "no data, carry on".
 check "status --me gives your own row + the budget block" "$(cli status --me)" \
   '.agent.id=="'"$CLIID"'" and .project=="demo" and .budget.ceilings["7d"]==75
-    and .budget.windows and has("stop")'
+    and .budget.windows and has("stop") and (.budget.effective_ceilings|type=="object")'
 ME_ERR=$(cd "$TMP" && BOARD_AGENT_ID=A-doesnotexist board status --me 2>&1 >"$TMP/me.out"); ME_RC=$?
 if [ "$ME_RC" -ne 0 ] && [ ! -s "$TMP/me.out" ] && [ -n "$ME_ERR" ]; then
   ok "status --me with no agent in the answer fails loudly (exit≠0 + message), not empty"
