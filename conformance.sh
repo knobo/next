@@ -765,6 +765,7 @@ api POST /tasks/$T3ID/release "{\"agent\":\"$BID\"}" >/dev/null
 
 if [ "$OWN_SERVER" = 1 ]; then
 check "blocked notifies" "$(api POST /tasks/$T2ID/blocked "{\"agent\":\"$AID\",\"note\":\"classifier refused\"}")" '.ok'
+for _ in $(seq 50); do grep -q "classifier refused" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
 N=$(cat "$TMP/ntfy" 2>/dev/null || true)
 grep -B2 "classifier refused" <<<"$N" | grep -q "CLICK: .*/t/$T2ID" \
   && ok "blocked notification links to the task, not /status" \
@@ -775,6 +776,7 @@ CLKAG=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"clk"
 CLKID=$(api POST /tasks "{\"agent\":\"$CLKAG\",\"project\":\"demo\",\"title\":\"click target\"}" | jq -r .id)
 api POST /tasks/$CLKID/claim "{\"agent\":\"$CLKAG\"}" >/dev/null
 api POST "/agents/$CLKAG/finished" '{"reason":"click check"}' >/dev/null
+for _ in $(seq 50); do grep -q "click check" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
 N=$(cat "$TMP/ntfy" 2>/dev/null || true)
 grep -B2 "click check" <<<"$N" | grep -q "CLICK: .*/t/$CLKID" \
   && ok "finished links to the agent's current task" \
@@ -783,6 +785,7 @@ fi
 check "project isolation (403)" "$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' >/dev/null; api POST /tasks/$TID/claim "{\"agent\":\"$(api POST /agents '{"project":"otherproject","harness":"grok","host":"mac","session":"s3"}' | jq -r .id)\"}")" '.error'
 check "finished releases everything" "$(api POST /agents/$AID/finished '{"reason":"queue empty"}')" '.ok'
 if [ "$OWN_SERVER" = 1 ]; then
+for _ in $(seq 50); do grep -q "queue empty" "$TMP/ntfy" 2>/dev/null && break; sleep .1; done
 N=$(cat "$TMP/ntfy" 2>/dev/null || true)
 grep -B2 "queue empty" <<<"$N" | grep -q "CLICK: $BOARD_URL/status" \
   && ok "finished with no current task links to /status" \
