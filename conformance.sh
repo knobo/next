@@ -1059,7 +1059,9 @@ api POST "/tasks/$W1/claim" "{\"agent\":\"$WAG\"}" >/dev/null
 check "a hand-off is NEVER blocked by the limit" \
   "$(api POST "/tasks/$W1/release" "{\"agent\":\"$WAG\",\"note\":\"back\"}")" '.ok'
 api POST "/tasks/$W1/claim" "{\"agent\":\"$WAG\"}" >/dev/null
-api POST "/tasks/$W1/review" "{\"agent\":\"$WAG\",\"open\":0}" >/dev/null
+# A review by someone other than the owner — the owner's own word does not count (T-282).
+WRV=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","session":"wip-rev","capabilities":["merge"]}' | jq -r .id)
+api POST "/tasks/$W1/review" "{\"agent\":\"$WRV\",\"open\":0}" >/dev/null
 api POST "/tasks/$W1/release" "{\"agent\":\"$WAG\"}" >/dev/null
 check "a review lowers the counter" "$(api GET '/tasks?project=demo')" \
   '[.tasks[]|select(.status=="in_review" and .review_open==null and (.title|startswith("wip")))]|length == 4'
@@ -1739,6 +1741,77 @@ if [ -s "$TMP/deploy-cwd.txt" ] && ! grep -qxE "$CLIDIR(/web)?" "$TMP/deploy-cwd
   ok "deploy did NOT run in the primary working copy or the caller's cwd"
 else no "deploy did not run in the primary working copy" "cwd was $(cat "$TMP/deploy-cwd.txt" 2>/dev/null)"; fi
 cli task release "$DP_T" >/dev/null 2>&1
+# T-282: the gate could not be passed from one session. `board task review` set by the owner
+# is rejected (correct — otherwise the gate is an echo of the owner's own word), but a Claude
+# subagent that registers with a bare `board register` inherits CLAUDE_CODE_SESSION_ID, and
+# register() dedupes on exactly that `session` — so it gets the OWNER's own id back, and the
+# gate rejects it just the same. Both halves need covering, or a half-fix looks complete and
+# still deadlocks the queue.
+echo "== T-282: review from a different agent, from the same machine =="
+
+# Half 1, THE TRAP: an inherited session gives the SAME agent id, no matter how it re-registers.
+# Not a bug to fix here — it IS the dedupe, and it is correct for an agent restarting. It is a
+# check because it explains why BOARD_SESSION alone would not be enough.
+INHERIT=$(cli register --cap merge --model claude-sonnet-5 | jq -r .id)
+check "an inherited session gives the SAME agent id — the subagent is the owner to the board" \
+  "$(jq -nc --arg a "$INHERIT" --arg b "$CLIID" '{a:$a,b:$b}')" '.a==.b'
+
+# Half 2, THE FIX: own session AND own cache. Without BOARD_CACHE, agent_id() falls back to
+# $CACHE/agent, the machine-wide file every register overwrites.
+REV() { (cd "$CLIDIR" && BOARD_SESSION="conf-rev-282-$$" BOARD_CACHE="$TMP/rev282-cache" board "$@" 2>/dev/null); }
+REVID=$(REV register --cap merge --model claude-sonnet-5 | jq -r .id)
+check "own BOARD_SESSION + BOARD_CACHE gives a DIFFERENT agent id than the owner's" \
+  "$(jq -nc --arg a "$REVID" --arg b "$CLIID" '{a:$a,b:$b}')" '.a and (.a != .b)'
+
+# End to end, the acceptance criterion: A owns, B reports the review, the gate opens.
+RT=$(cli task create --title "T-282 review-from-another-agent" --repo web --risk normal | jq -r .id)
+cli task claim "$RT" >/dev/null
+cli task review "$RT" --open 0 --fixed 0 >/dev/null
+check "the owner's own review result closes the gate, with an actionable reason" \
+  "$(cli gate merge "$RT")" \
+  '.ok==false and ([.reasons[]|select(test("owner itself"))]|length)==1
+     and ([.reasons[]|select(test("BOARD_SESSION") and test("BOARD_CACHE"))]|length)==1'
+# Same task, same owner — just reported by a different agent id.
+REV task review "$RT" --open 0 --fixed 0 >/dev/null
+check "a review reported by a DIFFERENT agent: the gate opens for the owner (T-282 acceptance)" \
+  "$(cli gate merge "$RT")" '.ok==true and (.reasons|length)==0'
+# T-282 review [88]: one shared review_open column was last-write-wins — reviewer A reports a
+# blocker, B and C report 0 afterwards, and the gate opened on a known blocker. Each reviewer's
+# latest result in the current round counts; only the owner's --round (after a fix) resets.
+REVB() { (cd "$CLIDIR" && BOARD_SESSION="conf-revb-282-$$" BOARD_CACHE="$TMP/revb282-cache" board "$@" 2>/dev/null); }
+REVC() { (cd "$CLIDIR" && BOARD_SESSION="conf-revc-282-$$" BOARD_CACHE="$TMP/revc282-cache" board "$@" 2>/dev/null); }
+REVBID=$(REVB register --cap merge --model claude-sonnet-5 | jq -r .id)
+REVCID=$(REVC register --cap merge --model claude-sonnet-5 | jq -r .id)
+RR=$(cli task create --title "T-282 three reviewers" --repo web --risk normal | jq -r .id)
+cli task claim "$RR" >/dev/null
+REV task review "$RR" --open 1 --fixed 0 >/dev/null
+REVB task review "$RR" --open 0 --fixed 0 >/dev/null
+REVC task review "$RR" --open 0 --fixed 0 >/dev/null
+check "A open=1, then B and C open=0: the gate stays closed (no last-write-wins)" \
+  "$(cli gate merge "$RR")" '.ok==false and ([.reasons[]|select(test("1 open review"))]|length)==1'
+check "a reviewer cannot start a new round and wipe the others' results" \
+  "$(api POST "/tasks/$RR/review" "{\"agent\":\"$REVBID\",\"open\":0,\"round\":true}")" '.error'
+cli task review "$RR" --open 0 --fixed 1 --round >/dev/null
+check "a new round started by the owner alone: the gate is closed" "$(cli gate merge "$RR")" '.ok==false'
+REVB task review "$RR" --open 0 --fixed 0 >/dev/null
+check "new round + B open=0: the gate opens" "$(cli gate merge "$RR")" '.ok==true'
+# T-282 review [40]: the derived columns follow the gate — the owner's own word is not a review.
+check "review_open/review_fixed come from non-owner results only" \
+  "$(api GET "/tasks/$RR")" '.review_open==0 and .review_fixed==0'
+# T-282 review [45]: a new owner's claim starts a fresh round; the same owner re-claiming does not.
+cli task release "$RR" >/dev/null
+cli task claim "$RR" >/dev/null
+check "the same owner re-claiming keeps the round: the gate stays open" "$(cli gate merge "$RR")" '.ok==true'
+cli task release "$RR" >/dev/null
+REVC task claim "$RR" >/dev/null
+check "a new owner's claim drops the previous owner's review results" \
+  "$(REVC gate merge "$RR")" '.ok==false and ([.reasons[]|select(test("no review result"))]|length)==1'
+check "a new owner's claim resets the derived review columns" \
+  "$(api GET "/tasks/$RR")" '.review_open==null and .review_fixed==null'
+REVC task release "$RR" >/dev/null
+api POST "/agents/$REVBID/finished" '{"reason":"conformance done"}' >/dev/null
+api POST "/agents/$REVCID/finished" '{"reason":"conformance done"}' >/dev/null
+api POST "/agents/$REVID/finished" '{"reason":"conformance done"}' >/dev/null
 
 # T-283 review: the check above swaps in a synthetic deploy.dev, so the REAL k8s/deploy.sh
 # was never run. It sourced "./$ENVFILE", which with an absolute BOARD_REPO_ROOT became
