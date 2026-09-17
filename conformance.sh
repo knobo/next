@@ -1437,6 +1437,49 @@ GROKID=$(jq -r .id <<<"$(cd "$CLIDIR" && env -u CLAUDE_CODE_SESSION_ID BOARD_HAR
   BOARD_CACHE="$TMP/cli-cache-3" board register --model grok-4 2>/dev/null)")
 check "grok gets the gk prefix and no merge grant" "$(api GET '/status?project=demo')" \
   '[.projects[0].agents[]?|select(.id=="'"$GROKID"'")][0] | (.id|startswith("gk-")) and (.grants|index("merge")|not)'
+# T-435 (review): a flat compat write in bin/board reopened the cross-board id collision
+# this suite already guards above ("the session cache is keyed on BOARD_URL") — same
+# session registering against two BOARD_URLs would share one flat file, and whichever
+# board wrote last would win the other board's heartbeat. The real fix lives only in
+# hooks/statusline-heartbeat.sh: it must read ONLY the keyed cache path (computed exactly
+# like bin/board's $CACHE) with `[ -s ]`, and never fall back to the shared flat `agent`
+# file while the payload carries a session id. Drive the hook directly with a stub curl
+# on PATH instead of re-deriving its logic here.
+SLROOT="$TMP/statusline"; mkdir -p "$SLROOT/bin" "$SLROOT/cache"
+cat > "$SLROOT/bin/curl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SLTMP_CALLS"
+SH
+chmod +x "$SLROOT/bin/curl"
+sl_urlsafe() { printf '%s' "${1#*://}" | tr -c 'A-Za-z0-9._-' '_'; }
+sl_run() { # sl_run <board_url> <session-id>  -- runs the hook, waits briefly for its
+  rm -f "$SLROOT/calls"                        # backgrounded curl to (maybe) land
+  env SLTMP_CALLS="$SLROOT/calls" \
+      input="$(jq -nc --arg s "$2" '{session_id:$s, model:{id:"m"}}')" \
+      BOARD_URL="$1" BOARD_TOKEN=tok BOARD_CACHE="$SLROOT/cache" \
+      PATH="$SLROOT/bin:$PATH" bash hooks/statusline-heartbeat.sh
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SLROOT/calls" ] && break; sleep 0.1; done
+}
+
+mkdir -p "$SLROOT/cache/$(sl_urlsafe http://sl-a.example)"
+echo aaa111 > "$SLROOT/cache/$(sl_urlsafe http://sl-a.example)/session-sess1"
+mkdir -p "$SLROOT/cache/$(sl_urlsafe http://sl-b.example)"
+echo bbb222 > "$SLROOT/cache/$(sl_urlsafe http://sl-b.example)/session-sess1"
+
+sl_run http://sl-a.example sess1
+if grep -q '/agents/aaa111/heartbeat' "$SLROOT/calls" 2>/dev/null; then
+  ok "statusline: keyed mapping resolves to that agent id"
+else no "statusline: keyed mapping resolves to that agent id" "$(cat "$SLROOT/calls" 2>&1)"; fi
+
+sl_run http://sl-a.example sess-unmapped
+if [ ! -s "$SLROOT/calls" ]; then
+  ok "statusline: no mapping + session id sends no heartbeat"
+else no "statusline: no mapping + session id sends no heartbeat" "$(cat "$SLROOT/calls")"; fi
+
+sl_run http://sl-b.example sess1
+if grep -q '/agents/bbb222/heartbeat' "$SLROOT/calls" 2>/dev/null; then
+  ok "statusline: two BOARD_URLs each resolve their own agent id"
+else no "statusline: two BOARD_URLs each resolve their own agent id" "$(cat "$SLROOT/calls" 2>&1)"; fi
 
 # An in_review takeover on ANOTHER machine: the directory on the board does not exist here,
 # but the branch is pushed. `worktree add -b <br> origin/main` then gave an EMPTY branch and
