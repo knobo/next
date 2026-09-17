@@ -5,6 +5,19 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# A fresh identity every time. An agent that runs ./conformance.sh from its own session
+# carries its own BOARD_AGENT_ID, BOARD_HUMAN, BOARD_URL, BOARD_SESSION and harness session
+# variables in its environment — inherit any of those and the suite quietly acts as that
+# agent/human/board instead of the fresh one it is about to build, and reports false reds
+# (T-449: 2-6 checks failed depending on which of these an agent happened to have set). Reset
+# them all before anything else runs. The few vars the suite deliberately takes as
+# caller-supplied config — BOARD_TOKEN, BOARD_HUMAN_TOKEN, BOARD_PORT — are read further down
+# via their own `${VAR:-default}` and are left alone here.
+unset BOARD_AGENT_ID BOARD_AS_HUMAN BOARD_HUMAN BOARD_SESSION BOARD_WHO BOARD_HARNESS \
+      BOARD_PROJECT BOARD_PROJECT_ROOT BOARD_REPO_ROOT BOARD_CACHE BOARD_URL \
+      CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_HOME GROK_SESSION_ID GROK_CLI \
+      ANTIGRAVITY_AGENT ANTIGRAVITY_CONVERSATION_ID ANTIGRAVITY_SOURCE_METADATA
+
 # The target is ALWAYS a fresh instance of its own — unless you say otherwise with an
 # argument. BOARD_URL is exported in the shell of every agent that uses the board, so
 # inheriting it from the environment would have meant that an innocent ./conformance.sh
