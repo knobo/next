@@ -1414,6 +1414,67 @@ if [ -s "$TMP/deploy-cwd.txt" ] && ! grep -qxE "$CLIDIR(/web)?" "$TMP/deploy-cwd
 else no "deploy did not run in the primary working copy" "cwd was $(cat "$TMP/deploy-cwd.txt" 2>/dev/null)"; fi
 cli task release "$DP_T" >/dev/null 2>&1
 
+# T-283 review: the check above swaps in a synthetic deploy.dev, so the REAL k8s/deploy.sh
+# was never run. It sourced "./$ENVFILE", which with an absolute BOARD_REPO_ROOT became
+# .//abs/board.env and died before any kubectl. Run it with a kubectl stub that records.
+mkdir -p "$TMP/kdeploy/bin" "$TMP/kdeploy/root"
+printf 'BOARD_HOST=board.example.test\n' > "$TMP/kdeploy/root/board.env"
+cat > "$TMP/kdeploy/bin/kubectl" <<SH
+#!/usr/bin/env bash
+echo "\$*" >> "$TMP/kdeploy/kubectl.log"
+[ -t 0 ] || cat >/dev/null
+SH
+chmod +x "$TMP/kdeploy/bin/kubectl"
+KDR=$(env -u BOARD_ENV PATH="$TMP/kdeploy/bin:$PATH" BOARD_REPO_ROOT="$TMP/kdeploy/root" ./k8s/deploy.sh </dev/null 2>&1)
+if grep -qs "rollout status deploy/board" "$TMP/kdeploy/kubectl.log"; then
+  ok "k8s/deploy.sh finds board.env via an absolute BOARD_REPO_ROOT and reaches kubectl"
+else no "k8s/deploy.sh with an absolute BOARD_REPO_ROOT" "$KDR"; fi
+
+# T-283 review [65]: `git clean -qfdx` used to run AFTER `checkout --detach origin/main`.
+# An untracked leftover in the deploy worktree that collides with a path newly tracked on
+# origin/main made the checkout itself fail before the clean ever got a chance to remove it.
+DW="$CLIDIR/web-worktrees/deploy"   # the shared deploy worktree, already created above
+DP_T2=$(cli task create --title "deploy over an untracked collision" --repo web | jq -r .id)
+cli task claim "$DP_T2" >/dev/null
+DPW2=$(jq -r .worktree <<<"$(cli task worktree "$DP_T2")")
+echo "tracked-from-origin" > "$DPW2/collide.txt"
+git -C "$DPW2" add collide.txt && git -C "$DPW2" commit -qm "track collide.txt"
+git -C "$DPW2" push -q origin HEAD:main
+DSHA2=$(git -C "$DPW2" rev-parse HEAD)
+api POST "/tasks/$DP_T2/merge_requested" "{\"agent\":\"$CLIID\"}" >/dev/null 2>&1
+api POST "/tasks/$DP_T2/merge_verified" "{\"agent\":\"$CLIID\",\"sha\":\"$DSHA2\"}" >/dev/null 2>&1
+echo "stale-untracked-leftover" > "$DW/collide.txt"   # untracked in $DW, never `git add`ed
+DPR2=$( (cd "$CLIDIR" && board task deploy "$DP_T2" 2>&1) || true )
+if [ "$(cat "$DW/collide.txt" 2>/dev/null)" = "tracked-from-origin" ]; then
+  ok "an untracked collision is cleaned before checkout, not after"
+else no "an untracked collision is cleaned before checkout" "$DPR2"; fi
+cli task release "$DP_T2" >/dev/null 2>&1
+
+# T-283 review [60]: the deploy worktree path "<repo>-worktrees/deploy" collides with a task
+# worktree for a branch literally named "deploy". Simulate that: $DW as a real worktree with
+# a branch checked out (not detached). Deploy must refuse and must not touch its files.
+git -C "$CLIDIR/web" worktree remove --force "$DW" >/dev/null 2>&1
+git -C "$CLIDIR/web" worktree add -q "$DW" -b deploy origin/main
+echo "do-not-touch" > "$DW/must-survive.txt"
+DP_T3=$(cli task create --title "deploy path collides with a branch worktree" --repo web | jq -r .id)
+cli task claim "$DP_T3" >/dev/null
+DPW3=$(jq -r .worktree <<<"$(cli task worktree "$DP_T3")")
+git -C "$DPW3" commit -q --allow-empty -m "another commit to deploy"
+git -C "$DPW3" push -q origin HEAD:main
+DSHA3=$(git -C "$DPW3" rev-parse HEAD)
+api POST "/tasks/$DP_T3/merge_requested" "{\"agent\":\"$CLIID\"}" >/dev/null 2>&1
+api POST "/tasks/$DP_T3/merge_verified" "{\"agent\":\"$CLIID\",\"sha\":\"$DSHA3\"}" >/dev/null 2>&1
+DPR3=$( (cd "$CLIDIR" && board task deploy "$DP_T3" 2>&1) ); DRC3=$?
+if [ "$DRC3" -ne 0 ] && grep -qi "not a detached deploy worktree" <<<"$DPR3"; then
+  ok "a deploy-path worktree with a branch checked out is refused, not cleaned"
+else no "deploy refuses a worktree with a branch checked out" "rc=$DRC3 $DPR3"; fi
+if [ "$(cat "$DW/must-survive.txt" 2>/dev/null)" = "do-not-touch" ]; then
+  ok "the refused worktree's files were left intact"
+else no "the refused worktree's files were left intact" "must-survive.txt was $(cat "$DW/must-survive.txt" 2>/dev/null || echo MISSING)"; fi
+cli task release "$DP_T3" >/dev/null 2>&1
+git -C "$CLIDIR/web" worktree remove --force "$DW" >/dev/null 2>&1
+git -C "$CLIDIR/web" branch -qD deploy >/dev/null 2>&1
+
 # T-189: a board that answers 503 (Traefik during a rollout) is down, not a valid answer. The
 # cache is keyed on BOARD_URL (T-118), so a cache warmed against the real board does not apply
 # to the 503 URL. What matters here is that the agent does not stop: a 503 must read as
