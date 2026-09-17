@@ -119,11 +119,15 @@ agent_id() {
 
 # ---- flag parsing: --foo bar --no-merge  ->  {"foo":"bar","no_merge":true} ----
 LIST_KEYS='["capabilities","requires","needs_grants","touches","options","cap"]'
-POS=(); JQARGS=()
+POS=(); JQARGS=(); CMDS=()
 parse() {
-  POS=(); JQARGS=()
+  POS=(); JQARGS=(); CMDS=()
   while [ $# -gt 0 ]; do
     case "$1" in
+      # --cmd is the one flag that may be given several times. A card often carries more
+      # than one command for the human, and jq --arg silently keeps only the last of two
+      # with the same name — the first would have vanished without a word (T-500).
+      --cmd) if [ $# -ge 2 ]; then CMDS+=("$2"); shift 2; else shift; fi ;;
       --*) k="${1#--}"; k="${k//-/_}"
            if [ $# -ge 2 ] && [[ "${2:-}" != --* ]]; then JQARGS+=(--arg "$k" "$2"); shift 2
            else JQARGS+=(--argjson "$k" true); shift; fi ;;
@@ -134,11 +138,17 @@ parse() {
 body() {  # extra k=v pairs as arguments: body key val key val
   local extra=()
   while [ $# -gt 1 ]; do [ -n "$2" ] && extra+=(--arg "$1" "$2"); shift 2; done
-  jq -nc "${JQARGS[@]}" "${extra[@]}" \
+  # NUL-separated, so a command with a comma, a newline or a quote in it survives intact
+  # — the whole point is that what lands on the card can be pasted verbatim.
+  local cj='[]'
+  [ ${#CMDS[@]} -gt 0 ] && cj=$(printf '%s\0' "${CMDS[@]}" | jq -Rsc 'split("\u0000")[:-1]')
+  jq -nc "${JQARGS[@]}" "${extra[@]}" --argjson board_cmds "$cj" \
     "\$ARGS.named
+     | del(.board_cmds)
      | with_entries(. as \$e | if (($LIST_KEYS | index(\$e.key)) and (.value|type==\"string\"))
                                then .value |= split(\",\") else . end)
-     | if has(\"cap\") then (.capabilities = .cap | del(.cap)) else . end"
+     | if has(\"cap\") then (.capabilities = .cap | del(.cap)) else . end
+     | if (\$board_cmds|length) > 0 then .cmds = \$board_cmds else . end"
 }
 
 req() {  # req METHOD PATH [JSON] [--nocache]
@@ -271,7 +281,7 @@ project::board project detect|show|init|sync|set::Project manifest operations.
 caps-probe|probe::board caps-probe::Probe this host's tool capabilities.
 task|tasks::board help task::Task lifecycle — see 'board help task' for subcommands.
 gate::board gate [merge] [task-id]::Check whether a task's merge/deploy gate is satisfied.
-ask::board ask "<question>"::Ask the board (or a human) a question.
+ask::board ask "<question>" [--task <id>] [--default <a>] [--deadline 8h] [--cmd "<command>"]...::Ask the board (or a human) a question. --cmd may be repeated: each command lands on the question and on its task's card, ready to paste.
 answer::board answer <question-id> "<answer>" [--note <note>]::Answer a pending question.
 message::board message <agent> --text "..."::Send a free-text message to an agent.
 routines|routine::board routines [--project <p>] [--status <s>] [--json]::List scheduled routines.
@@ -288,8 +298,8 @@ simplify::board task simplify [--project <p>] [--apply] [--archive-done] [--json
 create::board task create --title <t> [--spec-file <f>]::Create a new task.
 next::board task next [--repo <repo>]::Claim the next available task for this agent.
 claim::board task claim <id>::Claim a specific task by id.
-progress::board task progress <id> ["note"]::Post a progress note on the current task.
-blocked::board task blocked <id> ["note"]::Mark the current task blocked, with a note.
+progress::board task progress <id> ["note"] [--cmd "<command>"]...::Post a progress note on the current task. --cmd puts a command the human should run on the card, ready to paste.
+blocked::board task blocked <id> ["note"] [--cmd "<command>"]...::Mark the current task blocked, with a note. --cmd puts the command that would unblock it on the card, ready to paste.
 review::board task review <id>::Move a task to review.
 merging::board task merging <id>::Rebase/build/test a task's branch against origin/main.
 merged::board task merged <id> --sha <sha>::Verify a task's merge landed on origin/main (merge_verified) — does not mark done or clean up.
@@ -693,6 +703,12 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
               "merge  \(.merge_sha // "—")",
               "worktree \(.worktree // "—")",
               "",
+              (if ((.questions // []) | length) > 0 or ((.commands // []) | length) > 0 then
+                 "waiting on you",
+                 ((.questions // [])[] | "  \(.id)  \(.status)  \(.text // "")\n        \(.url)"),
+                 ((.commands // [])[] | "  $ \(.cmd)\(if .why then "   (\(.why))" else "" end)"),
+                 ""
+               else empty end),
               "timeline",
               (if ((.events // []) | length) == 0 then "  (empty)"
                else .events[] | "  \(.ts)  \(.type)  \(.actor)\(if .note then "  \(.note)" else "" end)"

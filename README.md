@@ -70,6 +70,7 @@ these is true:
 | An agent grants itself permission | Grants come from a policy file on the board, keyed on `harness@host`. An agent cannot write them. |
 | Quota is shared across sessions and machines | The board takes the highest reading per window name per harness account and answers `.stop` — the agent does not re-derive thresholds. |
 | A human decision is needed at 3 a.m. | `board ask` returns immediately with a default. The agent builds the default, marks the PR, and moves on. The human overrides later, and the board turns that into new work. |
+| The human wakes up and wants to know what is waiting on them | `/t/<id>` opens with it: the questions that block the task, linked to `/q/<id>`, and every command somebody is expected to run, each with a copy button. Agents put them there with `--cmd` on `board ask`, `board task blocked` and `board task progress`. |
 
 ## The loop
 

@@ -38,7 +38,7 @@ AG=$(A -X POST "$B/api/v1/agents" -d '{"project":"demo","model":"claude-opus-5",
 A -X POST "$B/api/v1/agents/$AG/heartbeat" -d '{"ctx_pct":42,"budget":[{"window":"5h","used_pct":58},{"window":"7d","used_pct":57}]}' >/dev/null
 TID=$(A -X POST "$B/api/v1/tasks" -d '{"project":"demo","title":"a task to look at","repo":".","agent":"'"$AG"'"}' | jq -r .id)
 A -X POST "$B/api/v1/tasks/$TID/claim" -d '{"agent":"'"$AG"'"}' >/dev/null
-QID=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"Should we use daisyUI?","kind":"product","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' | jq -r .id)
+QID=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"Should we use daisyUI?","kind":"product","default_answer":"yes","deadline":"8h","agent":"'"$AG"'","cmds":["cd ui && ./verify.sh"]}' | jq -r .id)
 TQ=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"Does the page look right?","agent":"'"$AG"'"}' | jq -r .id)
 
 CSSURL=$(python3 - <<PY
@@ -57,6 +57,20 @@ for pth in "/status" "/q/$QID" "/t/$TID"; do
     && ok "$pth CSP widened by 'self' and nothing else" || { no "$pth CSP:"; grep -i content-security "$D/hdr"; }
   grep -q "<style" "$D/body" && no "$pth still has an inline <style> block" || ok "$pth has no inline <style>"
 done
+
+# What is waiting on a human has to be ON the task's card, with a link to the question and
+# a button that copies the command (T-500). A command that cannot be pasted does not get run.
+TP=$(curl -s -H "Authorization: Bearer $T" "$B/t/$TID")
+grep -q "waiting on you" <<<"$TP" \
+  && ok "/t opens with what is waiting on a human" || no "/t is missing the waiting panel"
+grep -q "href='/q/$QID'" <<<"$TP" \
+  && ok "/t links to the question that blocks the task" || no "/t does not link to $QID"
+grep -q "data-copy='cd ui &amp;&amp; ./verify.sh'" <<<"$TP" \
+  && ok "/t offers the command for copying, verbatim" || no "/t has no copy button for the command"
+grep -q "<script>" <<<"$TP" \
+  && ok "/t carries the script the copy button needs" || no "/t has no script, so copy does nothing"
+curl -s -H "Authorization: Bearer $T" "$B/q/$QID" | grep -q "href='/t/$TID'" \
+  && ok "/q links back to the task it blocks" || no "/q is a dead end back to $TID"
 
 # the question page must show the deadline note
 curl -s -H "Authorization: Bearer $T" "$B/q/$QID" | grep -q "the agent carries on" \
