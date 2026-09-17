@@ -300,6 +300,81 @@ check "start without a manifest: a message, no unbound variable" \
   "$(jq -nc --arg o "$NOMAN" '{o:$o}')" \
   '(.o|contains("No project.yaml")) and (.o|contains("unbound")|not) and (.o|contains("rc=1"))'
 
+echo "== board help: authored text, not raw source (T-289) =="
+HELPTOP=$(env -u BOARD_HUMAN -u BOARD_URL -u BOARD_AGENT_ID "$SRC/bin/board" help 2>&1)
+HELPTASK=$(env -u BOARD_HUMAN -u BOARD_URL -u BOARD_AGENT_ID "$SRC/bin/board" help task 2>&1)
+if grep -qE ';;|\$\(' <<<"$HELPTOP"; then no "board help has no shell syntax" "$HELPTOP"
+else ok "board help has no shell syntax"; fi
+if grep -qE ';;|\$\(' <<<"$HELPTASK"; then no "board help task has no shell syntax" "$HELPTASK"
+else ok "board help task has no shell syntax"; fi
+# Derived from the real top-level case labels, not the help table — mirrors TASK_SUBS
+# below, so a top-level command added or removed (e.g. T-352 dropped test/test-level/
+# tests, T-466 added grant/revoke/grants) fails this instead of the table silently
+# drifting from the case statement again.
+TOPLEVEL_SUBS=$(awk '/^case "\$cmd" in$/{f=1; next} f && /^esac$/{exit} f && /^[a-zA-Z0-9_|.-]+\)$/' "$SRC/bin/board" \
+  | sed 's/)$//' | tr '|' '\n' | grep -v '^-' | sort -u)
+TOP_LISTED=$(awk '/^HELP_TOPLEVEL=/{f=1; next} f && /^EOF$/{exit} f' "$SRC/bin/board" \
+  | awk -F'::' '{print $1}' | tr '|' '\n' | sort -u)
+TOP_MISSING=""
+for s in $TOPLEVEL_SUBS; do grep -qx -- "$s" <<<"$TOP_LISTED" || TOP_MISSING="$TOP_MISSING $s"; done
+[ -z "$TOP_MISSING" ] && ok "board help lists every top-level command ($(wc -w <<<"$TOPLEVEL_SUBS") found)" \
+  || no "board help lists every top-level command" "missing:$TOP_MISSING"
+# Derived from the real case statement, not the help table — so a new task subcommand
+# added without help text fails this instead of the check trusting its own list.
+TASK_SUBS=$(awk '/^task\|tasks\)/{f=1; next} f && /^[a-zA-Z][a-zA-Z_-]*(\|[a-zA-Z_-]+)*\)$/{exit} f' "$SRC/bin/board" \
+  | grep -oP '^\s{4}\K[a-zA-Z][a-zA-Z_-]*(?=\))' | sort -u)
+# Match the actual listed token (`board task <name> ...`), not a raw substring — a
+# subcommand's own description text can otherwise contain another subcommand's name.
+LISTED=$(sed -n 's/^  board task \([a-zA-Z_-]*\).*/\1/p' <<<"$HELPTASK" | sort -u)
+MISSING=""
+for s in $TASK_SUBS; do grep -qx -- "$s" <<<"$LISTED" || MISSING="$MISSING $s"; done
+[ -z "$MISSING" ] && ok "board help task lists every task subcommand ($(wc -w <<<"$TASK_SUBS") found)" \
+  || no "board help task lists every task subcommand" "missing:$MISSING"
+
+# Every --flag a help row promises must actually be read by that subcommand's own case
+# body — a mismatch here is exactly the T-289 bug class (deploy documented a positional
+# <env> that the body never read; merged omitted --sha entirely). Derived from the real
+# case body text, not from a second hand-kept list, so drift fails this instead of trusting
+# itself.
+TASK_REGION=$(awk '/^task\|tasks\)/{f=1; next} f && /^[a-zA-Z][a-zA-Z_-]*(\|[a-zA-Z_-]+)*\)$/{exit} f' "$SRC/bin/board")
+SIMPLIFY_PY=$(cat "$SRC/bin/simplify.py" 2>/dev/null)
+FLAG_MISS=""
+for sub in $TASK_SUBS; do
+  # The block from this subcommand's case label up to the next one (or the closing esac).
+  block=$(awk -v n="$sub" '
+    grab && ($0 ~ "^    [a-zA-Z][a-zA-Z0-9_-]*\\)") {exit}
+    grab && ($0 ~ "^  esac") {exit}
+    grab {print}
+    $0 ~ "^    "n"\\)" {grab=1; print}
+  ' <<<"$TASK_REGION")
+  # `simplify` forwards "$@" untouched to simplify.py's own argparse — the case body never
+  # dereferences a single flag by name, so check the script that actually parses them.
+  [ "$sub" = simplify ] && block="$SIMPLIFY_PY"
+  row=$(grep -E "^  board task $sub([^a-zA-Z0-9_-]|\$)" <<<"$HELPTASK")
+  for flag in $(grep -oE -- '--[a-zA-Z][a-zA-Z0-9-]*' <<<"$row"); do
+    field=${flag#--}; field=${field//-/_}
+    case "$sub:$flag" in
+      # --title is sent through untouched to the API (with_agent/with_project forward the
+      # whole body); bin/board itself never dereferences it, so there is no literal to grep.
+      create:--title) continue ;;
+    esac
+    if grep -qE -- "[.\"\$]$field\\b" <<<"$block"; then continue; fi
+    # --project is handled by the shared with_project/project_name idiom, not a per-command
+    # `.project` read.
+    if [ "$field" = project ] && grep -qE 'with_project|project_name' <<<"$block"; then continue; fi
+    if grep -qF -- "$flag" <<<"$block"; then continue; fi
+    FLAG_MISS="$FLAG_MISS $sub:$flag"
+  done
+done
+[ -z "$FLAG_MISS" ] && ok "board help task: every documented --flag is read by its case body" \
+  || no "board help task: every documented --flag is read by its case body" "missing:$FLAG_MISS"
+
+echo "== board task deploy: a stray positional env dies loudly, never silently defaults to dev (T-289) =="
+DEPLOY_RC=0
+env -u BOARD_HUMAN -u BOARD_AGENT_ID "$SRC/bin/board" task deploy T-does-not-exist prod >/dev/null 2>&1 || DEPLOY_RC=$?
+[ "$DEPLOY_RC" -ne 0 ] && ok "board task deploy <id> <positional-env> exits non-zero" \
+  || no "board task deploy <id> <positional-env> exits non-zero" "exit code was 0 — env silently defaulted"
+
 echo "== registration, capabilities, heartbeat =="
 A=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-a","model":"claude-fable-5-1","session":"s1","capabilities":["browser-test","playwright"]}')
 check "register returns an id + grants from the policy" "$A" '.id and (.grants|index("merge"))'
