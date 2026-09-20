@@ -141,8 +141,14 @@ for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
 try:
     db.execute("CREATE INDEX IF NOT EXISTS events_type ON events(type, project, id)")
 except sqlite3.Error as _e:
+    # The EXTENDED code, not just "disk I/O error". SQLITE_IOERR is a family — _WRITE,
+    # _FSYNC, _SHMOPEN, _GETTEMPPATH and a dozen more — and they have entirely different
+    # causes. The plain message is what this failure has offered so far, and it is not
+    # enough to act on. sqlite_errorcode/sqlite_errorname are Python 3.11+, hence getattr.
     print("could not create the events(type) index — the board runs, reading the log by "
-          "type is slower: %r" % (_e,), file=sys.stderr, flush=True)
+          "type is slower: %s (%s/%s)" % (
+              _e, getattr(_e, "sqlite_errorname", "?"),
+              getattr(_e, "sqlite_errorcode", "?")), file=sys.stderr, flush=True)
 
 _cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
 if {"rl5_pct", "rl7_pct"} <= _cols:      # T-164: existing database, old columns still there
