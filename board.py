@@ -278,20 +278,28 @@ def budget(project):
     c = p.get("ceilings")
     if c is None and p.get("rl7_ceiling") is not None:
         c = {"7d": p["rl7_ceiling"], "5h": p.get("rl5_ceiling", 85)}
-    # The owner's own setting, made on the board, beats the file. `source` travels with
-    # the numbers so the gauges can say which one they are drawing — an override that
-    # looks identical to the policy is how you end up editing the ConfigMap for an hour
-    # wondering why nothing moves.
+    # The owner's own setting, made on the board, beats the file — PER WINDOW, merged
+    # over it, never instead of it. Each gauge on /status is its own form carrying one
+    # `ceiling.<window>`, so dragging one handle posts one window: replacing the whole
+    # dict meant that raising 5h from a phone deleted the 7d ceiling and stopped every
+    # agent in the project, with a note pointing at a YAML file that already had the
+    # value. That is the precise gesture this feature exists for.
+    #
+    # `source` travels with the numbers so the gauges can say which one they are drawing —
+    # an override that looks identical to the policy is how you spend an hour editing the
+    # ConfigMap wondering why nothing moves — and `overridden` names the windows the owner
+    # has taken over, because "set here" for the project as a whole would be a lie about
+    # the rest of them.
     own = ceilings_override(project)
-    if own:
-        return {"ceilings": own, "fallback": p.get("fallback", {}), "source": "board"}
-    if c is None:
+    merged = dict(c or {}, **own)
+    if not merged:
         return {"ceilings": {}, "fallback": p.get("fallback", {}), "ceilings_missing": True,
-                "source": "none",
+                "source": "none", "overridden": [],
                 "note": "No ceiling is set for %s, so every agent here stops. Set one on "
                         "the board (the gauges under the fleet), or add "
                         "budget.%s.ceilings to board-policy.json." % (project, project)}
-    return {"ceilings": c, "fallback": p.get("fallback", {}), "source": "policy"}
+    return {"ceilings": merged, "fallback": p.get("fallback", {}),
+            "source": "board" if own else "policy", "overridden": sorted(own)}
 
 
 def ceilings_override(project):
@@ -2040,6 +2048,10 @@ def status(project=None):
             agents.append(d)
         costs = task_costs(name)
         out["projects"].append({
+            # The fold over this project's dispatch events, done ONCE. The HTML reads it
+            # again for the done rows it draws; a second call here is a second scan of
+            # the event log on every page render, under the global lock.
+            "costs": costs,
             "name": name, "phase": p["phase"], "goal": p["goal"], "paused": p["paused"],
             "wip": wip_limit(name), "unreviewed": unreviewed(name),
             "agents": agents,
@@ -2220,7 +2232,7 @@ def cost_cell(t):
                mark, toks(c.get("tokens"))))
 
 
-def gauge(window, pct, ceiling, project, human):
+def gauge(window, pct, ceiling, project, human, overridden=False):
     """The quota gauge: what the fleet has used, and the line it must not cross — with
     the line as a handle you can drag.
 
@@ -2245,13 +2257,14 @@ def gauge(window, pct, ceiling, project, human):
             "<input class='handle' type='range' name='ceiling.%s' min='0' max='100' "
             "step='1' value='%d' data-ceiling aria-label='ceiling for %s, now %d percent'>"
             "</span>"
-            "<output class='%s' data-ceiling-out>%d</output>"
+            "<output class='%s' data-ceiling-out title='%s'>%d</output>"
             "<button type='submit' class='sr-only-btn'>Set</button>"
             "</form>" % (
                 escape(project), escape(project), escape(window),
                 fill, round(min(v, 100)), tick,
                 escape(window), int(round(c)), escape(window), int(round(c)),
-                MONO, int(round(c))))
+                MONO, "set here" if overridden else "from board-policy.json",
+                int(round(c))))
 
 
 SPINE = {"blocked": "spine-stop", "orphaned": "spine-stop",
@@ -2413,6 +2426,15 @@ function val(name,dflt){return LS.g('board:'+name,dflt);}
 function apply(){
   var all=val('all','0')==='1';
   var fp=val('project','all'),fs=val('status','active'),fa=val('age','all');
+  /* The project filter is remembered across pages, but /status?project=X renders ONE
+     project. A filter naming a different one then hid the only row on the page: a blank
+     board, a blank select and "0 shown", with nothing saying why. A stored value that
+     matches nothing here is not a filter, it is a leftover. */
+  if(fp!=='all'){
+    var known=false;
+    for(var q=0;q<pjs.length;q++){if(pjs[q].dataset.p===fp){known=true;break;}}
+    if(!known){fp='all';LS.s('board:project','all');}
+  }
   var sel=document.querySelectorAll('[data-f]');
   for(var s=0;s<sel.length;s++){
     var f=sel[s].getAttribute('data-f');
@@ -2529,6 +2551,12 @@ FOCUS_SHA = "'sha256-%s'" % base64.b64encode(
 FOCUS = "<script>%s</script>" % FOCUS_JS
 
 
+def status_ok(a):
+    """Worth offering a role to: it is here and it is answering. Pinning a dead agent as
+    coordinator is a way to have no coordinator at all until somebody notices."""
+    return (a.get("status") or "") in ("alive", "stalled")
+
+
 def agent_block(a, ceilings, human=False, project=None):
     # The ceiling drawn per window is THIS agent's effective (ramped) ceiling — already
     # computed once in status() — not the raw policy value, or an agent minutes from its
@@ -2538,6 +2566,27 @@ def agent_block(a, ceilings, human=False, project=None):
     ws = sorted(windows_of(a).items())
     st = a.get("status") or "unknown"
     mins = int(mins_since(a.get("last_seen"))) if a.get("last_seen") else 999999
+    # Who coordinates is the owner's call when they want it to be (§3.8: "the human's
+    # word wins"), and `board role pin` was the only way to say so. The board now says it
+    # too — the same handler, the same human-token gate. A pinned role beats the election
+    # for as long as the holder is alive, so the button that removes the pin has to sit
+    # next to the one that sets it, or a pin made at 3am is a pin nobody can undo from a
+    # phone.
+    role_ctl = ""
+    if human and project:
+        if "coordinator" in (a.get("roles") or []):
+            role_ctl = ("<form method='POST' action='/roles/coordinator/unpin' class='inline m-0'>"
+                        "<input type='hidden' name='project' value='%s'>"
+                        "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
+                        "title='Let the election decide again'>Unpin</button></form>"
+                        % escape(project))
+        elif status_ok(a):
+            role_ctl = ("<form method='POST' action='/roles/coordinator/pin' class='inline m-0'>"
+                        "<input type='hidden' name='project' value='%s'>"
+                        "<input type='hidden' name='agent' value='%s'>"
+                        "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
+                        "title='Pin this agent as coordinator'>Make coordinator</button></form>"
+                        % (escape(project), escape(a["id"])))
     grants_badges = []
     for g in a.get("grants", []):
         rev = ""
@@ -2579,9 +2628,12 @@ def agent_block(a, ceilings, human=False, project=None):
                 escape(a["status"] or ""),
                 ("<span class='badge badge-sm badge-outline'>%s</span>" % escape(roles))
                 if roles else "",
-                ("<a class='%s %s text-sm' href='/t/%s'>%s</a>" % (
+                # The task link stays next to the agent's own facts; the role button is an
+                # action and goes after them, or it pushes the one thing you came to read
+                # onto a line of its own.
+                (("<a class='%s %s text-sm' href='/t/%s'>%s</a>" % (
                     LINK, MONO, escape(a["current_task"]), escape(a["current_task"])))
-                if a["current_task"] else "",
+                 if a["current_task"] else "") + role_ctl,
                 grants_html,
                 add_form,
                 body,
@@ -2693,12 +2745,18 @@ def task_row(t, human, back, questions=(), multirepo=False, hidden=False):
 
 
 def task_rows(p, human=False, back="/status"):
-    """The queue, in priority order, with each task's open questions hanging under it."""
+    """The queue, in priority order, with each task's open questions hanging under it.
+
+    Returns the markup AND the ids it drew a row for: a question hangs under its task, so
+    a question about a task with no row here has nowhere to hang and has to fall back to
+    a card of its own. Without that it vanished from the board completely — the task was
+    archived, the question stayed open, and `board task cleanup-done` archives in bulk."""
     by_task = {}
     for q in p["questions"] + p["questions_defaulted"]:
         if q.get("task"):
             by_task.setdefault(q["task"], []).append(q)
     multirepo = len({t.get("repo") for t in p["tasks"] if t.get("repo")}) > 1
+    shown = set()
     h = ["<div class='min-w-0 overflow-x-auto'><table class='tasks w-full text-sm'>"
          "<thead><tr class='%s text-xs'>"
          "<th class='py-1 pl-3 pr-2 text-left font-semibold'>pri"
@@ -2709,16 +2767,20 @@ def task_rows(p, human=False, back="/status"):
          "<th class='px-2 py-1 text-left font-semibold'>pr"
          "<th class='px-2 py-1 text-left font-semibold'>title</thead><tbody>" % DIM]
     for t in p["tasks"]:
+        shown.add(t["id"])
         h.append(task_row(t, human, back, by_task.get(t["id"], ()), multirepo))
     # Done tasks are rendered but hidden: "what did the fleet land today" is one filter
-    # away rather than one page load away, and the row is already paid for.
-    costs = task_costs(p["name"])
+    # away rather than one page load away, and the row is already paid for. The costs
+    # come from status(), which has already scanned the log once for this project —
+    # scanning it again here doubled the work on every render, under the global lock.
+    costs = p.get("costs") or {}
     for t in db.execute("SELECT * FROM tasks WHERE project=? AND status='done' "
                         "ORDER BY updated DESC LIMIT 30", (p["name"],)):
+        shown.add(t["id"])
         h.append(task_row(dict(brief(t), cost=costs.get(t["id"])), human, back,
-                          (), multirepo, hidden=True))
+                          by_task.get(t["id"], ()), multirepo, hidden=True))
     h.append("</tbody></table></div>")
-    return "".join(h)
+    return "".join(h), shown
 
 
 def q_card(q, answer=None):
@@ -2793,15 +2855,24 @@ def limits_block(p, human):
     at three in the morning from a phone."""
     b = p.get("budget") or {}
     ceilings = {win_name(k): float(v or 0) for k, v in (b.get("ceilings") or {}).items()}
-    used = {}
-    for a in p["agents"]:
-        for w, pct in windows_of(a).items():
-            used[w] = max(used.get(w, 0.0), pct)
+    # The REMEMBERED per-account reading, not the maximum over the agents standing here
+    # right now. Quota is per harness account and survives the agent that reported it
+    # (quota_max, T-192): filtering to the living ones redraws every bar at zero the
+    # moment a session ends, and the owner then drags a ceiling against a gauge saying
+    # the quota is free when it is at 95%.
+    used = {win_name(k): float(v or 0) for k, v in (b.get("windows") or {}).items()}
     windows = sorted(set(list(ceilings) + list(used)) or {"5h", "7d"})
+    over = set(b.get("overridden") or [])
     rows = "<div class='grid gap-2.5'>%s</div>" % "".join(
-        gauge(w, used.get(w), ceilings.get(w), p["name"], human) for w in windows)
-    src = {"board": "set here", "policy": "from board-policy.json",
-           "none": "not set"}.get(b.get("source"), "")
+        gauge(w, used.get(w), ceilings.get(w), p["name"], human, w in over) for w in windows)
+    # Per window, because the owner can have taken over one and left the other: saying
+    # "set here" for the project would be a lie about the rest of them.
+    if not over:
+        src_txt = "from board-policy.json"
+    elif over >= set(windows):
+        src_txt = "set here"
+    else:
+        src_txt = "%s set here, the rest from board-policy.json" % ", ".join(sorted(over))
     wip = int(p.get("wip") or 0)
     unrev = int(p.get("unreviewed") or 0)
     if human:
@@ -2820,7 +2891,7 @@ def limits_block(p, human):
             "<div class='mt-3 flex flex-wrap items-baseline gap-2 text-sm'>"
             "<span class='%s'>waiting for review</span>"
             "<span class='%s'>%d of</span>%s</div></div>" % (
-                DIM, escape(src), rows, DIM, MONO, unrev, wip_ctl))
+                DIM, escape(src_txt), rows, DIM, MONO, unrev, wip_ctl))
 
 
 def html_status(project, token="", human=False):
@@ -2916,17 +2987,23 @@ def html_status(project, token="", human=False):
                  "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
                  "title='Archive tasks that are done'>Archive landed work</button>"
                  "</form></div></div>" % escape(p["name"]))
+        shown = set()
         if not p["tasks"]:
             h.append("<p class='%s text-sm'>The queue is empty. Add the next piece of work "
                      "with <code class='rounded bg-base-200 px-1 font-mono'>board task create"
                      "</code>.</p>" % DIM)
         else:
-            h.append(task_rows(p, human, back))
+            rows_html, shown = task_rows(p, human, back)
+            h.append(rows_html)
         h.append("</section></div>")
-        # A question about no particular task has no row to hang under, so it keeps the
-        # card it always had — at full width, because this is the human's own surface.
-        loose = [q for q in p["questions"] if not q.get("task")]
-        loose_d = [q for q in p["questions_defaulted"] if not q.get("task")]
+        # A question with no row to hang under keeps the card it always had, at full
+        # width, because this is the human's own surface. That is a question about no
+        # task at all — and also one about a task that is archived, or older than the
+        # thirty done rows the queue draws. Anchoring questions to rows without this
+        # made those disappear from the board entirely while still being open.
+        adrift = lambda q: not q.get("task") or q["task"] not in shown
+        loose = [q for q in p["questions"] if adrift(q)]
+        loose_d = [q for q in p["questions_defaulted"] if adrift(q)]
         if loose:
             h.append("<p class='%s'>waiting for an answer from you</p>" % LBL)
             h.append("<div class=qgrid>%s</div>" % "".join(q_card(q) for q in loose))
@@ -3218,6 +3295,15 @@ ROUTES = [(mth, re.compile("^" + API + pat), fn) for mth, pat, fn in ROUTES]
 BACK_OK = re.compile(r"^/(?!/)[^\\\x00-\x1f\x7f]*$")
 
 
+def need(b, key):
+    """A form field the handler cannot do without. `b[key]` raises KeyError, which the
+    request handler turns into a 400 with no idea what was missing; this says which."""
+    v = (b or {}).get(key)
+    if not v:
+        raise Err(400, "%s is required" % key)
+    return v
+
+
 def back_to(b, dflt):
     """Where a form on the board returns to.
 
@@ -3256,10 +3342,13 @@ UI_POST = [
      lambda m, b, q: set_ceilings(m.group(1), b), proj_back),
     (r"/projects/([^/]+)/phase$",
      lambda m, b, q: set_phase(m.group(1), b), proj_back),
+    # .get(), like every other entry here: a form that posts without them must answer
+    # 400, not raise a KeyError into the 500 handler.
     (r"/roles/([^/]+)/pin$",
-     lambda m, b, q: role_pin(b["project"], m.group(1), b["agent"], HUMAN, b), proj_back),
+     lambda m, b, q: role_pin(need(b, "project"), m.group(1), need(b, "agent"), HUMAN, b),
+     proj_back),
     (r"/roles/([^/]+)/unpin$",
-     lambda m, b, q: role_unpin(b["project"], m.group(1), b), proj_back),
+     lambda m, b, q: role_unpin(need(b, "project"), m.group(1), b), proj_back),
     (r"/t/([^/]+)/patch$",
      lambda m, b, q: task_patch(m.group(1), actor_h(q, b), b),
      lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
@@ -3625,7 +3714,13 @@ def prometheus_metrics():
         'board_tasks_estimated_total{project="%s",estimate_model="%s",estimate="%s"} %d' % (
             prom_esc(p), prom_esc(m), prom_esc(e), n)
         for (p, m, e), n in sorted(est_n.items())])
-    add_metric("board_task_estimate_tokens_total", "counter", [
+    # gauge, not counter: these are recomputed absolutes carrying an `estimate` label.
+    # Re-sizing a task moves its whole token sum from estimate="5" to estimate="8", and a
+    # new dispatch logged without --tokens drops the task out of the series altogether
+    # (conformance asserts exactly that). rate() over either would read those as counter
+    # resets — the dashboard only divides raw values, so the TYPE line was a trap rather
+    # than a visible fault.
+    add_metric("board_task_estimate_tokens_total", "gauge", [
         'board_task_estimate_tokens_total{project="%s",estimate_model="%s",estimate="%s"} %d' % (
             prom_esc(p), prom_esc(m), prom_esc(e), n)
         for (p, m, e), n in sorted(est_tok.items())])
@@ -3653,7 +3748,7 @@ def prometheus_metrics():
             for model, tok in c["by_model"].items():
                 k = (r["project"] or "", model, str(r["estimate"]) if r["estimate"] else "")
                 model_tok[k] = model_tok.get(k, 0) + tok
-    add_metric("board_task_tokens_total", "counter", [
+    add_metric("board_task_tokens_total", "gauge", [
         'board_task_tokens_total{project="%s",model="%s",estimate="%s"} %d' % (
             prom_esc(p), prom_esc(m), prom_esc(e), n)
         for (p, m, e), n in sorted(model_tok.items())])

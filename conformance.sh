@@ -2052,6 +2052,25 @@ check "what the owner set beats board-policy.json, and says which it is" \
    and (.projects[0].budget.ceilings_missing // false) == false'
 check "the review limit the owner set is the one the board enforces" \
   "$(api GET '/status?project=sizing')" '.projects[0].wip == 2'
+# The bug this check exists for: each gauge is its own form carrying ONE window, so
+# dragging one handle posted one window — and an override that replaced the policy dict
+# wholesale then deleted every other ceiling and stopped the project, with a note pointing
+# at a file that already had the value. That is the exact gesture the feature is for.
+check "setting one window leaves the others standing" \
+  "$(hum POST '/projects/demo/ceilings' '{"ceiling.5h":70}')" '.ceilings["5h"] == 70'
+check "…and the project keeps the policy's other windows" "$(api GET '/status?project=demo')" \
+  '.projects[0].budget.ceilings["7d"] == 75 and .projects[0].budget.ceilings["5h"] == 70'
+check "…with the overridden window named, not the whole project claimed" \
+  "$(api GET '/status?project=demo')" \
+  '.projects[0].budget.overridden == ["5h"] and .projects[0].budget.source == "board"'
+check "…and no agent is stopped for a window nobody touched" \
+  "$(api GET '/status?project=demo')" \
+  '(.projects[0].budget.ceilings_missing // false) == false'
+hum POST '/projects/demo/ceilings' '{"ceiling.5h":""}' >/dev/null
+check "clearing it hands the window back to the policy, in full" \
+  "$(api GET '/status?project=demo')" \
+  '.projects[0].budget.ceilings["5h"] == 85 and .projects[0].budget.source == "policy"
+   and .projects[0].budget.overridden == []'
 check "a percentage outside 0-100 is refused" \
   "$(hum POST '/projects/sizing/ceilings' '{"ceiling.5h":140}')" '.error != null'
 check "an empty value hands the window back to the policy" \
@@ -2062,6 +2081,19 @@ check "the human can" "$(hum POST '/projects/sizing/phase' '{"phase":"launch"}')
   '.phase == "launch"'
 check "an unknown phase is refused" "$(hum POST '/projects/sizing/phase' '{"phase":"shipping"}')" \
   '.error != null'
+
+echo "== a question is never invisible, whatever became of its task =="
+QT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"will be archived\",\"agent\":\"$EA\"}" | jq -r .id)
+QQ=$(api POST '/questions' "{\"project\":\"sizing\",\"task\":\"$QT\",\"text\":\"still open when the task went away?\",\"agent\":\"$EA\"}" | jq -r .id)
+hum POST "/tasks/$QT/archive" '{}' >/dev/null
+check "archiving a task does not answer its open question" "$(api GET '/questions')" \
+  '[.questions[]?|select(.id=="'"$QQ"'" and .status=="open")]|length == 1'
+# The HTML is where it was actually lost: questions hang under their task row, and an
+# archived task has no row. `board task cleanup-done` archives in bulk, so this is routine.
+HQ=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status?project=sizing")
+check "…and the board still shows it, in a card of its own" \
+  "$(jq -nc --arg h "$HQ" '{h:$h}')" '.h | test("'"$QQ"'")'
+api POST "/questions/$QQ/answer" '{"answer":"tidied by conformance","by":"board"}' >/dev/null
 
 echo "== the owner can take a task back from a live agent =="
 check "another agent cannot release someone else's task" \

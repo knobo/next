@@ -97,6 +97,19 @@ grep -q "name='estimate'" "$D/human.html" \
   && ok "the queue's size can be set in place" || no "the queue has no size control"
 grep -q "name='priority'" "$D/agent.html" \
   && no "an agent is shown the owner's queue controls" || ok "an agent sees the queue read-only"
+# Who coordinates is the owner's call (§3.8). `board role pin` was the only way to say
+# so; the button has to reach the same handler and refuse the same way.
+grep -q "action='/roles/coordinator/pin'" "$D/human.html" \
+  && ok "the owner can pin a coordinator from the board" || no "no role control on /status"
+grep -q "action='/roles/coordinator/" "$D/agent.html" \
+  && no "an agent is shown the role control" || ok "an agent cannot pin a role from the board"
+# A form that reaches a handler without its fields must answer 400, not raise into the
+# 500 handler.
+grep -q '"error"' <<<"$(curl -s -H "Authorization: Bearer $HT" -H 'Accept: application/json' \
+  -H 'Content-Type: application/x-www-form-urlencoded' -X POST -d 'project=demo' \
+  "$B/roles/coordinator/pin")" \
+  && ok "pinning with no agent says which field is missing" \
+  || no "a missing form field is not a 400"
 # A question belongs under the task it is about, at that task's place in the order.
 grep -q "data-task-child" "$D/human.html" \
   && ok "a question hangs under the task it is about" \
