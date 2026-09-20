@@ -3203,18 +3203,24 @@ ROUTES = [
 ROUTES = [(mth, re.compile("^" + API + pat), fn) for mth, pat, fn in ROUTES]
 
 
+# A path on this board and nothing else: leading "/", not "//" (that is a URL with a
+# host), no backslash (browsers read it as "/"), and no control character at all.
+# http.server's send_header does NOT sanitize — VERIFIED: it wrote
+# "Location: /status\r\nX-Injected: yes" out verbatim — so a CR or LF here is a header
+# the caller got to write. SameSite=Lax and form-action 'self' make that hard to reach
+# from outside, which is a reason it stayed unnoticed, not a reason to allow it.
+BACK_OK = re.compile(r"^/(?!/)[^\\\x00-\x1f\x7f]*$")
+
+
 def back_to(b, dflt):
     """Where a form on the board returns to.
 
     Every control exists on more than one page now — a priority can be changed from the
     queue and from the task itself — and coming back to the wrong one costs a scroll and
-    a lost place in a list of forty tasks. The page says where it was; the server refuses
-    anything that is not a path on this board, so `back` cannot be turned into an open
-    redirect by a link somebody was sent."""
+    a lost place in a list of forty tasks. The page says where it was; anything that is
+    not a path on this board is dropped for the default rather than followed."""
     v = (b or {}).get("back") or ""
-    if v.startswith("/") and not v.startswith("//") and "\\" not in v:
-        return v
-    return dflt
+    return v if BACK_OK.match(v) else dflt
 
 
 def proj_back(b, res):

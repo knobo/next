@@ -108,6 +108,26 @@ REF=$(curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/x-www-
 grep -q "signed in as an" <<<"$REF" \
   && ok "an agent pressing an owner's control gets a page that says why" \
   || no "the refusal is not a page" "$(head -c 120 <<<"$REF")"
+# `back` is a path this board serves, or it is dropped. http.server's send_header does
+# not sanitize, so a CR or LF that got this far would be a response header the caller
+# wrote. The check reads the RAW headers: the redirect must go to the default and no
+# X-Injected must exist anywhere in them.
+INJ=$(curl -s -o /dev/null -D - -H "Authorization: Bearer $HT" \
+      -H 'Content-Type: application/x-www-form-urlencoded' -X POST \
+      --data-urlencode 'back=/status
+X-Injected: yes' --data 'priority=70' "$B/t/$TID/patch")
+grep -qi 'x-injected' <<<"$INJ" \
+  && no "a newline in back wrote a response header" \
+  || ok "a newline in back is dropped, not written into the headers"
+grep -qi "^Location: /t/$TID" <<<"$INJ" \
+  && ok "a back that is not a path on this board falls back to the task" \
+  || no "the refused back did not fall back" "$(grep -i location <<<"$INJ")"
+OPEN=$(curl -s -o /dev/null -D - -H "Authorization: Bearer $HT" \
+       -H 'Content-Type: application/x-www-form-urlencoded' -X POST \
+       -d 'back=//example.com&priority=71' "$B/t/$TID/patch")
+grep -qi "^Location: //" <<<"$OPEN" \
+  && no "back accepted a protocol-relative URL — that is an open redirect" \
+  || ok "back refuses a URL with a host"
 # The task page has to say what the task cost, or the estimate beside it means nothing.
 curl -s -H "Authorization: Bearer $HT" "$B/t/$TID" | grep -q "what it has cost" \
   && ok "/t shows what the task has cost" || no "/t does not show the cost"
