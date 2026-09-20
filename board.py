@@ -2975,6 +2975,14 @@ def queue(p, human, back):
             by_task.setdefault(q["task"], []).append(q)
     shown, html = set(), []
     left = list(p["tasks"])
+    # Said BEFORE the landed rows are added, and about the live queue only. Testing
+    # `html` at the end instead meant a project whose only rows were `done` never got
+    # this line — and since landed is hidden by the default filter, its queue read as a
+    # blank space with nothing to say why.
+    if not left:
+        html.append("<p class='%s mt-2 text-sm'>The queue is empty. Add the next piece of "
+                    "work with <code class='rounded bg-base-200 px-1 font-mono'>board task "
+                    "create</code>.</p>" % DIM)
     for key, label, statuses in QUEUE_GROUPS:
         rows = [t for t in left if (t.get("status") or "") in statuses]
         if not rows:
@@ -3003,10 +3011,6 @@ def queue(p, human, back):
         for t in done:
             shown.add(t["id"])
             html.append(queue_card(t, human, back, (), big=False))
-    if not html:
-        return ("<p class='%s text-sm'>The queue is empty. Add the next piece of work with "
-                "<code class='rounded bg-base-200 px-1 font-mono'>board task create</code>.</p>"
-                % DIM, shown)
     return "".join(html), shown
 
 

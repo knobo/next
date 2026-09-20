@@ -2091,6 +2091,20 @@ check "the human can" "$(hum POST '/projects/sizing/phase' '{"phase":"launch"}')
 check "an unknown phase is refused" "$(hum POST '/projects/sizing/phase' '{"phase":"shipping"}')" \
   '.error != null'
 
+echo "== an empty queue says so, even with landed work behind it =="
+api POST '/projects' '{"project":"emptyq","phase":"build"}' >/dev/null
+EQA=$(api POST '/agents' '{"project":"emptyq","harness":"claude-code","host":"eq","session":"eq1"}' | jq -r .id)
+EQT=$(api POST '/tasks' "{\"project\":\"emptyq\",\"title\":\"already landed\",\"agent\":\"$EQA\"}" | jq -r .id)
+api POST "/tasks/$EQT/claim" "{\"agent\":\"$EQA\"}" >/dev/null
+api POST "/tasks/$EQT/done" "{\"agent\":\"$EQA\",\"no_merge\":true}" >/dev/null
+EQH=$(curl -sS -m 5 -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=emptyq")
+# Landed rows are rendered but hidden by the default filter, so a project with nothing but
+# done work would otherwise show a blank space where the queue is.
+grep -q "The queue is empty" <<<"$EQH" \
+  && ok "a project with only landed work still says its queue is empty" \
+  || no "an empty queue behind landed work says nothing" "$(head -c 120 <<<"$EQH")"
+api POST "/agents/$EQA/finished" '{"reason":"queue empty"}' >/dev/null
+
 echo "== a working agent that reports no quota is not a dead one =="
 NQ=$(api POST '/agents' '{"project":"sizing","harness":"codex","host":"nq","session":"nq1","model":"gpt-5"}' | jq -r .id)
 api POST "/agents/$NQ/heartbeat" '{"ctx_pct":10,"budget":[]}' >/dev/null
