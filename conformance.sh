@@ -495,8 +495,11 @@ curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=rampprojec
 TICK=$(python3 -c "
 import re
 html = open('$TMP/ramp-status.html').read()
-m = re.search(r'data-agent[^>]*>.*?<b[^>]*>' + re.escape('$RID') + r'</b>.*?(?=data-agent|\Z)', html, re.S)
-blk = m.group(0) if m else ''
+# One agent = one line now, and its id sits in the trailing .ag-id span rather than in a
+# bold heading. The property under test is unchanged: the tick this agent's meter draws
+# must be ITS ramped ceiling, not the raw policy number.
+blocks = re.split(r\"(?=<div class='ag' data-agent)\", html)
+blk = next((b for b in blocks if '>' + '$RID' + '<' in b), '')
 mm = re.search(r\"<span class=k>7d</span>.*?data-c='([0-9.]+)'\", blk, re.S)
 print(mm.group(1) if mm else -1)
 ")
@@ -1364,13 +1367,14 @@ SLID=$(jq -r .id <<<"$(api POST /tasks "{\"agent\":\"$SLA\",\"project\":\"demo\"
 api POST /tasks/$SLID/claim "{\"agent\":\"$SLA\"}" >/dev/null
 api POST /tasks/$SLID/progress "{\"agent\":\"$SLA\",\"pr\":\"http://pr/1\"}" >/dev/null
 STHTML=$(curl -sL -c "$J" -b "$J" "$BOARD_URL/status")
-# `>pr<` and not `<th>pr`: the check must see that the PR has its OWN COLUMN, not that the
-# header cell has no attributes. The previous form made every class on a <th> a conformance
-# violation.
-if grep -q "href='/t/$SLID'" <<<"$STHTML" && grep -q ">pr<" <<<"$STHTML" && grep -q "#1" <<<"$STHTML"; then
-  ok "status: the task id is a link, the PR number is in its own column"
+# The queue is no longer a table, so there is no pr column to look for. The property is
+# the same one it always was: from /status you can reach the task, and you can see and
+# reach its PR.
+if grep -q "href='/t/$SLID'" <<<"$STHTML" && grep -q "href='http://pr/1'" <<<"$STHTML" \
+   && grep -q "#1" <<<"$STHTML"; then
+  ok "status: the task id links to the task, and its PR number links to the PR"
 else
-  no "status links and the PR column" "$STHTML"
+  no "status links and the PR" "$STHTML"
 fi
 
 if [ "$OWN_SERVER" = 1 ]; then
@@ -1386,14 +1390,19 @@ if [ "$OWN_SERVER" = 1 ]; then
   MCRES=$(python3 -c "
 import sys
 html, alive_id, dead_id = sys.argv[1], sys.argv[2], sys.argv[3]
+import re
+blocks = re.split(r\"(?=<div class='ag' data-agent)\", html)
 def block(aid):
-    i = html.find(\">%s<\" % aid)
-    if i < 0: return None
-    start = html.rfind('<div data-agent', 0, i)
-    end = html.find('<div data-agent', i)
-    return html[start:end if end > 0 else len(html)]
+    b = next((x for x in blocks if '>' + aid + '<' in x), None)
+    # The LAST agent row in a project runs to the end of the split, which swallows the
+    # ceilings panel that follows the fleet — and that panel is full of meters. Cut the
+    # block where the fleet ends, or a dead agent inherits the project's gauges and the
+    # check passes for the wrong reason.
+    return b if b is None else b.split(\"<div class='lim'\")[0]
 a, d = block(alive_id), block(dead_id)
-have_ctx = lambda b: b is not None and '<span class=k>ctx</span>' in b
+# A dead agent stopped reporting, so its row must draw no live reading at all — neither
+# the context number nor a quota bar. It gets its last heartbeat instead.
+have_ctx = lambda b: b is not None and ('ctx ' in b or 'class=track' in b)
 print('ok' if have_ctx(a) and not have_ctx(d) else 'fail alive=%s dead=%s' % (have_ctx(a), have_ctx(d)))
 " "$MCHTML" "$MCA" "$MCD")
   [ "$MCRES" = ok ] && ok "status: a dead agent's row has no ctx meter, a live one does" \

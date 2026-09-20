@@ -2035,6 +2035,35 @@ def reaper_loop():
 
 # ---------- status --------------------------------------------------------
 
+# What the night band draws. Four marks, four meanings, and they reuse the colours the
+# rest of the board already assigns: landed is green, stopped is red, waiting on you is
+# amber. Nothing else earns a mark — a band with fifteen kinds of dot is a log, and the
+# log is already one click away on the task.
+RIBBON_KINDS = {"task.done": "landed", "task.blocked": "stopped",
+                "agent.presumed_dead": "stopped", "question.asked": "asked"}
+RIBBON_HOURS = 12
+
+
+def ribbon_events(project, hours=RIBBON_HOURS):
+    """What happened in this project over the last `hours`, for the band at the top.
+
+    The board is read in the morning by someone whose fleet worked all night, and until
+    now the page carried no time at all: it could say what IS, never what HAPPENED. The
+    event log has always held the answer and was never drawn.
+
+    Indexed by events(type, project, id) — four seeks, not a scan of the log."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+    out = []
+    for r in db.execute(
+            "SELECT ts, type, stream FROM events WHERE project=? AND ts>=? AND type IN (%s) "
+            "ORDER BY ts LIMIT 300" % ",".join("?" * len(RIBBON_KINDS)),
+            [project, since] + list(RIBBON_KINDS)):
+        out.append({"ts": r["ts"], "kind": RIBBON_KINDS[r["type"]], "type": r["type"],
+                    "ref": r["stream"].split("/", 1)[-1] if "/" in r["stream"] else r["stream"]})
+    return out
+
+
+
 def status(project=None):
     with NTFY_LOCK:
         fails = ntfy_failures_since_success
@@ -2074,6 +2103,7 @@ def status(project=None):
             "costs": costs,
             "name": name, "phase": p["phase"], "goal": p["goal"], "paused": p["paused"],
             "wip": wip_limit(name), "unreviewed": unreviewed(name),
+            "ribbon": ribbon_events(name),
             "agents": agents,
             # /status is an overview for the human: show the Claude fleet's numbers, which
             # are what drive the stop rules for most of the agents.
@@ -2118,12 +2148,64 @@ DIM = "text-base-content/60"
 LBL = "mt-6 mb-1 text-sm text-base-content/60"
 
 
+# Applied BEFORE the first paint, which is the whole reason this is its own script and
+# lives in <head>. VERIFIED in board.css: daisyUI guards the dark rules with
+# `@media (prefers-color-scheme:dark){:root:not([data-theme])}` and emits
+# `[data-theme=board-dark]` unguarded — so an explicit choice on <html> overrides the
+# operating system in BOTH directions and needs no stylesheet change at all. Set from the
+# bottom of the page instead, and the browser paints the wrong theme and then swaps it:
+# a flash of exactly the thing the setting exists to prevent.
+#
+# It also handles its own clicks, by delegation on `document`, so the toggle works on
+# every page — the question and task pages carry the header too, and only /status and /t
+# get the filter script.
+THEME_JS = """
+(function(){
+var K='board:theme';
+function get(){try{return localStorage.getItem(K)||'system';}catch(e){return 'system';}}
+function apply(t){
+  var r=document.documentElement;
+  if(t==='light'||t==='dark')r.setAttribute('data-theme','board-'+t);
+  else r.removeAttribute('data-theme');
+  var b=document.querySelectorAll('[data-theme-set]');
+  for(var i=0;i<b.length;i++){
+    b[i].setAttribute('aria-pressed', b[i].getAttribute('data-theme-set')===t?'true':'false');
+  }
+}
+apply(get());
+document.addEventListener('click',function(e){
+  var el=e.target&&e.target.closest?e.target.closest('[data-theme-set]'):null;
+  if(!el)return;
+  e.preventDefault();
+  var t=el.getAttribute('data-theme-set');
+  try{localStorage.setItem(K,t);}catch(err){}
+  apply(t);
+});
+document.addEventListener('DOMContentLoaded',function(){apply(get());});
+})();
+"""
+THEME_SHA = "'sha256-%s'" % base64.b64encode(
+    hashlib.sha256(THEME_JS.encode()).digest()).decode()
+THEME = "<script>%s</script>" % THEME_JS
+
+
+def theme_toggle():
+    """Follow the system, or say otherwise. Three states and not a switch, because
+    "follow the system" is a real answer and a two-state switch cannot express it — once
+    you flip a switch you have opted out of the operating system forever without being
+    told that is what you did."""
+    return ("<div class='themer' role='group' aria-label='colour theme'>%s</div>"
+            % "".join("<button type='button' class='th' data-theme-set='%s' "
+                      "aria-pressed='false'>%s</button>" % (k, lbl)
+                      for k, lbl in (("system", "auto"), ("light", "light"), ("dark", "dark"))))
+
+
 def page(title, body):
     return ("<!doctype html><html lang=en><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s</title><link rel=stylesheet href='%s'>"
+            "<title>%s</title><link rel=stylesheet href='%s'>%s"
             "<body class='bg-base-100 text-base-content font-sans antialiased'>"
-            "<div class='%s'>%s</div>" % (escape(title), CSS_URL, WRAP, body))
+            "<div class='%s'>%s</div>" % (escape(title), CSS_URL, THEME, WRAP, body))
 
 
 def whoami(human):
@@ -2144,10 +2226,11 @@ def head(title, right="", nav=(("/status", "board"),), human=False):
     return ("<header class='flex flex-wrap items-baseline gap-x-3 gap-y-1 "
             "border-b-2 border-base-300 pb-3'>"
             "<h1 class='text-xl font-semibold tracking-tight sm:text-2xl'>%s</h1>%s"
-            "<nav class='ml-auto flex items-baseline gap-4 text-sm'>%s%s</nav></header>" % (
+            "<nav class='ml-auto flex items-center gap-4 text-sm'>%s%s%s</nav></header>" % (
                 escape(title), right,
                 "".join("<a class='%s' href='%s'>%s</a>" % (LINK, u, escape(t))
                         for u, t in nav),
+                theme_toggle(),
                 whoami(human)))
 
 
@@ -2215,17 +2298,6 @@ def meter(label, pct, ceiling=None):
             "<span class=track><i class='%s' style='width:%s%%'></i>%s</span>"
             "<span class=v>%s%%</span></div>" % (
                 escape(label), cls, round(min(v, 100)), tick, round(v)))
-
-
-def est_badge(t):
-    """The size, as a number that means the same thing on every task in the queue.
-
-    No unit and no word: "5" beside "12.4k" reads as a ratio, which is the only thing a
-    relative estimate is good for. A task nobody has sized shows nothing rather than a
-    zero — an unsized task is not a small one."""
-    e = t.get("estimate")
-    return ("<span class='badge badge-sm badge-ghost %s' title='relative size'>%s</span>"
-            % (MONO, escape(str(e)))) if e else ""
 
 
 def toks(n):
@@ -2490,7 +2562,7 @@ function apply(){
     var ab=pj.querySelector('[data-agent-badge]');
     if(ab)ab.textContent=ah?('('+ah+' hidden)'):'';
 
-    var rows=pj.querySelectorAll('[data-task]'),th=0,open={};
+    var rows=pj.querySelectorAll('[data-task]'),th=0;
     for(var r=0;r<rows.length;r++){
       var rw=rows[r],ts=rw.getAttribute('data-status');
       var tm=parseInt(rw.getAttribute('data-mins')||'0',10),off2=false;
@@ -2503,17 +2575,20 @@ function apply(){
         if(!off2&&AGE[fa])off2=(tm>AGE[fa]);
       }
       rw.style.display=off2?'none':'';
-      open[rw.id]=!off2;
       if(off2)th++;else if(!offProject)shown++;
     }
-    /* a question hangs under its task and goes wherever that row goes */
-    var kids=pj.querySelectorAll('[data-task-child]');
-    for(var k=0;k<kids.length;k++){
-      var on=open[kids[k].getAttribute('data-for')];
-      kids[k].style.display=on?'':'none';
+    /* A group heading with every row under it hidden is a label for nothing. The
+       headings are siblings of the rows, so walk forward from each one until the next
+       heading and hide it when it turns out to own no visible row. */
+    var grps=pj.querySelectorAll('.grp');
+    for(var g=0;g<grps.length;g++){
+      var any=false,sib=grps[g].nextElementSibling;
+      while(sib&&!sib.classList.contains('grp')){
+        if(sib.hasAttribute('data-task')&&sib.style.display!=='none'){any=true;break;}
+        sib=sib.nextElementSibling;
+      }
+      grps[g].style.display=any?'':'none';
     }
-    var tb=pj.querySelector('[data-task-badge]');
-    if(tb)tb.textContent=th?('('+th+' hidden)'):'';
     if(!offProject)hid+=th;
   }
   var out=document.querySelector('[data-rail-count]');
@@ -2571,106 +2646,6 @@ FOCUS_SHA = "'sha256-%s'" % base64.b64encode(
 FOCUS = "<script>%s</script>" % FOCUS_JS
 
 
-def status_ok(a):
-    """Worth offering a role to: it is here and it is answering. Pinning a dead agent as
-    coordinator is a way to have no coordinator at all until somebody notices."""
-    return (a.get("status") or "") in ("alive", "stalled")
-
-
-def agent_block(a, ceilings, human=False, project=None):
-    # The ceiling drawn per window is THIS agent's effective (ramped) ceiling — already
-    # computed once in status() — not the raw policy value, or an agent minutes from its
-    # own reset renders red/over while agent_stop still lets it run (T-428 review 55).
-    eff = a.get("effective_ceilings") or ceilings
-    roles = " ".join(a["roles"]) if a.get("roles") else ""
-    ws = sorted(windows_of(a).items())
-    st = a.get("status") or "unknown"
-    mins = int(mins_since(a.get("last_seen"))) if a.get("last_seen") else 999999
-    # Who coordinates is the owner's call when they want it to be (§3.8: "the human's
-    # word wins"), and `board role pin` was the only way to say so. The board now says it
-    # too — the same handler, the same human-token gate. A pinned role beats the election
-    # for as long as the holder is alive, so the button that removes the pin has to sit
-    # next to the one that sets it, or a pin made at 3am is a pin nobody can undo from a
-    # phone.
-    role_ctl = ""
-    if human and project:
-        if "coordinator" in (a.get("roles") or []):
-            role_ctl = ("<form method='POST' action='/roles/coordinator/unpin' class='inline m-0'>"
-                        "<input type='hidden' name='project' value='%s'>"
-                        "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
-                        "title='Let the election decide again'>Unpin</button></form>"
-                        % escape(project))
-        elif status_ok(a):
-            role_ctl = ("<form method='POST' action='/roles/coordinator/pin' class='inline m-0'>"
-                        "<input type='hidden' name='project' value='%s'>"
-                        "<input type='hidden' name='agent' value='%s'>"
-                        "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
-                        "title='Pin this agent as coordinator'>Make coordinator</button></form>"
-                        % (escape(project), escape(a["id"])))
-    grants_badges = []
-    for g in a.get("grants", []):
-        rev = ""
-        if human:
-            rev = ("<form method='POST' action='/agents/%s/grants/revoke' class='inline m-0'>"
-                   "<input type='hidden' name='grant' value='%s'>"
-                   "<input type='hidden' name='project' value='%s'>"
-                   "<button type='submit' class='cursor-pointer ml-1 text-xs opacity-60 hover:opacity-100 hover:text-error' title='Take this grant back'>✕</button>"
-                   "</form>" % (escape(a["id"]), escape(g), escape(project or "")))
-        grants_badges.append("<span class='badge badge-sm badge-outline font-mono'>%s%s</span>" % (escape(g), rev))
-    grants_html = "".join(grants_badges)
-    add_form = ""
-    if human:
-        add_form = ("<form method='POST' action='/agents/%s/grants' class='m-0 flex items-center gap-1 mt-1'>"
-                    "<input type='hidden' name='project' value='%s'>"
-                    "<input list='grants-list-%s' name='grant' placeholder='add a grant' class='quiet font-mono w-28 text-xs'>"
-                    "<datalist id='grants-list-%s'><option value='merge'><option value='deploy-dev'><option value='deploy-prod'></datalist>"
-                    "<button type='submit' class='badge badge-sm badge-primary cursor-pointer'>Grant</button></form>"
-                    % (escape(a["id"]), escape(project or ""), escape(a["id"]), escape(a["id"])))
-    # A dead or stale agent stopped reporting — its ctx meter and ceiling line would
-    # draw a precision (a percent, a tick mark) that is no longer true, and 12 of these on
-    # one page is most of /status's height (T-284). Only a live agent gets meters; anything
-    # else gets its last heartbeat, one line, and nothing to measure.
-    body = (meter("ctx", a["ctx_pct"], 80) +
-            ("".join(meter(w, pct, eff.get(win_name(w))) for w, pct in ws)
-             or "<p class='%s text-xs'>reports no quota</p>" % DIM)) if st in ("alive", "stalled") else (
-            "<p class='%s text-xs'>last seen %s</p>" % (DIM, escape(a.get("last_seen") or "—")))
-    return ("<div data-agent class='border-t border-base-300 py-2.5' data-status='%s' data-mins='%d'>"
-            "<b class='%s block font-semibold'>%s</b>"
-            "<div class='mt-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-1'>"
-            "<span class='%s text-xs'>%s</span>"
-            "<span class='badge badge-sm %s'>%s</span>%s%s%s</div>"
-            "%s"
-            "<div class='mt-1.5 grid gap-1'>%s</div>%s</div>" % (
-                escape(st), mins,
-                MONO, escape(a["id"]), DIM, escape(a["model"] or ""),
-                "badge-error" if a["status"] == "dead" else
-                ("badge-warning" if a["status"] != "alive" else "badge-ghost"),
-                escape(a["status"] or ""),
-                ("<span class='badge badge-sm badge-outline'>%s</span>" % escape(roles))
-                if roles else "",
-                # The task link stays next to the agent's own facts; the role button is an
-                # action and goes after them, or it pushes the one thing you came to read
-                # onto a line of its own.
-                (("<a class='%s %s text-sm' href='/t/%s'>%s</a>" % (
-                    LINK, MONO, escape(a["current_task"]), escape(a["current_task"])))
-                 if a["current_task"] else "") + role_ctl,
-                grants_html,
-                add_form,
-                body,
-                (("<p class='mt-1.5 text-sm text-error'>stop: %s</p>" % escape(a["stop"]))
-                 if a.get("stop") else "")
-                + (("<p class='mt-1.5 text-sm text-warning'>silent %d min</p>" % a["silent_min"])
-                   if a.get("silent_min") is not None and a["silent_min"] >= SILENT_MIN else "")))
-
-
-def dash(v):
-    """"—" is not information. On a phone every empty cell still becomes a row in the
-    card, and five tasks with an empty pr, repo and owner became a screenful of dashes.
-    `data-empty` lets the CSS hide exactly those rows in card mode — on a wide screen the
-    column stands there as before."""
-    return (escape(v), "") if v not in (None, "", "—") else ("—", " data-empty")
-
-
 def q_inline(q, answer=None):
     """A question where it belongs: under the task it is about, in the queue, at that
     task's place in the priority order.
@@ -2685,9 +2660,6 @@ def q_inline(q, answer=None):
             "<span class='%s text-xs'>%s</span>"
             "<span class='max-w-[68ch]'>%s</span>%s</a>" % (
                 escape(q["id"]), MONO, escape(q["id"]), escape(q["text"] or ""), answered))
-
-
-TASK_COLS = ("pri", "id", "status", "size", "owner", "pr", "title")
 
 
 def prio_cell(t, human, back):
@@ -2711,8 +2683,9 @@ def size_cell(t, human, back):
     is the whole point of the column: it is read as "we thought 5, it has cost 12.4k"."""
     c = cost_cell(t)
     if not human:
-        return "%s%s" % (est_badge(t) or "<span class='%s'>—</span>" % DIM,
-                         (" <span class='%s'>%s</span>" % (DIM, c)) if c else "")
+        size = ("<span class='%s' title='relative size'>%s</span>" % (MONO, t["estimate"])
+                if t.get("estimate") else "")
+        return "%s%s" % (size, (" " + c) if c else "")
     opts = "".join("<option value='%d'%s>%d</option>"
                    % (e, " selected" if t.get("estimate") == e else "", e)
                    for e in ESTIMATES)
@@ -2723,84 +2696,6 @@ def size_cell(t, human, back):
             "<button type='submit' class='sr-only-btn'>Set</button>"
             "<span class='%s'>%s</span></form>" % (
                 escape(t["id"]), escape(back), MONO, escape(t["id"]), opts, DIM, c))
-
-
-def task_row(t, human, back, questions=(), multirepo=False, hidden=False):
-    pn = pr_num(t.get("pr"))
-    pr_v, pr_e = dash("#" + pn if pn else None)
-    ow_v, ow_e = dash(t.get("owner"))
-    st = t.get("status") or "unknown"
-    mins = int(mins_since(t.get("updated") or t.get("created"))) if (t.get("updated") or t.get("created")) else 0
-    repo = ("<span class='%s text-xs'>%s</span> " % (DIM, escape(t["repo"]))
-            if multirepo and t.get("repo") else "")
-    h = ["<tr id='%s' data-task class='spine %s' data-status='%s' data-mins='%d' "
-         "data-est='%s'%s>"
-         "<td data-l=pri class='py-1.5 pl-3 pr-2 align-top whitespace-nowrap'>%s"
-         "<td data-l=id class='px-2 py-1.5 align-top whitespace-nowrap'>"
-         "<a class='%s %s' href='/t/%s'>%s</a>"
-         "<td data-l=status class='%s px-2 py-1.5 align-top whitespace-nowrap'>"
-         "<span class='badge badge-sm %s'>%s</span>"
-         "<td data-l=size class='px-2 py-1.5 align-top whitespace-nowrap'>%s"
-         "<td data-l=owner%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-         "<td data-l=pr%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-         "<td data-l=title class='px-2 py-1.5 align-top font-medium "
-         "[overflow-wrap:anywhere]'>%s%s" % (
-             escape(t["id"]), SPINE.get(st, ""), escape(st), mins,
-             escape(str(t.get("estimate") or "")),
-             " style='display:none;'" if hidden else "",
-             prio_cell(t, human, back),
-             LINK, MONO, escape(t["id"]), escape(t["id"]),
-             DIM, BADGE.get(st, "badge-ghost"), escape(st),
-             size_cell(t, human, back),
-             ow_e, DIM, MONO, ow_v,
-             pr_e, DIM, MONO, pr_v,
-             repo, escape(t.get("title") or ""))]
-    for q in questions:
-        h.append("<tr data-task-child data-for='%s' class='spine qchild'%s>"
-                 "<td colspan='%d' class='px-2 pb-2 pt-0'>%s" % (
-                     escape(t["id"]), " style='display:none;'" if hidden else "",
-                     len(TASK_COLS),
-                     q_inline(q, q["answer"] if q["status"] == "defaulted" else None)))
-    return "".join(h)
-
-
-def task_rows(p, human=False, back="/status"):
-    """The queue, in priority order, with each task's open questions hanging under it.
-
-    Returns the markup AND the ids it drew a row for: a question hangs under its task, so
-    a question about a task with no row here has nowhere to hang and has to fall back to
-    a card of its own. Without that it vanished from the board completely — the task was
-    archived, the question stayed open, and `board task cleanup-done` archives in bulk."""
-    by_task = {}
-    for q in p["questions"] + p["questions_defaulted"]:
-        if q.get("task"):
-            by_task.setdefault(q["task"], []).append(q)
-    multirepo = len({t.get("repo") for t in p["tasks"] if t.get("repo")}) > 1
-    shown = set()
-    h = ["<div class='min-w-0 overflow-x-auto'><table class='tasks w-full text-sm'>"
-         "<thead><tr class='%s text-xs'>"
-         "<th class='py-1 pl-3 pr-2 text-left font-semibold'>pri"
-         "<th class='px-2 py-1 text-left font-semibold'>id"
-         "<th class='px-2 py-1 text-left font-semibold'>status"
-         "<th class='px-2 py-1 text-left font-semibold'>size"
-         "<th class='px-2 py-1 text-left font-semibold'>owner"
-         "<th class='px-2 py-1 text-left font-semibold'>pr"
-         "<th class='px-2 py-1 text-left font-semibold'>title</thead><tbody>" % DIM]
-    for t in p["tasks"]:
-        shown.add(t["id"])
-        h.append(task_row(t, human, back, by_task.get(t["id"], ()), multirepo))
-    # Done tasks are rendered but hidden: "what did the fleet land today" is one filter
-    # away rather than one page load away, and the row is already paid for. The costs
-    # come from status(), which has already scanned the log once for this project —
-    # scanning it again here doubled the work on every render, under the global lock.
-    costs = p.get("costs") or {}
-    for t in db.execute("SELECT * FROM tasks WHERE project=? AND status='done' "
-                        "ORDER BY updated DESC LIMIT 30", (p["name"],)):
-        shown.add(t["id"])
-        h.append(task_row(dict(brief(t), cost=costs.get(t["id"])), human, back,
-                          by_task.get(t["id"], ()), multirepo, hidden=True))
-    h.append("</tbody></table></div>")
-    return "".join(h), shown
 
 
 def q_card(q, answer=None):
@@ -2866,52 +2761,310 @@ def phase_control(p, human):
                 escape(p["name"]), escape(p["name"]), opts))
 
 
-def limits_block(p, human):
-    """The two numbers the owner sets: how far the fleet may spend, and how much finished
-    work may wait for review before production stops.
+def night_band(events, hours=RIBBON_HOURS):
+    """What happened while you were away, drawn on a line.
 
-    Both used to live only in board-policy.json on the host. That file is deliberately
-    never deployed, which made it the right place for them and the wrong place to reach
-    at three in the morning from a phone."""
+    The board had no time on it at all. It is read in the morning by someone whose fleet
+    worked all night, and it could say what IS but never what HAPPENED — while the event
+    log held the whole answer and was never drawn. Four kinds of mark, reusing the
+    colours the rest of the board already assigns; a band with fifteen kinds of dot would
+    be a log, and the log is one click away on the task itself."""
+    now_ = datetime.now(timezone.utc)
+    start = now_ - timedelta(hours=hours)
+    span = hours * 3600.0
+    marks, n = [], {"landed": 0, "stopped": 0, "asked": 0}
+    for e in events:
+        t = ts(e["ts"])
+        if not t:
+            continue
+        at = (t - start).total_seconds() / span * 100.0
+        if at < 0 or at > 100:
+            continue
+        n[e["kind"]] = n.get(e["kind"], 0) + 1
+        marks.append("<i class='mk mk-%s' style='left:%.2f%%' title='%s %s at %s'></i>" % (
+            e["kind"], at, escape(e["ref"]), escape(e["kind"]), escape(e["ts"][11:16])))
+    # Hour ticks every three hours, labelled in the board's own UTC.
+    ticks = []
+    for h in range(0, hours + 1, 3):
+        ticks.append("<b class='tk' style='left:%.2f%%'>%s</b>" % (
+            h / float(hours) * 100.0, (start + timedelta(hours=h)).strftime("%H")))
+    counts = [(n["landed"], "landed", ""), (n["stopped"], "stopped", "text-error"),
+              (n["asked"], "asked", "text-warning")]
+    legend = "".join("<span class='%s'><b class='%s font-semibold'>%d</b> %s</span>"
+                     % (cls, MONO, v, lbl) for v, lbl, cls in counts if v)
+    if not marks:
+        legend = "<span class='%s'>nothing has happened in %d hours</span>" % (DIM, hours)
+    return ("<div class='night'><span class='%s night-k'>last %dh</span>"
+            "<span class='night-track'>%s%s</span>"
+            "<span class='night-legend'>%s</span></div>" % (
+                DIM, hours, "".join(ticks), "".join(marks), legend))
+
+
+GRANT_VOCAB = ("merge", "deploy-dev", "deploy-prod")
+
+
+def grant_chips(a, project, known, human):
+    """Permissions as chips you switch on and off.
+
+    What stood here was a text field with a datalist and a Grant button — a form for
+    writing a row into a table, not a control. It could not show what permissions EXIST,
+    only which had already been typed in, so the one question you actually have looking
+    at an agent ("may it merge?") took reading a list and knowing what was missing from
+    it. Held is filled, available is outlined, one press either way."""
+    held = set(a.get("grants") or [])
+    if not human:
+        return "".join("<span class='chip chip-on'>%s</span>" % escape(g)
+                       for g in sorted(held))
+    out = []
+    for g in known:
+        on = g in held
+        out.append(
+            "<form method='POST' action='/agents/%s/grants%s' class='inline m-0'>"
+            "<input type='hidden' name='project' value='%s'>"
+            "<input type='hidden' name='grant' value='%s'>"
+            "<button type='submit' class='chip %s' aria-pressed='%s' title='%s %s'>%s</button>"
+            "</form>" % (
+                escape(a["id"]), "/revoke" if on else "", escape(project or ""), escape(g),
+                "chip-on" if on else "chip-off", "true" if on else "false",
+                "take back" if on else "give", escape(g), escape(g)))
+    return "".join(out)
+
+
+def tightest(a, ceilings):
+    """The one window this agent is closest to being stopped by.
+
+    Three meters per agent, times a dozen agents, is not density — it is the same
+    drawing repeated until it stops being read. Only the binding constraint earns the
+    bar; the rest are on the agent's own task page."""
+    eff = a.get("effective_ceilings") or ceilings or {}
+    best = None
+    for w, pct in windows_of(a).items():
+        c = float(eff.get(w) or ceilings.get(w) or 0)
+        share = (pct / c) if c > 0 else 0
+        if best is None or share > best[0]:
+            best = (share, w, pct, c)
+    return best
+
+
+def agent_line(a, ceilings, human, project, known):
+    """One agent, one line: what it runs, what it holds, what it is on, and the one
+    number that can stop it."""
+    st = a.get("status") or "unknown"
+    mins = int(mins_since(a.get("last_seen"))) if a.get("last_seen") else 999999
+    live = st in ("alive", "stalled")
+    t = tightest(a, ceilings) if live else None
+    if t:
+        _, w, pct, c = t
+        bar = meter(w, pct, c)
+    else:
+        bar = "<span class='%s text-xs'>last seen %s</span>" % (
+            DIM, escape((a.get("last_seen") or "—")[:16].replace("T", " ")))
+    ctx = a.get("ctx_pct")
+    ctx_h = ""
+    if live and ctx is not None:
+        cls = "text-error" if ctx >= 80 else ("text-warning" if ctx >= 65 else DIM)
+        ctx_h = "<span class='%s %s text-xs' title='context window'>ctx %d%%</span>" % (
+            cls, MONO, round(ctx))
+    task_h = ("<a class='%s %s' href='/t/%s'>%s</a>" % (
+        LINK, MONO, escape(a["current_task"]), escape(a["current_task"]))
+        if a.get("current_task") else "<span class='%s'>—</span>" % DIM)
+    roles = " ".join(a.get("roles") or [])
+    role_h = ("<span class='badge badge-sm badge-outline'>%s</span>" % escape(roles)) if roles else ""
+    if human and project:
+        if "coordinator" in (a.get("roles") or []):
+            role_h += ("<form method='POST' action='/roles/coordinator/unpin' class='inline m-0'>"
+                       "<input type='hidden' name='project' value='%s'>"
+                       "<button type='submit' class='chip chip-act' "
+                       "title='Let the election decide again'>unpin</button></form>"
+                       % escape(project))
+        elif st in ("alive", "stalled"):
+            role_h += ("<form method='POST' action='/roles/coordinator/pin' class='inline m-0'>"
+                       "<input type='hidden' name='project' value='%s'>"
+                       "<input type='hidden' name='agent' value='%s'>"
+                       "<button type='submit' class='chip chip-act' "
+                       "title='Pin this agent as coordinator'>make coordinator</button></form>"
+                       % (escape(project), escape(a["id"])))
+    stop = a.get("stop")
+    silent = (a.get("silent_min") is not None and a["silent_min"] >= SILENT_MIN
+              and st == "alive")
+    note = ""
+    if stop:
+        note = "<p class='ag-note text-error'>%s</p>" % escape(stop)
+    elif silent:
+        note = "<p class='ag-note text-warning'>silent %d min</p>" % a["silent_min"]
+    return ("<div class='ag' data-agent data-status='%s' data-mins='%d'>"
+            "<span class='ag-model'>%s</span>"
+            "<span class='ag-task'>%s</span>"
+            "<span class='ag-meter'>%s</span>"
+            "<span class='ag-ctx'>%s</span>"
+            "<span class='ag-grants'>%s%s</span>"
+            "<span class='%s ag-id' title='%s'>%s</span>"
+            "%s</div>" % (
+                escape(st), mins,
+                escape(a.get("model") or a.get("harness") or "?"),
+                task_h, bar, ctx_h,
+                grant_chips(a, project, known, human), role_h,
+                # The id, small and dim, with the host as its tooltip — not the other way
+                # round, which is how the first cut had it. What was wrong with the old
+                # block was that the id SHOUTED, not that it was there: it is the handle
+                # you paste into `board grant <id>`, and a row you cannot name is a row
+                # you cannot act on from a shell.
+                DIM + " " + MONO, escape(a.get("host") or ""), escape(a["id"]),
+                note))
+
+
+QUEUE_GROUPS = (
+    ("stopped", "stopped", ("blocked", "orphaned")),
+    ("flight", "in flight", ("claimed", "merging", "in_review")),
+    ("waiting", "waiting", ("open",)),
+)
+
+
+def queue_card(t, human, back, questions, big):
+    """A task. `big` ones carry their title at reading size; the rest are one line,
+    because forty rows that all look important look like a spreadsheet and get read like
+    one.
+
+    No owner column: it said `6320` — the tail of an agent id, which is not information —
+    and the fleet directly below already says which agent is on which task, by model. One
+    cross-reference beats a column of hashes.
+
+    priority and size are rendered ONCE each, by the same helpers the task page uses:
+    they come back as a number for a reader and as a control for the owner of the board.
+    The first cut drew both, so every row showed its priority twice and its size twice."""
+    st = t.get("status") or "unknown"
+    mins = int(mins_since(t.get("updated") or t.get("created"))) if (t.get("updated") or t.get("created")) else 0
+    pn = pr_num(t.get("pr"))
+    pr_h = (("<a class='%s %s' href='%s'>#%s</a>" % (LINK, MONO, escape(t["pr"]), escape(pn))
+             if str(t.get("pr", "")).startswith("http") else
+             "<span class='%s'>#%s</span>" % (MONO, escape(pn))) if pn else "")
+    qs = "".join(q_inline(q, q["answer"] if q["status"] == "defaulted" else None)
+                 for q in questions)
+    return ("<article class='tk-row %s%s' data-task data-status='%s' data-mins='%d' id='%s'>"
+            "<span class='tk-pri'>%s</span>"
+            "<a class='tk-id %s %s' href='/t/%s'>%s</a>"
+            "<span class='badge badge-sm %s tk-st'>%s</span>"
+            "<h4 class='tk-title'>%s</h4>"
+            "<span class='tk-meta'>%s%s</span>"
+            "%s</article>" % (
+                "tk-big" if big else "", " " + SPINE.get(st, "") if SPINE.get(st) else "",
+                escape(st), mins, escape(t["id"]),
+                prio_cell(t, human, back),
+                LINK, MONO, escape(t["id"]), escape(t["id"]),
+                BADGE.get(st, "badge-ghost"), escape(st),
+                escape(t.get("title") or ""),
+                size_cell(t, human, back), pr_h,
+                qs))
+
+
+def queue(p, human, back):
+    """The queue, grouped by what is actually happening to the work: stopped first
+    because it wants you, then what is being worked, then what is waiting.
+
+    A single table sorted by priority could not answer "what is going on" without
+    reading every row's status column. The groups answer it before you read anything,
+    and priority still orders within each one."""
+    by_task = {}
+    for q in p["questions"] + p["questions_defaulted"]:
+        if q.get("task"):
+            by_task.setdefault(q["task"], []).append(q)
+    shown, html = set(), []
+    left = list(p["tasks"])
+    for key, label, statuses in QUEUE_GROUPS:
+        rows = [t for t in left if (t.get("status") or "") in statuses]
+        if not rows:
+            continue
+        html.append("<h3 class='grp grp-%s'>%s<span class='%s grp-n'>%d</span></h3>"
+                    % (key, label, MONO, len(rows)))
+        for i, t in enumerate(rows):
+            shown.add(t["id"])
+            # The first row of stopped and of in-flight is the one you are most likely to
+            # act on; waiting is a queue and its front is its first row.
+            html.append(queue_card(t, human, back, by_task.get(t["id"], ()),
+                                   big=(i == 0 and key != "waiting")))
+    other = [t for t in left if t["id"] not in shown]
+    if other:
+        html.append("<h3 class='grp'>other<span class='%s grp-n'>%d</span></h3>" % (MONO, len(other)))
+        for t in other:
+            shown.add(t["id"])
+            html.append(queue_card(t, human, back, by_task.get(t["id"], ()), big=False))
+    costs = p.get("costs") or {}
+    done = [dict(brief(t), cost=costs.get(t["id"])) for t in db.execute(
+        "SELECT * FROM tasks WHERE project=? AND status='done' ORDER BY updated DESC LIMIT 30",
+        (p["name"],))]
+    if done:
+        html.append("<h3 class='grp grp-landed' data-task data-status='done' data-mins='0'>"
+                    "landed<span class='%s grp-n'>%d</span></h3>" % (MONO, len(done)))
+        for t in done:
+            shown.add(t["id"])
+            html.append(queue_card(t, human, back, (), big=False))
+    if not html:
+        return ("<p class='%s text-sm'>The queue is empty. Add the next piece of work with "
+                "<code class='rounded bg-base-200 px-1 font-mono'>board task create</code>.</p>"
+                % DIM, shown)
+    return "".join(html), shown
+
+
+def limits_row(p, human):
+    """The two numbers the owner sets, on one line under the fleet they govern."""
     b = p.get("budget") or {}
     ceilings = {win_name(k): float(v or 0) for k, v in (b.get("ceilings") or {}).items()}
-    # The REMEMBERED per-account reading, not the maximum over the agents standing here
-    # right now. Quota is per harness account and survives the agent that reported it
-    # (quota_max, T-192): filtering to the living ones redraws every bar at zero the
-    # moment a session ends, and the owner then drags a ceiling against a gauge saying
-    # the quota is free when it is at 95%.
     used = {win_name(k): float(v or 0) for k, v in (b.get("windows") or {}).items()}
     windows = sorted(set(list(ceilings) + list(used)) or {"5h", "7d"})
     over = set(b.get("overridden") or [])
-    rows = "<div class='grid gap-2.5'>%s</div>" % "".join(
-        gauge(w, used.get(w), ceilings.get(w), p["name"], human, w in over) for w in windows)
-    # Per window, because the owner can have taken over one and left the other: saying
-    # "set here" for the project would be a lie about the rest of them.
+    rows = "".join(gauge(w, used.get(w), ceilings.get(w), p["name"], human, w in over)
+                   for w in windows)
     if not over:
         src_txt = "from board-policy.json"
     elif over >= set(windows):
         src_txt = "set here"
     else:
-        src_txt = "%s set here, the rest from board-policy.json" % ", ".join(sorted(over))
-    wip = int(p.get("wip") or 0)
-    unrev = int(p.get("unreviewed") or 0)
+        src_txt = "%s set here" % ", ".join(sorted(over))
+    wip, unrev = int(p.get("wip") or 0), int(p.get("unreviewed") or 0)
     if human:
-        wip_ctl = ("<form method='POST' action='/projects/%s/ceilings' class='m-0 flex items-baseline gap-1'>"
+        wip_ctl = ("<form method='POST' action='/projects/%s/ceilings' class='m-0 inline-flex items-baseline gap-1'>"
                    "<input type='hidden' name='project' value='%s'>"
                    "<input class='cell-num %s' type='number' name='wip' min='1' max='99' "
                    "value='%d' data-autosave aria-label='review limit'>"
-                   "<button type='submit' class='sr-only-btn'>Set</button>"
-                   "</form>" % (escape(p["name"]), escape(p["name"]), MONO, wip))
+                   "<button type='submit' class='sr-only-btn'>Set</button></form>"
+                   % (escape(p["name"]), escape(p["name"]), MONO, wip))
     else:
         wip_ctl = "<span class='%s'>%d</span>" % (MONO, wip)
-    return ("<div class='mt-6'>"
-            "<div class='mb-2 flex flex-wrap items-baseline gap-x-2'>"
-            "<p class='m-0 text-sm text-base-content/60'>ceilings</p>"
+    return ("<div class='lim'><div class='lim-head'><span>ceilings</span>"
             "<span class='%s text-xs'>%s</span></div>%s"
-            "<div class='mt-3 flex flex-wrap items-baseline gap-2 text-sm'>"
-            "<span class='%s'>waiting for review</span>"
-            "<span class='%s'>%d of</span>%s</div></div>" % (
+            # A DIV and not a P: <form> is not allowed inside <p>, so the browser closed
+            # the paragraph at the form's start tag and re-parented it as a sibling —
+            # which is why the number sat on a line of its own with no rule able to pull
+            # it back. Nothing in the markup showed it; only the live DOM did.
+            "<div class='lim-wip'><span class='%s'>waiting for review</span>"
+            "<span class='of'><span class='%s'>%d of</span>%s</span></div></div>" % (
                 DIM, escape(src_txt), rows, DIM, MONO, unrev, wip_ctl))
+
+
+def band_head(p, human):
+    """The project's name, stuck to the top of the viewport for as long as you are
+    inside that project.
+
+    This is the fix for the complaint that started the redesign: with four projects
+    stacked as identical accordions, nothing on screen told you which one you were
+    reading once its heading had scrolled away. The name now stays, and a rule runs the
+    full height of the band beside everything that belongs to it."""
+    pause = ("<span class='badge badge-sm badge-error'>paused</span>"
+             if p.get("paused") else "")
+    btn = ""
+    if human:
+        act, label, cls, confirm = (
+            ("resume", "Resume", "badge-success", "")
+            if p.get("paused") else
+            ("pause", "Pause", "badge-ghost",
+             " data-confirm='Pause the project? Agents finish what they hold and take nothing new.'"))
+        btn = ("<form method='POST' action='/projects/%s/%s' class='inline m-0'%s>"
+               "<input type='hidden' name='project' value='%s'>"
+               "<button type='submit' class='badge badge-sm %s cursor-pointer'>%s</button>"
+               "</form>" % (escape(p["name"]), act, confirm, escape(p["name"]), cls, label))
+    return ("<div class='band-head'><h2 class='band-name'>%s</h2>%s%s%s%s</div>" % (
+        escape(p["name"]), phase_control(p, human), tell(p),
+        (" " + pause) if pause else "", (" " + btn) if btn else ""))
 
 
 def html_status(project, token="", human=False):
@@ -2933,94 +3086,45 @@ def html_status(project, token="", human=False):
                  "in a project to put it here.</div>" % DIM)
         return page("board", "".join(h))
     h.append(watchline(s))
-    h.append(fleet_runway(s))
+    # The night and the quota on one row: what happened, and what is left to spend.
+    h.append("<div class='topband'>%s%s</div>" % (
+        night_band([e for p in s["projects"] for e in (p.get("ribbon") or [])]),
+        fleet_runway(s)))
     h.append(rail(s))
     back = "/status?project=" + urllib.parse.quote(project) if project else "/status"
-    h.append("<div class='mt-2'>")
     for p in sorted(s["projects"], key=last_activity, reverse=True):
-        pause = ("<span class='badge badge-sm badge-error'>paused: %s</span>"
-                 % escape(p["paused"])) if p.get("paused") else ""
-        pause_btn = ""
-        if human:
-            if p.get("paused"):
-                pause_btn = ("<form method='POST' action='/projects/%s/resume' class='inline m-0'>"
-                             "<input type='hidden' name='project' value='%s'>"
-                             "<button type='submit' class='badge badge-sm badge-success cursor-pointer'>Resume</button></form>"
-                             % (escape(p["name"]), escape(p["name"])))
-            else:
-                pause_btn = ("<form method='POST' action='/projects/%s/pause' class='inline m-0' "
-                             "data-confirm='Pause the project? Agents finish what they hold and take nothing new.'>"
-                             "<input type='hidden' name='project' value='%s'>"
-                             "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer'>Pause</button></form>"
-                             % (escape(p["name"]), escape(p["name"])))
-        h.append("<details class='pj border-t-2 border-base-300 last-of-type:border-b-2' "
-                 "data-p='%s'><summary class='grid cursor-pointer list-none "
-                 "grid-cols-[1.2ch_auto_auto_minmax(0,1fr)] items-baseline gap-x-2 gap-y-1 "
-                 "rounded px-1 py-3 max-sm:grid-cols-[1.2ch_minmax(0,1fr)_auto] "
-                 "[&::-webkit-details-marker]:hidden'>"
-                 "<span class='mark %s select-none' aria-hidden=true></span>"
-                 "<h2 class='text-base font-semibold'>%s</h2>"
-                 "<span>%s</span>"
-                 "<span class='flex flex-wrap items-baseline justify-end gap-x-3 gap-y-1 "
-                 "max-sm:col-start-2 max-sm:col-end-[-1] "
-                 "max-sm:justify-start'>%s%s%s</span></summary>" % (
-                     escape(p["name"]), DIM, escape(p["name"]), phase_control(p, human),
-                     tell(p), (" " + pause) if pause else "", (" " + pause_btn) if pause_btn else ""))
-        h.append("<div class='pb-4'>")
+        known = sorted(set(GRANT_VOCAB) | {g for a in p["agents"] for g in (a.get("grants") or [])})
+        ceilings = {win_name(k): float(v or 0)
+                    for k, v in ((p.get("budget") or {}).get("ceilings") or {}).items()}
+        h.append("<section class='band pj' data-p='%s'>" % escape(p["name"]))
+        h.append(band_head(p, human))
+        h.append("<div class='band-body'>")
         if p.get("goal"):
-            h.append("<p class='max-w-[68ch] %s'>%s</p>" % (DIM, escape(p["goal"])))
+            h.append("<p class='band-goal %s'>%s</p>" % (DIM, escape(p["goal"])))
         if (p.get("budget") or {}).get("ceilings_missing"):
             h.append("<p class='mt-2 rounded-box border border-l-4 border-base-300 "
                      "border-l-error bg-base-200 p-3 text-sm'>%s</p>"
                      % escape(p["budget"]["note"]))
-        h.append("<div class='pane mt-2'><section class='min-w-0'>")
-        h.append("<div class='mt-6 mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>"
-                 "<div class='flex items-center gap-1'>"
-                 "<p class='text-sm text-base-content/60 m-0'>fleet</p>"
-                 "<span data-agent-badge class='text-xs text-base-content/60'></span></div>"
-                 "<div class='ml-auto flex items-center gap-1'>"
-                 "<form method='POST' action='/agents/cleanup' class='m-0 flex items-center' "
+        rows_html, shown = queue(p, human, back)
+        h.append(rows_html)
+        h.append("<div class='band-foot'><div class='fleet'>"
+                 "<div class='fleet-head'><span>fleet</span>"
+                 "<span data-agent-badge class='%s text-xs'></span>"
+                 "<form method='POST' action='/agents/cleanup' class='m-0 ml-auto' "
                  "data-confirm='Mark every agent that has been dead for a day as finished?'>"
                  "<input type='hidden' name='project' value='%s'>"
                  "<input type='hidden' name='older_than' value='24h' data-agent-cleanup>"
-                 "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
-                 "title='Mark dead agents as finished'>Clear out dead agents</button>"
-                 "</form></div></div>" % escape(p["name"]))
+                 "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer'>"
+                 "Clear out dead</button></form></div>" % (DIM, escape(p["name"])))
         if not p["agents"]:
             h.append("<p class='%s text-sm'>No agent has registered here yet. Run "
                      "<code class='rounded bg-base-200 px-1 font-mono'>/next</code> in the "
                      "project to start one.</p>" % DIM)
-        ceilings = {win_name(k): float(v or 0)
-                    for k, v in ((p.get("budget") or {}).get("ceilings") or {}).items()}
         for a in p["agents"]:
-            h.append(agent_block(a, ceilings, human=human, project=p["name"]))
-        h.append(limits_block(p, human))
-        h.append("</section><section class='min-w-0'>")
-        h.append("<div class='mt-6 mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>"
-                 "<div class='flex items-center gap-1'>"
-                 "<p class='text-sm text-base-content/60 m-0'>queue</p>"
-                 "<span data-task-badge class='text-xs text-base-content/60'></span></div>"
-                 "<div class='ml-auto flex items-center gap-1'>"
-                 "<form method='POST' action='/tasks/cleanup' class='m-0 flex items-center' "
-                 "data-confirm='Archive every task that is already done?'>"
-                 "<input type='hidden' name='project' value='%s'>"
-                 "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
-                 "title='Archive tasks that are done'>Archive landed work</button>"
-                 "</form></div></div>" % escape(p["name"]))
-        shown = set()
-        if not p["tasks"]:
-            h.append("<p class='%s text-sm'>The queue is empty. Add the next piece of work "
-                     "with <code class='rounded bg-base-200 px-1 font-mono'>board task create"
-                     "</code>.</p>" % DIM)
-        else:
-            rows_html, shown = task_rows(p, human, back)
-            h.append(rows_html)
-        h.append("</section></div>")
-        # A question with no row to hang under keeps the card it always had, at full
-        # width, because this is the human's own surface. That is a question about no
-        # task at all — and also one about a task that is archived, or older than the
-        # thirty done rows the queue draws. Anchoring questions to rows without this
-        # made those disappear from the board entirely while still being open.
+            h.append(agent_line(a, ceilings, human, p["name"], known))
+        h.append("</div>")
+        h.append(limits_row(p, human))
+        h.append("</div>")
         adrift = lambda q: not q.get("task") or q["task"] not in shown
         loose = [q for q in p["questions"] if adrift(q)]
         loose_d = [q for q in p["questions_defaulted"] if adrift(q)]
@@ -3031,8 +3135,7 @@ def html_status(project, token="", human=False):
             h.append("<p class='%s'>the board answered itself — you can still override it</p>" % LBL)
             h.append("<div class=qgrid>%s</div>"
                      % "".join(q_card(q, q["answer"] or "") for q in loose_d))
-        h.append("</div></details>")
-    h.append("</div>")
+        h.append("</div></section>")
     h.append(FOCUS)
     return page("board", "".join(h))
 
@@ -3931,7 +4034,7 @@ class Handler(BaseHTTPRequestHandler):
         # the network.
         self.send_header("Content-Security-Policy",
                          "default-src 'none'; style-src 'self' 'unsafe-inline'; "
-                         "script-src %s; form-action 'self'" % FOCUS_SHA)
+                         "script-src %s %s; form-action 'self'" % (THEME_SHA, FOCUS_SHA))
         self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()

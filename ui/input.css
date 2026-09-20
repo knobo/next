@@ -148,61 +148,191 @@
     .pane { grid-template-columns: minmax(14rem, 0.36fr) minmax(0, 1fr); align-items: start; }
   }
 
-  /* --- the task list -----------------------------------------------------
-     The spine: a left border per row carrying the state colour, so a glance down the
-     column reads state without reading words. */
-  .tasks { border-collapse: collapse; }
-  .tasks tbody td { border-top: 1px solid var(--color-base-300); }
-  /* The border sits on the FIRST CELL, not on the <tr>: a row can only carry a border
-     when border-collapse is `collapse`, and even then browsers draw it differently. The
-     cell is the one place it works everywhere. */
-  .tasks tbody tr.spine > td:first-child { border-left: 3px solid transparent; }
-  .tasks tbody tr.spine-stop > td:first-child { border-left-color: var(--color-error); }
-  .tasks tbody tr.spine-land > td:first-child { border-left-color: var(--color-success); }
+  /* --- the theme switch ----------------------------------------------------
+     Three states, not a switch: "follow the system" is a real answer, and a two-state
+     switch cannot express it — flip it once and you have opted out of the operating
+     system forever without being told that is what you did. */
+  .themer { display: inline-flex; border: 1px solid var(--color-base-300);
+            border-radius: var(--radius-field); overflow: hidden; }
+  .themer > .th { padding: .1rem .5rem; font-size: .75rem; line-height: 1.6;
+                  background: transparent; color: inherit; cursor: pointer;
+                  border: 0; border-left: 1px solid var(--color-base-300); }
+  .themer > .th:first-child { border-left: 0; }
+  .themer > .th:hover { background: var(--color-base-200); }
+  .themer > .th[aria-pressed="true"] { background: var(--color-base-content);
+                  color: var(--color-base-100); }
+  .themer > .th:focus-visible { outline: 2px solid var(--color-primary);
+                  outline-offset: -2px; }
 
-  /* Below 40rem the table becomes cards: six columns on a phone is unreadable, and the
-     pages are opened from push notifications on mobile. The label lives in data-l on each
-     cell, so the markup is ONE, not two. */
-  @media (max-width: 40rem) {
-    .tasks thead { display: none; }
-    .tasks, .tasks tbody, .tasks tr, .tasks td { display: block; width: 100%; }
-    .tasks tbody tr { margin: .55rem 0; padding: .5rem .75rem;
-      border: 1px solid var(--color-base-300); border-left-width: 3px;
-      border-radius: var(--radius-box); background: var(--color-base-200); }
-    /* The card IS the row here, so the colour moves back to the row and off the cell. */
-    .tasks tbody tr.spine > td:first-child { border-left: 0; }
-    .tasks tbody tr.spine-stop { border-left-color: var(--color-error); }
-    .tasks tbody tr.spine-land { border-left-color: var(--color-success); }
-    /* The card puts the title FIRST — on a phone you read what the task is before you
-       read its id — and then lets the short facts FLOW onto shared lines instead of
-       taking a row each. With priority and size editable in place there are six facts
-       per task now, and six stacked rows made one task fill the screen. */
-    .tasks tbody tr { display: flex; flex-wrap: wrap; gap: .1rem .9rem; }
-    /* width:auto undoes the `width:100%` the block-display rule above sets on every
-       cell — without it every flex item is a full line and nothing shares one. */
-    .tasks tbody td { display: grid; grid-template-columns: auto auto; width: auto;
-      gap: .35rem; padding: .15rem 0; border: 0; flex: 0 0 auto; align-items: baseline; }
-    .tasks tbody td[data-l="title"] { order: -1; flex: 1 0 100%;
-      grid-template-columns: minmax(0, 1fr); margin-bottom: .35rem; }
-    /* The two that can be long get the whole line rather than truncating beside a pr. */
-    .tasks tbody td[data-l="owner"] { flex: 1 0 100%; }
-    .tasks tbody td[data-l="title"]::before { content: none; }
-    /* An empty cell is not information, and must not cost a row on a phone. */
-    .tasks tbody td[data-empty] { display: none; }
-    .tasks tbody td::before { content: attr(data-l); font-size: .75rem;
-      color: color-mix(in oklab, var(--color-base-content) 60%, transparent); }
+  /* --- the queue ---------------------------------------------------------
+     Grouped by what is happening to the work, not sorted into one table. The heading
+     carries the state; the rows under it do not have to repeat it at full volume.
+     A seven-column table answered "what is going on" only if you read every row's
+     status cell — which is how a queue becomes a spreadsheet. */
+  .grp { display: flex; align-items: baseline; gap: .5rem; margin: 1.35rem 0 .4rem;
+         font-size: .8125rem; font-weight: 600; letter-spacing: .01em;
+         color: color-mix(in oklab, var(--color-base-content) 70%, transparent); }
+  .grp::before { content: ""; width: .5rem; height: .5rem; border-radius: 1px;
+                 background: var(--color-base-300); }
+  .grp-stopped::before { background: var(--color-error); }
+  .grp-flight::before { background: var(--color-base-content); }
+  .grp-landed::before { background: var(--color-success); }
+  /* Waiting work is the only group with nothing happening to it, so its marker is hollow
+     rather than a colour — and it is declared rather than left to the default, because a
+     class with no rule is exactly what ui/verify.sh exists to catch. */
+  .grp-waiting::before { background: transparent;
+                         box-shadow: inset 0 0 0 1px var(--color-base-300); }
+  .grp-n { font-weight: 400;
+           color: color-mix(in oklab, var(--color-base-content) 55%, transparent); }
+  .grp:first-child { margin-top: .25rem; }
+
+  /* One row = one task. The grid is named so the big and small variants are the same
+     markup with a different shape, and a phone gets a third shape without new HTML. */
+  .tk-row { display: grid; align-items: baseline; gap: .1rem .6rem; padding: .3rem 0 .3rem .6rem;
+            border-top: 1px solid var(--color-base-300); border-left: 3px solid transparent;
+            grid-template-columns: 3.6rem 4.2rem auto minmax(0, 1fr) auto;
+            grid-template-areas: "pri id st title meta" "q q q q q"; }
+  .tk-row.spine-stop { border-left-color: var(--color-error); }
+  .tk-row.spine-land { border-left-color: var(--color-success); }
+  .tk-pri { grid-area: pri; font-size: .75rem;
+            color: color-mix(in oklab, var(--color-base-content) 50%, transparent); }
+  .tk-id { grid-area: id; font-size: .8125rem; }
+  .tk-st { grid-area: st; }
+  .tk-title { grid-area: title; margin: 0; max-width: 62ch; font-size: .9375rem;
+              font-weight: 500; line-height: 1.35; overflow-wrap: anywhere; }
+  .tk-meta { grid-area: meta; display: flex; align-items: baseline; gap: .5rem;
+             justify-content: flex-end;
+             font-size: .8125rem; white-space: nowrap;
+             color: color-mix(in oklab, var(--color-base-content) 60%, transparent); }
+  .tk-row > .qrow { grid-area: q; margin: .4rem 0 .2rem; }
+
+  /* The first row of `stopped` and of `in flight` is the one you are most likely to act
+     on, so it gets the reading size. Bigness is the hierarchy; if every row had it,
+     none would. */
+  .tk-big { padding: .7rem 0 .7rem .6rem; }
+  .tk-big .tk-title { font-size: 1.15rem; font-weight: 600; letter-spacing: -.01em; }
+
+  @media (max-width: 52rem) {
+    .tk-row { grid-template-columns: 3.6rem 4.2rem minmax(0, 1fr);
+              grid-template-areas: "pri id st" "title title title" "meta meta meta"
+                                   "q q q"; }
+    .tk-meta { justify-content: flex-start; flex-wrap: wrap; white-space: normal; }
   }
 
-  /* The open/close affordance on a project. `<details>` is kept rather than daisyUI's
-     `collapse`: the server renders everything closed, so a closed project never flashes
-     open on a slow phone, and that requires the built-in element behaviour. */
-  .pj > summary > .mark::before { content: "+"; font-weight: 600; }
-  .pj[open] > summary > .mark::before { content: "\2212"; }
+  /* --- the band ------------------------------------------------------------
+     One project, one band, with a rule that runs its entire height and a heading that
+     stays on screen while you are inside it. This is the answer to the complaint that
+     started the redesign: four projects stacked as identical accordions, and nothing
+     telling you which one you were reading once its heading had scrolled away. */
+  .band { border-left: 3px solid var(--color-base-300); padding-left: 1rem;
+          margin-top: 2.25rem; }
+  .band:first-of-type { margin-top: 1rem; }
+  .band-head { position: sticky; top: 2.6rem; z-index: 4;
+               display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem .75rem;
+               padding: .5rem 0 .45rem; margin-bottom: .25rem;
+               background: var(--color-base-100);
+               border-bottom: 1px solid var(--color-base-300); }
+  .band-name { margin: 0; font-size: 1.25rem; font-weight: 600; letter-spacing: -.02em; }
+  .band-head > :last-child { margin-left: auto; }
+  /* Everything that belongs to the project, inset from the rule so the rule reads as
+     the project's own edge rather than as a divider between two of them. */
+  .band-body { min-width: 0; padding-bottom: .5rem; }
+  .band-goal { max-width: 68ch; margin: .5rem 0 0; font-size: .875rem; }
+  .band-foot { display: grid; gap: 1.5rem 2.5rem; margin-top: 1.75rem; }
+  @media (min-width: 60rem) {
+    .band-foot { grid-template-columns: minmax(0, 1fr) 24rem; align-items: start; }
+  }
 
-  /* The question cards. auto-fill rather than fixed columns: ONE card should take its
-     own width, not sit abandoned in half an empty grid. */
-  .qgrid { display: grid; gap: .75rem; margin-top: .5rem;
-           grid-template-columns: repeat(auto-fill, minmax(min(100%, 26rem), 1fr)); }
+  /* --- one agent, one line -------------------------------------------------
+     Three meters per agent, times a dozen agents, is not density: it is the same
+     drawing repeated until it stops being read. Only the window closest to stopping the
+     agent gets a bar; the rest are on its task page. */
+  .fleet-head, .lim-head { display: flex; align-items: baseline; gap: .5rem;
+            margin-bottom: .35rem; font-size: .8125rem; font-weight: 600;
+            color: color-mix(in oklab, var(--color-base-content) 70%, transparent); }
+  .lim-head > :last-child { margin-left: auto; font-weight: 400; }
+  .ag { display: grid; align-items: center; gap: .1rem .7rem;
+        padding: .4rem 0; border-top: 1px solid var(--color-base-300);
+        grid-template-columns: auto auto minmax(8rem, 1fr) auto;
+        grid-template-areas: "model task meter ctx" "grants grants grants id"
+                             "note note note note"; }
+  .ag-model { grid-area: model; font-weight: 600; font-size: .9375rem; }
+  .ag-task { grid-area: task; font-size: .8125rem; }
+  .ag-meter { grid-area: meter; }
+  .ag-meter .meter { max-width: none; grid-template-columns: 1.9rem minmax(0, 1fr) 2.4rem; }
+  .ag-ctx { grid-area: ctx; justify-self: end; }
+  .ag-grants { grid-area: grants; display: flex; flex-wrap: wrap; gap: .25rem;
+               margin-top: .15rem; }
+  .ag-id { grid-area: id; justify-self: end; font-size: .6875rem; }
+  .ag-note { grid-area: note; margin: .25rem 0 0; font-size: .8125rem; }
+  @media (max-width: 40rem) {
+    .ag { grid-template-columns: auto minmax(0, 1fr);
+          grid-template-areas: "model task" "meter ctx" "grants grants" "id id" "note note"; }
+    .ag-id { justify-self: start; }
+  }
+
+  /* --- permissions as chips -----------------------------------------------
+     What stood here was a text field with a datalist and a button: a form for writing a
+     row into a table. It could not show which permissions EXIST, only which had already
+     been typed in — so "may this agent merge?" meant reading a list and knowing what was
+     missing from it. Held is filled, available is outlined, one press either way. */
+  .chip { display: inline-block; padding: .05rem .4rem; border-radius: var(--radius-field);
+          font-family: var(--font-mono); font-size: .6875rem; line-height: 1.5;
+          border: 1px solid var(--color-base-300); cursor: pointer; }
+  .chip-on { background: var(--color-primary); border-color: var(--color-primary);
+             color: var(--color-primary-content); }
+  .chip-off { background: transparent; opacity: .45; }
+  /* Pinning a coordinator is an ACTION, not a permission the agent holds. Among the
+     grant chips it read as one more thing that could be switched on. */
+  .chip-act { background: transparent; opacity: .6; font-family: var(--font-sans);
+              border-style: dashed; margin-left: .35rem; }
+  .chip-act:hover, .chip-act:focus-visible { opacity: 1; border-style: solid;
+              border-color: var(--color-primary); }
+  .chip-off:hover, .chip-off:focus-visible { opacity: 1; border-color: var(--color-primary); }
+  .chip-on:hover, .chip-on:focus-visible { background: var(--color-error);
+             border-color: var(--color-error); color: var(--color-error-content); }
+  .chip:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+  span.chip { cursor: default; }
+
+  /* --- the night band ------------------------------------------------------
+     The board carried no time at all: it could say what IS and never what HAPPENED,
+     while the event log held the whole answer and was never drawn. */
+  .night-k { font-size: .75rem; white-space: nowrap; }
+  .topband { display: grid; gap: .75rem 2.5rem; margin-top: 1.5rem;
+             padding-top: 1rem; border-top: 1px solid var(--color-base-300); }
+  @media (min-width: 60rem) {
+    .topband { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+  }
+  .night { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr);
+           gap: .15rem .75rem; align-items: center; }
+  .night-track { position: relative; height: 2.6rem;
+                 border-bottom: 1px solid var(--color-base-300); }
+  .night-track > .mk { position: absolute; width: 3px; height: .55rem; border-radius: 1px;
+                       background: var(--color-base-content); transform: translateX(-1px); }
+  /* One lane per kind: two events in the same minute used to draw on top of each other
+     and the colours muddied into one dark mark, which is the moment you most need to
+     tell them apart. Read along a lane and you read one kind of thing. */
+  .mk-stopped { background: var(--color-error); bottom: 1.65rem; }
+  .mk-asked { background: var(--color-warning); bottom: .95rem; }
+  .mk-landed { background: var(--color-success); bottom: .25rem; }
+  .night-track > .tk { position: absolute; bottom: -1.1rem; font-size: .625rem;
+                      font-weight: 400; font-family: var(--font-mono);
+                      color: color-mix(in oklab, var(--color-base-content) 50%, transparent);
+                      transform: translateX(-50%); }
+  .night-legend { grid-column: 2; display: flex; gap: .9rem; margin-top: .9rem;
+                 font-size: .75rem;
+                 color: color-mix(in oklab, var(--color-base-content) 60%, transparent); }
+
+  /* --- the limits panel ----------------------------------------------------- */
+  .lim { min-width: 0; }
+  .lim-wip { display: flex; flex-wrap: wrap; align-items: baseline; gap: .4rem;
+             margin: .9rem 0 0; font-size: .8125rem; }
+  /* flex: none, and the same on the field: measured in the browser, the phrase was being
+     SHRUNK to 31px by the flex parent — nowrap keeps text on one line and does nothing
+     about a flex item whose min-width the input is happy to give up. */
+  .lim-wip > .of { display: inline-flex; flex: 0 0 auto; align-items: baseline;
+                   gap: .4rem; white-space: nowrap; }
+  .lim-wip .cell-num { flex: 0 0 auto; }
 
   /* --- the timeline ------------------------------------------------------
      The clock in a fixed monospace column, the text wrapping at reading width beside it. */
