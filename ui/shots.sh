@@ -17,7 +17,8 @@ T=shot-$RANDOM; P=$((19000 + RANDOM % 900)); D=$(mktemp -d)
 HT=shothum-$RANDOM
 cat > "$D/policy.json" <<'POL'
 {"budget": {"*": {"ceilings": {"5h": 85, "7d": 60}, "fallback": {"max_tasks": 12}}},
- "grants": {"*": ["merge", "deploy-dev"]}}
+ "grants": {"board": {"*": ["merge", "deploy-dev"]},
+            "shopfront": {"*": ["deploy-dev"]}}}
 POL
 BOARD_TOKEN=$T BOARD_HUMAN_TOKEN=$HT BOARD_DB=$D/b.db BOARD_POLICY=$D/policy.json BOARD_PORT=$P \
   python3 "$W/board.py" >"$D/log" 2>&1 &
