@@ -54,6 +54,12 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY, ts TEXT NOT NULL, project TEXT NOT NULL, stream TEXT NOT NULL,
   type TEXT NOT NULL, actor TEXT NOT NULL, body TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS events_stream ON events(project, stream, id);
+-- Reading the log BY TYPE: the cost of a task is folded out of its task.progress events,
+-- and both /status and /metrics do it — /metrics under the global lock, where every
+-- agent call waits behind it. Without this index those queries scan the whole log: at the
+-- live board's 42k events that was 37 ms per /status render and about half of a 1 s
+-- scrape. `id` last so the fold still gets its rows in insertion order for free.
+CREATE INDEX IF NOT EXISTS events_type ON events(type, project, id);
 CREATE TABLE IF NOT EXISTS projects (
   name TEXT PRIMARY KEY, phase TEXT NOT NULL, goal TEXT, manifest TEXT,
   manifest_host TEXT, manifest_path TEXT, updated TEXT);
@@ -3518,9 +3524,16 @@ def prometheus_metrics():
         ("task.merge_verified", "board_task_merges_total"),
     ]
     for ev_type, metric_name in task_counters:
+        # `t.id = substr(e.stream, 6)` and not `e.stream = 'task/' || t.id`: the second
+        # form builds the key on the TASKS side, so no index on tasks.id can be used and
+        # every matching event re-scans the whole table. Measured on a 42k-event log, per
+        # event type and with this endpoint holding the global lock: 243 ms → 10 ms. The
+        # results are identical — a stream that is not a task ("agent/…", "project")
+        # matches nothing either way and the LEFT JOIN yields NULL, which is what
+        # COALESCE is already there for.
         rows = db.execute(
             "SELECT e.project, COALESCE(t.repo, json_extract(e.body, '$.repo'), '') AS repo_val, COUNT(*) AS cnt "
-            "FROM events e LEFT JOIN tasks t ON e.stream = ('task/' || t.id) "
+            "FROM events e LEFT JOIN tasks t ON t.id = substr(e.stream, 6) "
             "WHERE e.type = ? "
             "GROUP BY e.project, repo_val", (ev_type,)
         ).fetchall()
@@ -3533,13 +3546,29 @@ def prometheus_metrics():
 
     # 8. board_task_dispatches_total{project="...",role="...",model="..."}
     # 9. board_task_dispatch_tokens_total{project="...",role="...",model="..."}
+    #
+    # ONE pass over the dispatch events, feeding both the per-role counters below and the
+    # per-task fold that 9b needs. It used to be two full scans of the event log, and
+    # this endpoint holds the GLOBAL LOCK while it runs — measured at 42k events (the
+    # live board's own size) the second scan took the scrape from 545 ms to 1035 ms, and
+    # every agent call waits behind it for as long as it lasts.
+    #
+    # The two readings are deliberately different and both are wanted: the counters below
+    # count dispatch EVENTS (SKILL.md logs one before and one after, so a completed
+    # dispatch is two), while cost_of folds those two back into one costed dispatch.
+    # Changing the counters to the folded number would silently redefine a metric Grafana
+    # already draws, so they stay as they are.
     dispatches = {}
     dispatch_tokens = {}
-    for r in db.execute("SELECT project, body FROM events WHERE json_extract(body, '$.dispatch') IS NOT NULL").fetchall():
+    per_task = {}
+    for r in db.execute("SELECT project, stream, ts, actor, body FROM events "
+                        "WHERE type='task.progress' "
+                        "AND json_extract(body, '$.dispatch') IS NOT NULL ORDER BY id"):
         b = jl(r["body"], {})
         d = b.get("dispatch")
         if not d:
             continue
+        per_task.setdefault(r["stream"].split("/", 1)[-1], []).append(r)
         if isinstance(d, dict):
             role = d.get("role") or ""
             model = d.get("model") or ""
@@ -3556,6 +3585,7 @@ def prometheus_metrics():
                 dispatch_tokens[key] = dispatch_tokens.get(key, 0) + int(tokens)
             except (ValueError, TypeError):
                 pass
+    costs = {tid: cost_of(dispatches_of(rows)) for tid, rows in per_task.items()}
 
     disp_samples = [
         'board_task_dispatches_total{project="%s",role="%s",model="%s"} %d' % (
@@ -3580,7 +3610,6 @@ def prometheus_metrics():
     # Only tasks whose cost is COMPLETE contribute tokens (cost_of: every dispatch has
     # its number). A task still missing one would drag the average down for a model that
     # did nothing wrong but forget a --tokens flag.
-    costs = task_costs()
     est_n, est_tok, est_costed, est_points = {}, {}, {}, {}
     for r in db.execute("SELECT id, project, status, estimate, estimate_model FROM tasks "
                         "WHERE estimate IS NOT NULL"):
@@ -3613,13 +3642,17 @@ def prometheus_metrics():
     # own size. This is the other half of the question: not "did we guess right" but
     # "what does this model cost per unit of work".
     model_tok = {}
-    for r in db.execute("SELECT id, project, estimate FROM tasks"):
-        c = costs.get(r["id"])
-        if not c:
-            continue
-        for model, tok in c["by_model"].items():
-            k = (r["project"] or "", model, str(r["estimate"]) if r["estimate"] else "")
-            model_tok[k] = model_tok.get(k, 0) + tok
+    if costs:
+        marks = {r["id"]: r for r in db.execute(
+            "SELECT id, project, estimate FROM tasks WHERE id IN (%s)"
+            % ",".join("?" * len(costs)), list(costs))}
+        for tid, c in costs.items():
+            r = marks.get(tid)
+            if not r:
+                continue
+            for model, tok in c["by_model"].items():
+                k = (r["project"] or "", model, str(r["estimate"]) if r["estimate"] else "")
+                model_tok[k] = model_tok.get(k, 0) + tok
     add_metric("board_task_tokens_total", "counter", [
         'board_task_tokens_total{project="%s",model="%s",estimate="%s"} %d' % (
             prom_esc(p), prom_esc(m), prom_esc(e), n)
