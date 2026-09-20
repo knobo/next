@@ -2289,8 +2289,16 @@ if [ "$OWN_SERVER" = 1 ]; then
   check "routine last_run updated" "$(api GET "/routines?project=demo")" '.routines[0].last_run != null'
 
 
-  R=$(curl -s "$BOARD_URL/metrics")
-  echo "$R" | grep -q 'board_routines_total{project="demo",status="open"}' && ok "metrics contains routines" || no "metrics contains routines" "missing"
+  R=$(curl -sS -m 10 "$BOARD_URL/metrics")
+  # This one has failed intermittently — roughly one run in four — and said only
+  # "missing", which is the reason nobody has been able to chase it. Print what the
+  # routine table and the metric actually held at the moment it failed.
+  if grep -q 'board_routines_total{project="demo",status="open"}' <<<"$R"; then
+    ok "metrics contains routines"
+  else
+    no "metrics contains routines" \
+      "routines in metrics: $(grep -c 'board_routines_total' <<<"$R") line(s): $(grep 'board_routines_total' <<<"$R" | tr '\n' ' ')| routines row: $(api GET '/routines?project=demo' | jq -c '.routines')"
+  fi
   echo "$R" | grep -q 'board_routine_last_run_timestamp_seconds{project="demo",routine="clean"}' && ok "metrics contains last_run" || no "metrics contains last_run" "missing"
   
   echo "== reaper routines =="
