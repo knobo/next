@@ -679,6 +679,131 @@
         },
         "pieType": "donut"
       }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "id": 43,
+      "panels": [],
+      "title": "Estimat og kostnad per modell",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Snitt antall tokens en oppgave faktisk kostet, gruppert p\u00e5 st\u00f8rrelsen modellen ga den. Les den vannrett: for \u00e9n modell skal s\u00f8ylene stige med st\u00f8rrelsen. Gj\u00f8r de ikke det, betyr ikke tallene modellen skriver ned det den tror. Sammenlign modeller ved samme st\u00f8rrelse for \u00e5 se hvem som undervurderer.\n\nBare oppgaver med FULLSTENDIG kostnad teller med \u2014 en dispatch som aldri rapporterte tokens ville ellers dratt snittet ned for en modell som ikke gjorde noe galt.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "id": 44,
+      "targets": [
+        {
+          "expr": "sum by (estimate_model, estimate) (board_task_estimate_tokens_total{project=~\"$project\"})\n  /\nsum by (estimate_model, estimate) (board_tasks_estimate_costed_total{project=~\"$project\"})",
+          "legendFormat": "{{estimate_model}} \u2014 st\u00f8rrelse {{estimate}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Faktisk kostnad per estimert st\u00f8rrelse, per modell",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Estimeringsprofilen til hver modell. En modell som aldri sier 8 eller 13 deler ikke opp arbeidet annerledes \u2014 den t\u00f8r ikke si at noe er stort.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      },
+      "id": 45,
+      "targets": [
+        {
+          "expr": "sum by (estimate_model, estimate) (board_tasks_estimated_total{project=~\"$project\"})",
+          "legendFormat": "{{estimate_model}} \u2014 {{estimate}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Estimerte oppgaver fordelt p\u00e5 st\u00f8rrelse og modell",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Det andre halve sp\u00f8rsm\u00e5let: ikke \u00abgjettet vi riktig\u00bb, men \u00abhva koster denne modellen per oppgave\u00bb. Merket med modellen som gjorde jobben, ikke med den som estimerte.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 49
+      },
+      "id": 46,
+      "targets": [
+        {
+          "expr": "sum by (model) (board_task_tokens_total{project=~\"$project\"})",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Tokenforbruk per modell som utf\u00f8rte arbeidet",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "K\u00f8 m\u00e5lt i arbeid, ikke i antall rader. Femten oppgaver \u00e0 1 poeng og tre \u00e0 13 er samme radtall og helt ulik k\u00f8.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 49
+      },
+      "id": 47,
+      "targets": [
+        {
+          "expr": "sum by (status) (board_task_estimate_points{project=~\"$project\"})",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "K\u00f8ens st\u00f8rrelse i poeng, per status",
+      "type": "timeseries"
     }
   ],
   "refresh": "15s",

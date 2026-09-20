@@ -57,6 +57,13 @@ CREATE INDEX IF NOT EXISTS events_stream ON events(project, stream, id);
 CREATE TABLE IF NOT EXISTS projects (
   name TEXT PRIMARY KEY, phase TEXT NOT NULL, goal TEXT, manifest TEXT,
   manifest_host TEXT, manifest_path TEXT, updated TEXT);
+-- projects.ceilings/.wip are the OWNER'S OVERRIDE of board-policy.json, set from the
+-- board itself (the gauges on /status) instead of by hand-editing the ConfigMap on the
+-- host. The policy file stays the default; this wins when it is set. The reason it is a
+-- table and not the file: the file is deliberately never deployed (k8s/board.yaml), so
+-- the only way to raise a ceiling at 3am was to ssh in — and a project the file has no
+-- entry for stops the whole fleet with a note telling the owner to go edit YAML. Written
+-- ONLY behind the human token (§3.7): a ceiling an agent can raise is not a ceiling.
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY, harness TEXT, host TEXT, model TEXT, session TEXT,
   current_project TEXT, capabilities TEXT, preference TEXT,
@@ -101,7 +108,17 @@ db.executescript(SCHEMA)
 for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
                           ("agents", "budget", "TEXT"),
                           ("tasks", "routine", "TEXT"),
-                          ("grants", "source", "TEXT DEFAULT 'policy'")):
+                          ("grants", "source", "TEXT DEFAULT 'policy'"),
+                          # The estimate is a RELATIVE size, not hours, and the point of
+                          # keeping who/what estimated is that the board can then answer
+                          # "which model estimates well" — the model on the agent row is
+                          # not enough, because agents are cleaned up and a session can
+                          # change model. Snapshot both at the moment the number is given.
+                          ("tasks", "estimate", "INTEGER"),
+                          ("tasks", "estimate_by", "TEXT"),
+                          ("tasks", "estimate_model", "TEXT"),
+                          ("projects", "ceilings", "TEXT"),
+                          ("projects", "wip", "INTEGER")):
 
     try:                                # database from before the column existed
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
@@ -255,12 +272,29 @@ def budget(project):
     c = p.get("ceilings")
     if c is None and p.get("rl7_ceiling") is not None:
         c = {"7d": p["rl7_ceiling"], "5h": p.get("rl5_ceiling", 85)}
+    # The owner's own setting, made on the board, beats the file. `source` travels with
+    # the numbers so the gauges can say which one they are drawing — an override that
+    # looks identical to the policy is how you end up editing the ConfigMap for an hour
+    # wondering why nothing moves.
+    own = ceilings_override(project)
+    if own:
+        return {"ceilings": own, "fallback": p.get("fallback", {}), "source": "board"}
     if c is None:
         return {"ceilings": {}, "fallback": p.get("fallback", {}), "ceilings_missing": True,
-                "note": "budget.%s.ceilings is not set for %s — %s must add it to "
-                        "board-policy.json (budget.%s.ceilings, e.g. "
-                        '{"5h": 85, "7d": 60})' % (project, project, HUMAN, project)}
-    return {"ceilings": c, "fallback": p.get("fallback", {})}
+                "source": "none",
+                "note": "No ceiling is set for %s, so every agent here stops. Set one on "
+                        "the board (the gauges under the fleet), or add "
+                        "budget.%s.ceilings to board-policy.json." % (project, project)}
+    return {"ceilings": c, "fallback": p.get("fallback", {}), "source": "policy"}
+
+
+def ceilings_override(project):
+    """The ceilings the owner set on the board itself, or {} when they set none."""
+    r = db.execute("SELECT ceilings FROM projects WHERE name=?", (project,)).fetchone()
+    raw = jl(r["ceilings"], {}) if r else {}
+    if not isinstance(raw, dict):
+        return {}
+    return {win_name(k): v for k, v in raw.items() if num(v) is not None}
 
 
 WIN_UNIT = {"m": 1, "h": 60, "d": 1440, "w": 10080}
@@ -871,15 +905,86 @@ def task_create(b, actor):
     if actor != "board":
         check_repo(project, b.get("repo"))
     tid = next_id("T-", "tasks")
+    # Validated BEFORE the insert: a task that exists with a silently dropped estimate is
+    # worse than one that was refused, because the number never comes back.
+    est = estimate_fields(b.get("estimate"), actor)
     db.execute("""INSERT INTO tasks (id,project,repo,title,spec,status,requires,needs_grants,touches,
-                  risk,review_open,created,updated,priority,routine) VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?,?)""",
+                  risk,review_open,created,updated,priority,routine,estimate,estimate_by,estimate_model)
+                  VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?,?,?,?,?)""",
                (tid, project, b.get("repo"), b["title"], b.get("spec"),
                 json.dumps(b.get("requires", [])), json.dumps(b.get("needs_grants", [])),
                 json.dumps(b.get("touches", [])), b.get("risk", "normal"), now(), now(),
-                int(b.get("priority", 50)), b.get("routine")))
+                int(b.get("priority", 50)), b.get("routine"),
+                est["estimate"], est["estimate_by"], est["estimate_model"]))
     ev(project, "task/" + tid, "task.created", actor, title=b["title"], repo=b.get("repo"),
-       risk=b.get("risk", "normal"), from_project=b.get("from_project"))
+       risk=b.get("risk", "normal"), from_project=b.get("from_project"),
+       estimate=est["estimate"])
     return {"id": tid, "status": "open"}
+
+
+def dispatches_of(rows):
+    """Who dispatched what on one task, oldest first. `rows` are that task's
+    `task.progress` events in id order.
+
+    SKILL.md asks the coordinator to log the same dispatch TWICE: once before the
+    subagent starts, and once when it returns with --tokens. One event = one dispatch
+    therefore counted every dispatch twice, and `complete` could never become true — the
+    "before" row stands forever without a token count. The closing entry is folded into
+    the open row for the same role:model instead. A NEW round with the same role:model
+    begins with a new "before" row, and therefore counts as its own dispatch — that is
+    where `ts` tells them apart.
+
+    Lifted out of task_show because /metrics needs precisely the same fold, and a second
+    implementation of it would be a second set of numbers that disagree with the page."""
+    out = []
+    for r in rows:
+        body = jl(r["body"], {})
+        x = body.get("dispatch")
+        if not x:
+            continue
+        res = body.get("result")
+        open_row = next((p for p in reversed(out)
+                         if p["role"] == x["role"] and p["model"] == x["model"]
+                         and p["tokens"] is None), None)
+        if open_row is not None and (x.get("tokens") is not None or res is not None):
+            open_row["tokens"] = x.get("tokens")
+            open_row["result"] = res if res is not None else open_row["result"]
+            continue
+        out.append({"ts": r["ts"], "actor": r["actor"], "role": x["role"],
+                    "model": x["model"], "tokens": x.get("tokens"), "result": res})
+    return out
+
+
+def cost_of(dispatches):
+    """What a task cost in subagents. Tokens is the number every harness has, unlike the
+    vendor's percentage windows (T-164). `complete` is false as soon as one dispatch is
+    missing the number — a sum that pretends to be whole is worse than one that says it
+    is not, and the estimate-vs-actual panels on Grafana are only honest if they can
+    leave the incomplete ones out."""
+    toks = [x.get("tokens") for x in dispatches]
+    by_model = {}
+    for x in dispatches:
+        if x.get("tokens"):
+            by_model[x["model"]] = by_model.get(x["model"], 0) + x["tokens"]
+    return {"dispatches": len(toks), "tokens": sum(t for t in toks if t),
+            "by_model": by_model, "complete": all(t is not None for t in toks)}
+
+
+def task_costs(project=None):
+    """{task id: cost} for every task that has dispatches, in one pass.
+
+    One query, not one per task: the queue page shows the cost on every row, and forty
+    tasks meant forty scans of the event log while the global lock was held."""
+    where, args = "type='task.progress'", []
+    if project:                          # hits the events(project, stream, id) index
+        where += " AND project=?"
+        args.append(project)
+    per = {}
+    for r in db.execute("SELECT stream, ts, actor, body FROM events WHERE %s "
+                        "AND json_extract(body, '$.dispatch') IS NOT NULL "
+                        "ORDER BY id" % where, args):
+        per.setdefault(r["stream"].split("/", 1)[-1], []).append(r)
+    return {tid: cost_of(dispatches_of(rows)) for tid, rows in per.items()}
 
 
 def task_show(tid):
@@ -905,35 +1010,10 @@ def task_show(tid):
     # the open row for the same role:model instead. A NEW round with the same role:model
     # begins with a new "before" row, and therefore counts as its own dispatch — that is
     # where `ts` tells them apart.
-    d["dispatches"] = []
-    for r in db.execute("SELECT * FROM events WHERE stream=? AND type='task.progress' "
-                        "ORDER BY id", ("task/" + tid,)):
-        body = jl(r["body"], {})
-        x = body.get("dispatch")
-        if not x:
-            continue
-        res = body.get("result")
-        open_row = next((p for p in reversed(d["dispatches"])
-                         if p["role"] == x["role"] and p["model"] == x["model"]
-                         and p["tokens"] is None), None)
-        if open_row is not None and (x.get("tokens") is not None or res is not None):
-            open_row["tokens"] = x.get("tokens")
-            open_row["result"] = res if res is not None else open_row["result"]
-            continue
-        d["dispatches"].append({"ts": r["ts"], "actor": r["actor"], "role": x["role"],
-                                "model": x["model"], "tokens": x.get("tokens"),
-                                "result": res})
-    # What the task cost in subagents. Tokens is the number every harness has, unlike
-    # the vendor's percentage windows (T-164). `complete` is false as soon as one
-    # dispatch is missing the number — a sum that pretends to be whole is worse than one
-    # that says it is not.
-    toks = [x.get("tokens") for x in d["dispatches"]]
-    by_model = {}
-    for x in d["dispatches"]:
-        if x.get("tokens"):
-            by_model[x["model"]] = by_model.get(x["model"], 0) + x["tokens"]
-    d["cost"] = {"dispatches": len(toks), "tokens": sum(t for t in toks if t),
-                 "by_model": by_model, "complete": all(t is not None for t in toks)}
+    d["dispatches"] = dispatches_of(db.execute(
+        "SELECT ts, actor, body FROM events WHERE stream=? AND type='task.progress' "
+        "ORDER BY id", ("task/" + tid,)))
+    d["cost"] = cost_of(d["dispatches"])
     d["phase"] = phase_of(d["project"])
     d["events"] = [
         {"ts": r["ts"], "type": r["type"], "actor": r["actor"],
@@ -1018,6 +1098,9 @@ def wip_limit(project):
     number, in the policy. The default is a LIMIT, not a free pass: without a limit the
     queue grows until production has outrun the review, which is exactly what happened
     once."""
+    r = db.execute("SELECT wip FROM projects WHERE name=?", (project,)).fetchone()
+    if r and r["wip"] is not None:        # the owner's own number, set on the board
+        return int(r["wip"])
     p = policy().get("limits", {})
     return int(p.get(project, p.get("*", {})).get("unreviewed", DEFAULT_WIP))
 
@@ -1211,28 +1294,71 @@ def task_progress(tid, aid, b):
     return {"ok": True}
 
 
-PATCHABLE = ("repo", "touches", "risk", "priority")
+PATCHABLE = ("repo", "touches", "risk", "priority", "estimate")
 PATCH_LOCKED = ("status", "owner", "merge_sha")
+# Two kinds of field, and they do not have the same owner.
+#   repo/touches/risk describe THE WORK: where it lands and how dangerous it is. `risk`
+#   is what triggers the human gate before a merge (§3.6), so it stays the owner's — that
+#   guard is the reason task_patch checks ownership at all.
+#   priority/estimate describe THE QUEUE: what should be picked up next, and how big we
+#   think it is. Both are set while grooming, BEFORE anyone has claimed anything, so
+#   demanding ownership for them made an estimate impossible to record in the one moment
+#   it is actually made ("the task is no longer yours (open)" on a task nobody held).
+QUEUE_FIELDS = ("priority", "estimate")
+# Relative sizes, not hours. A closed set, because the whole point of the number is that
+# it is comparable ACROSS agents and models — "how well does this model size its own
+# work" is unanswerable if every agent invents its own scale. Fibonacci-ish: the gaps
+# widen as the uncertainty does.
+ESTIMATES = (1, 2, 3, 5, 8, 13)
+
+
+def estimate_fields(value, aid):
+    """The estimate, plus WHO gave it and on which model.
+
+    The model is copied here rather than read back off the agent row later, for two
+    reasons that both actually happen: `board agent cleanup` deletes nothing but the
+    agent rows go stale and get reused, and a session can come back on a different model
+    after a restart. Reading it later answers "what does that agent run now", which is
+    not the question. The question is what the estimate was worth when it was made."""
+    if value in (None, ""):
+        return {"estimate": None, "estimate_by": None, "estimate_model": None}
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise Err(400, "an estimate is one of %s" % ", ".join(str(x) for x in ESTIMATES))
+    if n not in ESTIMATES:
+        raise Err(400, "an estimate is one of %s — relative size, not hours"
+                  % ", ".join(str(x) for x in ESTIMATES), estimates=list(ESTIMATES))
+    a = db.execute("SELECT model FROM agents WHERE id=?", (aid,)).fetchone()
+    return {"estimate": n, "estimate_by": aid,
+            "estimate_model": (a["model"] if a else None) or ("human" if aid == HUMAN else None)}
 
 
 def task_patch(tid, aid, b):
     """Correct metadata that describes the task. State (status/owner/merge_sha) is owned
     by the transitions."""
     t = task(tid)
-    a = agent(aid)
-    same_project(a, t["project"])
-    # Ownership, like every other state change. Without this any agent in the project
-    # could lower `risk` from high to low on SOMEONE ELSE'S task — and risk is exactly
-    # what triggers the human gate before merge (§3.6). That is, a detour around the one
-    # mechanical safeguard the design rests on.
-    owns(t, aid)
+    if as_human(b) and not (b or {}).get("agent"):
+        # The owner reordering the queue from the board has no agent id, and is not
+        # bound by ownership — it is their board. Everything below still applies.
+        aid = HUMAN
+    else:
+        a = agent(aid)
+        same_project(a, t["project"])
+        # Ownership, for the fields that describe the work. Without this any agent in the
+        # project could lower `risk` from high to low on SOMEONE ELSE'S task — and risk is
+        # exactly what triggers the human gate before merge (§3.6). That is, a detour
+        # around the one mechanical safeguard the design rests on. The queue fields are
+        # not part of that: see QUEUE_FIELDS.
+        if any(k in b for k in PATCHABLE if k not in QUEUE_FIELDS):
+            owns(t, aid)
     locked = [k for k in PATCH_LOCKED if k in b]
     if locked:
         raise Err(400, "cannot be set with PATCH: %s — they are owned by the transitions"
                   % ", ".join(locked))
     fields = {k: b[k] for k in PATCHABLE if k in b}
     if not fields:
-        raise Err(400, "nothing to change (repo, touches, risk, priority)")
+        raise Err(400, "nothing to change (repo, touches, risk, priority, estimate)")
     if "touches" in fields:
         v = fields["touches"]
         if isinstance(v, str):
@@ -1245,6 +1371,8 @@ def task_patch(tid, aid, b):
             fields["priority"] = int(fields["priority"])
         except (TypeError, ValueError):
             raise Err(400, "priority must be an integer")
+    if "estimate" in fields:
+        fields.update(estimate_fields(fields.pop("estimate"), aid))
     if "risk" in fields and fields["risk"] not in (None, "low", "normal", "high"):
         raise Err(400, "unknown risk %r" % fields["risk"])
     if "repo" in fields:
@@ -1497,7 +1625,7 @@ def task_done(tid, aid, b):
 def task_archive(tid, aid, b):
     """Archive a task (status='archived'). Hidden from /status and ordinary searches."""
     t = task(tid)
-    if t["owner"] and t["owner"] != aid:
+    if t["owner"] and t["owner"] != aid and not as_human(b or {}):
         raise Err(409, "the task is owned by %s — cannot be archived while it is being "
                        "worked on" % t["owner"])
     db.execute("UPDATE tasks SET status='archived', owner=NULL, lease_until=NULL, updated=? WHERE id=?",
@@ -1528,7 +1656,11 @@ def release(tid, aid, b):
     PR became invisible to `task next` and locked by `owns()` — deadlock on exactly what
     was worth the most."""
     t = task(tid)
-    owns(t, aid)
+    # The owner of the BOARD can always take a task back. owns() protects agents from
+    # each other; it was never meant to leave a person watching a task sit with a live
+    # owner that has stopped making progress and no way to free it but the database.
+    if not as_human(b or {}):
+        owns(t, aid)
     keep = t["status"] if t["status"] == "in_review" else "open"
     db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=? WHERE id=?",
                (keep, now(), tid))
@@ -1900,13 +2032,18 @@ def status(project=None):
                           "progress` with what you found before you go quiet again"
                           % (sm, a["current_task"])) if sm is not None and sm >= SILENT_MIN else None
             agents.append(d)
+        costs = task_costs(name)
         out["projects"].append({
             "name": name, "phase": p["phase"], "goal": p["goal"], "paused": p["paused"],
+            "wip": wip_limit(name), "unreviewed": unreviewed(name),
             "agents": agents,
             # /status is an overview for the human: show the Claude fleet's numbers, which
             # are what drive the stop rules for most of the agents.
             "budget": dict(budget(name), windows=quota_max()),
-            "tasks": [brief(t) for t in db.execute(
+            # The cost travels with the task, not in a separate section: "what has this
+            # one already spent" is read next to "how big did we think it was", or it is
+            # not read at all.
+            "tasks": [dict(brief(t), cost=costs.get(t["id"])) for t in db.execute(
                 "SELECT * FROM tasks WHERE project=? AND status NOT IN ('done', 'archived') "
                 "ORDER BY priority DESC, created", (name,))],
             "questions": [dict(q) for q in db.execute(
@@ -1965,16 +2102,14 @@ def whoami(human):
             "title='signed in as an agent: answers will be refused'>agent</span>")
 
 
-def head(title, right="", nav=(("/status", "board"),), human=False, show_all_btn=False):
-    btn = "<button id='btn-show-all' class='badge badge-sm badge-ghost cursor-pointer font-sans select-none' title='Vis alt / Skjul inaktive'>vis alt</button>" if show_all_btn else ""
+def head(title, right="", nav=(("/status", "board"),), human=False):
     return ("<header class='flex flex-wrap items-baseline gap-x-3 gap-y-1 "
             "border-b-2 border-base-300 pb-3'>"
             "<h1 class='text-xl font-semibold tracking-tight sm:text-2xl'>%s</h1>%s"
-            "<nav class='ml-auto flex items-baseline gap-4 text-sm'>%s%s%s</nav></header>" % (
+            "<nav class='ml-auto flex items-baseline gap-4 text-sm'>%s%s</nav></header>" % (
                 escape(title), right,
                 "".join("<a class='%s' href='%s'>%s</a>" % (LINK, u, escape(t))
                         for u, t in nav),
-                btn,
                 whoami(human)))
 
 
@@ -2042,6 +2177,75 @@ def meter(label, pct, ceiling=None):
             "<span class=track><i class='%s' style='width:%s%%'></i>%s</span>"
             "<span class=v>%s%%</span></div>" % (
                 escape(label), cls, round(min(v, 100)), tick, round(v)))
+
+
+def est_badge(t):
+    """The size, as a number that means the same thing on every task in the queue.
+
+    No unit and no word: "5" beside "12.4k" reads as a ratio, which is the only thing a
+    relative estimate is good for. A task nobody has sized shows nothing rather than a
+    zero — an unsized task is not a small one."""
+    e = t.get("estimate")
+    return ("<span class='badge badge-sm badge-ghost %s' title='relative size'>%s</span>"
+            % (MONO, escape(str(e)))) if e else ""
+
+
+def toks(n):
+    """12400 → 12.4k. The queue shows one of these per row; the exact figure belongs on
+    the task's own page, and six digits per row in a phone-width column is noise."""
+    n = int(n or 0)
+    if n >= 1000000:
+        return "%.1fM" % (n / 1000000.0)
+    if n >= 1000:
+        return "%.1fk" % (n / 1000.0)
+    return str(n)
+
+
+def cost_cell(t):
+    """What the task has spent so far. `~` means at least one subagent never reported its
+    number, so the sum is a floor and not a total — the difference matters as soon as
+    anyone divides it by the estimate."""
+    c = t.get("cost") or {}
+    if not c.get("dispatches"):
+        return ""
+    mark = "" if c.get("complete") else "~"
+    return ("<span class='%s' title='%d dispatches%s'>%s%s</span>"
+            % (MONO, c["dispatches"], "" if c.get("complete") else ", one is missing its token count",
+               mark, toks(c.get("tokens"))))
+
+
+def gauge(window, pct, ceiling, project, human):
+    """The quota gauge: what the fleet has used, and the line it must not cross — with
+    the line as a handle you can drag.
+
+    Until now the only way to move a ceiling was to hand-edit a ConfigMap on the host,
+    which is why a project missing an entry in it simply stopped, with a note telling the
+    owner to go and write YAML. The handle sits ON the track, not under it: dragging it
+    is reading it, and a second bar underneath would have been the same numbers twice.
+
+    A range input rather than a drawn handle and mouse maths — it drags with a finger,
+    it moves with the arrow keys, it announces itself to a screen reader, and with the
+    script blocked it still moves and the Set button still saves it."""
+    v = float(pct or 0)
+    c = float(ceiling or 0)
+    fill = "over" if c > 0 and v >= c else ("warn" if c > 0 and v >= c - 5 else "")
+    tick = ("<u data-c='%s' style='left:%s%%'></u>" % (round(c), round(min(c, 100)))) if c > 0 else ""
+    if not human:
+        return meter(window, pct, ceiling)
+    return ("<form class='meter gauge' method='POST' action='/projects/%s/ceilings'>"
+            "<input type='hidden' name='project' value='%s'>"
+            "<span class=k>%s</span>"
+            "<span class=track><i class='%s' style='width:%s%%'></i>%s"
+            "<input class='handle' type='range' name='ceiling.%s' min='0' max='100' "
+            "step='1' value='%d' data-ceiling aria-label='ceiling for %s, now %d percent'>"
+            "</span>"
+            "<output class='%s' data-ceiling-out>%d</output>"
+            "<button type='submit' class='sr-only-btn'>Set</button>"
+            "</form>" % (
+                escape(project), escape(project), escape(window),
+                fill, round(min(v, 100)), tick,
+                escape(window), int(round(c)), escape(window), int(round(c)),
+                MONO, int(round(c))))
 
 
 SPINE = {"blocked": "spine-stop", "orphaned": "spine-stop",
@@ -2170,113 +2374,147 @@ def last_activity(p):
     return max(t or "", a or "", "")
 
 
-# Opens the project you last looked at, and applies agent/task visibility filters.
+# Opens the project you last looked at, drives the filter rail, and saves a control the
+# moment you let go of it. The ONLY script the board serves: the CSP admits it by hash,
+# so anything added here changes FOCUS_SHA and nothing else can ever be added by accident.
 FOCUS_JS = """
 (function(){
-var d=document.querySelectorAll('.pj'),k='board:focus',w=localStorage.getItem(k),o;
-for(var i=0;i<d.length;i++){if(d[i].dataset.p===w)o=d[i];
-d[i].addEventListener('toggle',function(){if(this.open)localStorage.setItem(k,this.dataset.p);
-else if(localStorage.getItem(k)===this.dataset.p)localStorage.removeItem(k);});}
-(o||d[0]||{}).open=true;
+var LS={g:function(k,d){try{return localStorage.getItem(k)||d;}catch(e){return d;}},
+        s:function(k,v){try{localStorage.setItem(k,v);}catch(e){}}};
+var AGE={'1h':60,'24h':1440,'7d':10080};
+var STOP={'blocked':1,'orphaned':1},FLY={'claimed':1,'merging':1};
 
-var iv={'1h':60,'24h':1440,'7d':10080};
-var pms=new URLSearchParams(window.location.search);
-if(pms.get('all')==='1'||pms.get('all')==='true'){localStorage.setItem('board:show_all','1');}
-else if(pms.has('all')){localStorage.setItem('board:show_all','0');}
-if(pms.get('interval')){
-  localStorage.setItem('board:agent_filter',pms.get('interval'));
-  localStorage.setItem('board:task_filter',pms.get('interval'));
-}
-
-function upd(){
-  var sa=localStorage.getItem('board:show_all')==='1';
-  var b=document.getElementById('btn-show-all');
-  if(b){
-    if(sa){b.textContent='viser alt';b.classList.add('badge-primary');b.classList.remove('badge-ghost');}
-    else{b.textContent='vis alt';b.classList.remove('badge-primary');b.classList.add('badge-ghost');}
-  }
-  var pjs=document.querySelectorAll('.pj');
-  for(var p=0;p<pjs.length;p++){
-    var pj=pjs[p];
-    var as=pj.querySelector('[data-agent-filter]');
-    var av=sa?'all':(localStorage.getItem('board:agent_filter')||(as?as.value:'24h'));
-    if(as&&!sa)as.value=av;
-    var ci=pj.querySelector('[data-agent-cleanup]');
-    if(ci)ci.value=av;
-
-    var ac=pj.querySelectorAll('[data-agent]');
-    var ah=0;
-    for(var c=0;c<ac.length;c++){
-      var cd=ac[c];
-      var st=cd.getAttribute('data-status');
-      var mn=parseInt(cd.getAttribute('data-mins')||'0',10);
-      var hd=false;
-      if(!sa&&av!=='all'){
-        if(av==='active'){hd=(st==='dead');}
-        else if(iv[av]){hd=(st==='dead'&&mn>iv[av]);}
-      }
-      cd.style.display=hd?'none':'';
-      if(hd)ah++;
-    }
-    var ab=pj.querySelector('[data-agent-badge]');
-    if(ab){ab.textContent=ah>0?('('+ah+' døde skjult)'):'';}
-
-    var ts=pj.querySelector('[data-task-filter]');
-    var tv=sa?'all':(localStorage.getItem('board:task_filter')||(ts?ts.value:'active'));
-    if(ts&&!sa)ts.value=tv;
-
-    var tr=pj.querySelectorAll('[data-task]');
-    var th=0;
-    for(var r=0;r<tr.length;r++){
-      var rw=tr[r];
-      var tst=rw.getAttribute('data-status');
-      var tmn=parseInt(rw.getAttribute('data-mins')||'0',10);
-      var thd=false;
-      if(!sa&&tv!=='all'){
-        if(tv==='active'){thd=(tst==='done');}
-        else if(tv==='in_flight'){thd=(tst!=='claimed'&&tst!=='in_review'&&tst!=='merging');}
-        else if(iv[tv]){thd=(tmn>iv[tv]);}
-      }
-      rw.style.display=thd?'none':'';
-      if(thd)th++;
-    }
-    var tb=pj.querySelector('[data-task-badge]');
-    if(tb){tb.textContent=th>0?('('+th+' skjult)'):'';}
-  }
-}
-
-var afs=document.querySelectorAll('[data-agent-filter]');
-for(var i=0;i<afs.length;i++){
-  afs[i].addEventListener('change',function(){
-    localStorage.setItem('board:agent_filter',this.value);
-    localStorage.setItem('board:show_all','0');
-    upd();
+/* the project you last had open comes back open */
+var pjs=document.querySelectorAll('.pj'),FK='board:focus',want=LS.g(FK,''),found;
+for(var i=0;i<pjs.length;i++){
+  if(pjs[i].dataset.p===want)found=pjs[i];
+  pjs[i].addEventListener('toggle',function(){
+    if(this.open)LS.s(FK,this.dataset.p);
+    else if(LS.g(FK,'')===this.dataset.p)LS.s(FK,'');
   });
 }
-var tfs=document.querySelectorAll('[data-task-filter]');
-for(var j=0;j<tfs.length;j++){
-  tfs[j].addEventListener('change',function(){
-    localStorage.setItem('board:task_filter',this.value);
-    localStorage.setItem('board:show_all','0');
-    upd();
+(found||pjs[0]||{}).open=true;
+
+/* links from a notification carry the filter with them */
+var qs=new URLSearchParams(window.location.search);
+if(qs.get('all')==='1'||qs.get('all')==='true')LS.s('board:all','1');
+else if(qs.has('all'))LS.s('board:all','0');
+if(qs.get('interval'))LS.s('board:age',qs.get('interval'));
+if(qs.get('status'))LS.s('board:status',qs.get('status'));
+
+function val(name,dflt){return LS.g('board:'+name,dflt);}
+
+function apply(){
+  var all=val('all','0')==='1';
+  var fp=val('project','all'),fs=val('status','active'),fa=val('age','all');
+  var sel=document.querySelectorAll('[data-f]');
+  for(var s=0;s<sel.length;s++){
+    var f=sel[s].getAttribute('data-f');
+    sel[s].value=f==='project'?fp:(f==='status'?fs:fa);
+  }
+  var b=document.getElementById('btn-show-all');
+  if(b){
+    b.textContent=all?'Filters off':'Show everything';
+    b.classList.toggle('badge-primary',all);
+    b.classList.toggle('badge-ghost',!all);
+  }
+  var hid=0,shown=0;
+  for(var p=0;p<pjs.length;p++){
+    var pj=pjs[p];
+    var offProject=!all&&fp!=='all'&&pj.dataset.p!==fp;
+    pj.style.display=offProject?'none':'';
+    var ci=pj.querySelector('[data-agent-cleanup]');
+    if(ci&&AGE[fa])ci.value=fa;
+
+    var ac=pj.querySelectorAll('[data-agent]'),ah=0;
+    for(var c=0;c<ac.length;c++){
+      var ag=ac[c],st=ag.getAttribute('data-status');
+      var mn=parseInt(ag.getAttribute('data-mins')||'0',10);
+      /* A dead agent is history, not fleet: it is hidden once it is older than the
+         window you are looking at, and a day is the window when you have not said.
+         Without that default one project here shows eighty-nine of them and the three
+         that are working scroll off the screen. A LIVE agent is never hidden by age. */
+      var off=false;
+      if(!all&&st==='dead')off=(mn>(AGE[fa]||1440));
+      ag.style.display=off?'none':'';
+      if(off)ah++;
+    }
+    var ab=pj.querySelector('[data-agent-badge]');
+    if(ab)ab.textContent=ah?('('+ah+' hidden)'):'';
+
+    var rows=pj.querySelectorAll('[data-task]'),th=0,open={};
+    for(var r=0;r<rows.length;r++){
+      var rw=rows[r],ts=rw.getAttribute('data-status');
+      var tm=parseInt(rw.getAttribute('data-mins')||'0',10),off2=false;
+      if(!all){
+        if(fs==='active')off2=(ts==='done'||ts==='archived');
+        else if(fs==='in_flight')off2=!FLY[ts];
+        else if(fs==='in_review')off2=(ts!=='in_review');
+        else if(fs==='stopped')off2=!STOP[ts];
+        else if(fs==='done')off2=(ts!=='done');
+        if(!off2&&AGE[fa])off2=(tm>AGE[fa]);
+      }
+      rw.style.display=off2?'none':'';
+      open[rw.id]=!off2;
+      if(off2)th++;else if(!offProject)shown++;
+    }
+    /* a question hangs under its task and goes wherever that row goes */
+    var kids=pj.querySelectorAll('[data-task-child]');
+    for(var k=0;k<kids.length;k++){
+      var on=open[kids[k].getAttribute('data-for')];
+      kids[k].style.display=on?'':'none';
+    }
+    var tb=pj.querySelector('[data-task-badge]');
+    if(tb)tb.textContent=th?('('+th+' hidden)'):'';
+    if(!offProject)hid+=th;
+  }
+  var out=document.querySelector('[data-rail-count]');
+  if(out)out.textContent=shown+' shown'+(hid?', '+hid+' hidden':'');
+}
+
+var fsel=document.querySelectorAll('[data-f]');
+for(var i2=0;i2<fsel.length;i2++){
+  fsel[i2].addEventListener('change',function(){
+    LS.s('board:'+this.getAttribute('data-f'),this.value);
+    LS.s('board:all','0');
+    apply();
   });
 }
 var sab=document.getElementById('btn-show-all');
-if(sab){
-  sab.addEventListener('click',function(e){
-    e.preventDefault();
-    var cur=localStorage.getItem('board:show_all')==='1';
-    localStorage.setItem('board:show_all',cur?'0':'1');
-    upd();
+if(sab)sab.addEventListener('click',function(e){
+  e.preventDefault();
+  LS.s('board:all',val('all','0')==='1'?'0':'1');
+  apply();
+});
+
+/* a control you changed is a control you meant to change: save it on release, so the
+   Set button beside it is the fallback and not the ritual */
+var auto=document.querySelectorAll('[data-autosave]');
+for(var a2=0;a2<auto.length;a2++){
+  auto[a2].addEventListener('change',function(){
+    if(this.form)this.form.submit();
   });
 }
-var cforms=document.querySelectorAll('form[data-confirm]');
-for(var k=0;k<cforms.length;k++){
-  cforms[k].addEventListener('submit',function(e){
-    if(!confirm(this.getAttribute('data-confirm'))){e.preventDefault();}
+/* the ceiling: the number follows the handle while you drag, the save happens when you
+   let go (change, not input — otherwise every pixel is a POST) */
+var rng=document.querySelectorAll('[data-ceiling]');
+for(var r2=0;r2<rng.length;r2++){
+  rng[r2].addEventListener('input',function(){
+    var o=this.parentNode.querySelector('[data-ceiling-out]');
+    if(o)o.textContent=this.value;
+    var tick=this.closest('.gauge').querySelector('.track > u');
+    if(tick){tick.style.left=Math.min(this.value,100)+'%';tick.setAttribute('data-c',this.value);}
+  });
+  rng[r2].addEventListener('change',function(){this.form.submit();});
+}
+
+var cf=document.querySelectorAll('form[data-confirm]');
+for(var k2=0;k2<cf.length;k2++){
+  cf[k2].addEventListener('submit',function(e){
+    if(!confirm(this.getAttribute('data-confirm')))e.preventDefault();
   });
 }
-upd();
+apply();
 })();
 """
 # The CSP lets no script-src in; the hash keeps it exactly as tight as before.
@@ -2301,7 +2539,7 @@ def agent_block(a, ceilings, human=False, project=None):
             rev = ("<form method='POST' action='/agents/%s/grants/revoke' class='inline m-0'>"
                    "<input type='hidden' name='grant' value='%s'>"
                    "<input type='hidden' name='project' value='%s'>"
-                   "<button type='submit' class='cursor-pointer ml-1 text-xs opacity-60 hover:opacity-100 hover:text-error' title='Trekk tilbake grant'>✕</button>"
+                   "<button type='submit' class='cursor-pointer ml-1 text-xs opacity-60 hover:opacity-100 hover:text-error' title='Take this grant back'>✕</button>"
                    "</form>" % (escape(a["id"]), escape(g), escape(project or "")))
         grants_badges.append("<span class='badge badge-sm badge-outline font-mono'>%s%s</span>" % (escape(g), rev))
     grants_html = "".join(grants_badges)
@@ -2309,9 +2547,9 @@ def agent_block(a, ceilings, human=False, project=None):
     if human:
         add_form = ("<form method='POST' action='/agents/%s/grants' class='m-0 flex items-center gap-1 mt-1'>"
                     "<input type='hidden' name='project' value='%s'>"
-                    "<input list='grants-list-%s' name='grant' placeholder='+ grant' class='rounded border border-base-300 bg-base-100 px-1.5 py-0.5 text-xs font-mono w-24'>"
+                    "<input list='grants-list-%s' name='grant' placeholder='add a grant' class='quiet font-mono w-28 text-xs'>"
                     "<datalist id='grants-list-%s'><option value='merge'><option value='deploy-dev'><option value='deploy-prod'></datalist>"
-                    "<button type='submit' class='badge badge-sm badge-primary cursor-pointer'>gi</button></form>"
+                    "<button type='submit' class='badge badge-sm badge-primary cursor-pointer'>Grant</button></form>"
                     % (escape(a["id"]), escape(project or ""), escape(a["id"]), escape(a["id"])))
     # A dead or stale agent stopped reporting — its ctx meter and ceiling line would
     # draw a precision (a percent, a tick mark) that is no longer true, and 12 of these on
@@ -2355,65 +2593,124 @@ def dash(v):
     return (escape(v), "") if v not in (None, "", "—") else ("—", " data-empty")
 
 
-def task_rows(p):
+def q_inline(q, answer=None):
+    """A question where it belongs: under the task it is about, in the queue, at that
+    task's place in the priority order.
+
+    It used to sit in its own block at the bottom of the project, which is the one place
+    it cannot be read in context — you saw that something was waiting on you, and then
+    had to go and find out which of forty tasks it was waiting on. The card at the bottom
+    survives for questions about no task at all; everything else is a child of its row."""
+    answered = ("<span class='badge badge-sm badge-warning'>answered by the board: %s</span>"
+                % escape(answer)) if answer is not None else ""
+    return ("<a class='qrow' href='/q/%s'>"
+            "<span class='%s text-xs'>%s</span>"
+            "<span class='max-w-[68ch]'>%s</span>%s</a>" % (
+                escape(q["id"]), MONO, escape(q["id"]), escape(q["text"] or ""), answered))
+
+
+TASK_COLS = ("pri", "id", "status", "size", "owner", "pr", "title")
+
+
+def prio_cell(t, human, back):
+    """Priority, and for the owner of the board a field to change it in.
+
+    A number rather than up/down arrows: the queue is sorted by it and forty tasks all
+    sitting on the default 50 need one of them set to 80, not nudged thirty times."""
+    v = int(t.get("priority") or 0)
+    if not human:
+        return "<span class='%s'>%d</span>" % (MONO, v)
+    return ("<form method='POST' action='/t/%s/patch' class='m-0'>"
+            "<input type='hidden' name='back' value='%s'>"
+            "<input class='cell-num %s' type='number' name='priority' value='%d' min='0' "
+            "max='100' step='5' data-autosave aria-label='priority for %s'>"
+            "<button type='submit' class='sr-only-btn'>Set</button></form>" % (
+                escape(t["id"]), escape(back), MONO, v, escape(t["id"])))
+
+
+def size_cell(t, human, back):
+    """Estimate and actual, side by side, because neither is worth much alone. The arrow
+    is the whole point of the column: it is read as "we thought 5, it has cost 12.4k"."""
+    c = cost_cell(t)
+    if not human:
+        return "%s%s" % (est_badge(t) or "<span class='%s'>—</span>" % DIM,
+                         (" <span class='%s'>%s</span>" % (DIM, c)) if c else "")
+    opts = "".join("<option value='%d'%s>%d</option>"
+                   % (e, " selected" if t.get("estimate") == e else "", e)
+                   for e in ESTIMATES)
+    return ("<form method='POST' action='/t/%s/patch' class='m-0 flex items-baseline gap-1'>"
+            "<input type='hidden' name='back' value='%s'>"
+            "<select class='cell-num %s' name='estimate' data-autosave aria-label='size of %s'>"
+            "<option value=''>–</option>%s</select>"
+            "<button type='submit' class='sr-only-btn'>Set</button>"
+            "<span class='%s'>%s</span></form>" % (
+                escape(t["id"]), escape(back), MONO, escape(t["id"]), opts, DIM, c))
+
+
+def task_row(t, human, back, questions=(), multirepo=False, hidden=False):
+    pn = pr_num(t.get("pr"))
+    pr_v, pr_e = dash("#" + pn if pn else None)
+    ow_v, ow_e = dash(t.get("owner"))
+    st = t.get("status") or "unknown"
+    mins = int(mins_since(t.get("updated") or t.get("created"))) if (t.get("updated") or t.get("created")) else 0
+    repo = ("<span class='%s text-xs'>%s</span> " % (DIM, escape(t["repo"]))
+            if multirepo and t.get("repo") else "")
+    h = ["<tr id='%s' data-task class='spine %s' data-status='%s' data-mins='%d' "
+         "data-est='%s'%s>"
+         "<td data-l=pri class='py-1.5 pl-3 pr-2 align-top whitespace-nowrap'>%s"
+         "<td data-l=id class='px-2 py-1.5 align-top whitespace-nowrap'>"
+         "<a class='%s %s' href='/t/%s'>%s</a>"
+         "<td data-l=status class='%s px-2 py-1.5 align-top whitespace-nowrap'>"
+         "<span class='badge badge-sm %s'>%s</span>"
+         "<td data-l=size class='px-2 py-1.5 align-top whitespace-nowrap'>%s"
+         "<td data-l=owner%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
+         "<td data-l=pr%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
+         "<td data-l=title class='px-2 py-1.5 align-top font-medium "
+         "[overflow-wrap:anywhere]'>%s%s" % (
+             escape(t["id"]), SPINE.get(st, ""), escape(st), mins,
+             escape(str(t.get("estimate") or "")),
+             " style='display:none;'" if hidden else "",
+             prio_cell(t, human, back),
+             LINK, MONO, escape(t["id"]), escape(t["id"]),
+             DIM, BADGE.get(st, "badge-ghost"), escape(st),
+             size_cell(t, human, back),
+             ow_e, DIM, MONO, ow_v,
+             pr_e, DIM, MONO, pr_v,
+             repo, escape(t.get("title") or ""))]
+    for q in questions:
+        h.append("<tr data-task-child data-for='%s' class='spine qchild'%s>"
+                 "<td colspan='%d' class='px-2 pb-2 pt-0'>%s" % (
+                     escape(t["id"]), " style='display:none;'" if hidden else "",
+                     len(TASK_COLS),
+                     q_inline(q, q["answer"] if q["status"] == "defaulted" else None)))
+    return "".join(h)
+
+
+def task_rows(p, human=False, back="/status"):
+    """The queue, in priority order, with each task's open questions hanging under it."""
+    by_task = {}
+    for q in p["questions"] + p["questions_defaulted"]:
+        if q.get("task"):
+            by_task.setdefault(q["task"], []).append(q)
+    multirepo = len({t.get("repo") for t in p["tasks"] if t.get("repo")}) > 1
     h = ["<div class='min-w-0 overflow-x-auto'><table class='tasks w-full text-sm'>"
-         "<thead><tr class='%s text-xs'><th class='py-1 pl-3 pr-2 text-left font-semibold'>id"
+         "<thead><tr class='%s text-xs'>"
+         "<th class='py-1 pl-3 pr-2 text-left font-semibold'>pri"
+         "<th class='px-2 py-1 text-left font-semibold'>id"
          "<th class='px-2 py-1 text-left font-semibold'>status"
-         "<th class='px-2 py-1 text-left font-semibold'>pr"
-         "<th class='px-2 py-1 text-left font-semibold'>repo"
+         "<th class='px-2 py-1 text-left font-semibold'>size"
          "<th class='px-2 py-1 text-left font-semibold'>owner"
+         "<th class='px-2 py-1 text-left font-semibold'>pr"
          "<th class='px-2 py-1 text-left font-semibold'>title</thead><tbody>" % DIM]
     for t in p["tasks"]:
-        pn = pr_num(t.get("pr"))
-        pr_v, pr_e = dash("#" + pn if pn else None)
-        rp_v, rp_e = dash(t["repo"])
-        ow_v, ow_e = dash(t["owner"])
-        st = t.get("status") or "unknown"
-        mins = int(mins_since(t.get("updated") or t.get("created"))) if (t.get("updated") or t.get("created")) else 0
-        h.append("<tr id='%s' data-task class='spine %s' data-status='%s' data-mins='%d'>"
-                 "<td data-l=id class='py-1.5 pl-3 pr-2 align-top whitespace-nowrap'>"
-                 "<a class='%s %s' href='/t/%s'>%s</a>"
-                 "<td data-l=status class='%s px-2 py-1.5 align-top whitespace-nowrap'>"
-                 "<span class='badge badge-sm %s'>%s</span>"
-                 "<td data-l=pr%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-                 "<td data-l=repo%s class='%s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-                 "<td data-l=owner%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-                 "<td data-l=title class='px-2 py-1.5 align-top font-medium "
-                 "[overflow-wrap:anywhere]'>%s" % (
-                     escape(t["id"]), SPINE.get(t["status"], ""), escape(st), mins,
-                     LINK, MONO,
-                     escape(t["id"]), escape(t["id"]),
-                     DIM, BADGE.get(t["status"], "badge-ghost"), escape(t["status"]),
-                     pr_e, DIM, MONO, pr_v,
-                     rp_e, DIM, rp_v,
-                     ow_e, DIM, MONO, ow_v,
-                     escape(t["title"] or "")))
-    recent_done = [brief(t) for t in db.execute(
-        "SELECT * FROM tasks WHERE project=? AND status='done' ORDER BY updated DESC LIMIT 30", (p["name"],))]
-    for t in recent_done:
-        pn = pr_num(t.get("pr"))
-        pr_v, pr_e = dash("#" + pn if pn else None)
-        rp_v, rp_e = dash(t["repo"])
-        ow_v, ow_e = dash(t["owner"])
-        mins = int(mins_since(t.get("updated") or t.get("created"))) if (t.get("updated") or t.get("created")) else 0
-        h.append("<tr id='%s' data-task class='spine spine-land' data-status='done' data-mins='%d' style='display:none;'>"
-                 "<td data-l=id class='py-1.5 pl-3 pr-2 align-top whitespace-nowrap'>"
-                 "<a class='%s %s' href='/t/%s'>%s</a>"
-                 "<td data-l=status class='%s px-2 py-1.5 align-top whitespace-nowrap'>"
-                 "<span class='badge badge-sm %s'>%s</span>"
-                 "<td data-l=pr%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-                 "<td data-l=repo%s class='%s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-                 "<td data-l=owner%s class='%s %s px-2 py-1.5 align-top whitespace-nowrap'>%s"
-                 "<td data-l=title class='px-2 py-1.5 align-top font-medium "
-                 "[overflow-wrap:anywhere]'>%s" % (
-                     escape(t["id"]), mins,
-                     LINK, MONO,
-                     escape(t["id"]), escape(t["id"]),
-                     DIM, BADGE.get("done", "badge-ghost"), "done",
-                     pr_e, DIM, MONO, pr_v,
-                     rp_e, DIM, rp_v,
-                     ow_e, DIM, MONO, ow_v,
-                     escape(t["title"] or "")))
+        h.append(task_row(t, human, back, by_task.get(t["id"], ()), multirepo))
+    # Done tasks are rendered but hidden: "what did the fleet land today" is one filter
+    # away rather than one page load away, and the row is already paid for.
+    costs = task_costs(p["name"])
+    for t in db.execute("SELECT * FROM tasks WHERE project=? AND status='done' "
+                        "ORDER BY updated DESC LIMIT 30", (p["name"],)):
+        h.append(task_row(dict(brief(t), cost=costs.get(t["id"])), human, back,
+                          (), multirepo, hidden=True))
     h.append("</tbody></table></div>")
     return "".join(h)
 
@@ -2437,17 +2734,100 @@ def q_card(q, answer=None):
                 escape(q["text"] or "")))
 
 
+def rail(s):
+    """One filter bar for the whole board, not one per project.
+
+    Every project used to carry its own pair of selects, so "show me everything blocked"
+    meant setting the same filter four times and the answer was still four separate
+    lists. The rail is sticky because the board is scrolled, and the thing you are
+    filtering is below the fold by the second project."""
+    projects = "".join("<option value='%s'>%s</option>" % (escape(p["name"]), escape(p["name"]))
+                       for p in s["projects"])
+    return ("<div class='rail' role='group' aria-label='filters'>"
+            "<label class='f'><span class='%s'>Project</span>"
+            "<select data-f='project'><option value='all'>All</option>%s</select></label>"
+            "<label class='f'><span class='%s'>Status</span>"
+            "<select data-f='status'>"
+            "<option value='active'>Active and open</option>"
+            "<option value='in_flight'>In flight</option>"
+            "<option value='in_review'>Waiting for review</option>"
+            "<option value='stopped'>Blocked or unowned</option>"
+            "<option value='done'>Landed</option>"
+            "<option value='all'>Everything</option></select></label>"
+            "<label class='f'><span class='%s'>Changed</span>"
+            "<select data-f='age'><option value='all'>Any time</option>"
+            "<option value='1h'>Last hour</option>"
+            "<option value='24h'>Last 24 hours</option>"
+            "<option value='7d'>Last 7 days</option></select></label>"
+            "<button type='button' id='btn-show-all' class='badge badge-sm badge-ghost "
+            "cursor-pointer font-sans select-none' "
+            "title='Ignore the filters and show every row'>Show everything</button>"
+            "<span data-rail-count class='%s ml-auto text-xs'></span></div>" % (
+                DIM, projects, DIM, DIM, DIM))
+
+
+def phase_control(p, human):
+    if not human:
+        return "<span class='badge badge-sm badge-ghost'>%s</span>" % escape(p["phase"])
+    opts = "".join("<option value='%s'%s>%s</option>"
+                   % (ph, " selected" if ph == p["phase"] else "", ph) for ph in PHASES)
+    return ("<form method='POST' action='/projects/%s/phase' class='m-0 inline-flex'>"
+            "<input type='hidden' name='project' value='%s'>"
+            "<select name='phase' class='pill' data-autosave aria-label='phase'>%s</select>"
+            "<button type='submit' class='sr-only-btn'>Set</button></form>" % (
+                escape(p["name"]), escape(p["name"]), opts))
+
+
+def limits_block(p, human):
+    """The two numbers the owner sets: how far the fleet may spend, and how much finished
+    work may wait for review before production stops.
+
+    Both used to live only in board-policy.json on the host. That file is deliberately
+    never deployed, which made it the right place for them and the wrong place to reach
+    at three in the morning from a phone."""
+    b = p.get("budget") or {}
+    ceilings = {win_name(k): float(v or 0) for k, v in (b.get("ceilings") or {}).items()}
+    used = {}
+    for a in p["agents"]:
+        for w, pct in windows_of(a).items():
+            used[w] = max(used.get(w, 0.0), pct)
+    windows = sorted(set(list(ceilings) + list(used)) or {"5h", "7d"})
+    rows = "<div class='grid gap-2.5'>%s</div>" % "".join(
+        gauge(w, used.get(w), ceilings.get(w), p["name"], human) for w in windows)
+    src = {"board": "set here", "policy": "from board-policy.json",
+           "none": "not set"}.get(b.get("source"), "")
+    wip = int(p.get("wip") or 0)
+    unrev = int(p.get("unreviewed") or 0)
+    if human:
+        wip_ctl = ("<form method='POST' action='/projects/%s/ceilings' class='m-0 flex items-baseline gap-1'>"
+                   "<input type='hidden' name='project' value='%s'>"
+                   "<input class='cell-num %s' type='number' name='wip' min='1' max='99' "
+                   "value='%d' data-autosave aria-label='review limit'>"
+                   "<button type='submit' class='sr-only-btn'>Set</button>"
+                   "</form>" % (escape(p["name"]), escape(p["name"]), MONO, wip))
+    else:
+        wip_ctl = "<span class='%s'>%d</span>" % (MONO, wip)
+    return ("<div class='mt-6'>"
+            "<div class='mb-2 flex flex-wrap items-baseline gap-x-2'>"
+            "<p class='m-0 text-sm text-base-content/60'>ceilings</p>"
+            "<span class='%s text-xs'>%s</span></div>%s"
+            "<div class='mt-3 flex flex-wrap items-baseline gap-2 text-sm'>"
+            "<span class='%s'>waiting for review</span>"
+            "<span class='%s'>%d of</span>%s</div></div>" % (
+                DIM, escape(src), rows, DIM, MONO, unrev, wip_ctl))
+
+
 def html_status(project, token="", human=False):
     s = status(project)
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
-        MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")),
-        (), human, show_all_btn=True)]
+        MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")), (), human)]
     if s.get("ntfy_failures_since_success", 0) > 0:
         fails = s["ntfy_failures_since_success"]
         h.append("<div class='mt-4 rounded-box border border-l-4 border-base-300 "
                  "border-l-error bg-base-200 p-3 text-sm'>"
-                 "<b class='font-semibold text-error'>ntfy push failed:</b> %d %s failed since last success. "
-                 "Check notification server / ntfy settings.</div>" % (
+                 "<b class='font-semibold text-error'>Push notifications are failing:</b> "
+                 "%d %s have not gone out since the last one that did. Check NTFY_URL and "
+                 "the topic's credentials.</div>" % (
                      fails, "push" if fails == 1 else "pushes"))
     if not s["projects"]:
         h.append("<div class='mt-8 rounded-box border border-dashed border-base-300 "
@@ -2457,7 +2837,9 @@ def html_status(project, token="", human=False):
         return page("board", "".join(h))
     h.append(watchline(s))
     h.append(fleet_runway(s))
-    h.append("<div class='mt-8'>")
+    h.append(rail(s))
+    back = "/status?project=" + urllib.parse.quote(project) if project else "/status"
+    h.append("<div class='mt-2'>")
     for p in sorted(s["projects"], key=last_activity, reverse=True):
         pause = ("<span class='badge badge-sm badge-error'>paused: %s</span>"
                  % escape(p["paused"])) if p.get("paused") else ""
@@ -2466,12 +2848,13 @@ def html_status(project, token="", human=False):
             if p.get("paused"):
                 pause_btn = ("<form method='POST' action='/projects/%s/resume' class='inline m-0'>"
                              "<input type='hidden' name='project' value='%s'>"
-                             "<button type='submit' class='badge badge-sm badge-success cursor-pointer'>▶ gjenoppta</button></form>"
+                             "<button type='submit' class='badge badge-sm badge-success cursor-pointer'>Resume</button></form>"
                              % (escape(p["name"]), escape(p["name"])))
             else:
-                pause_btn = ("<form method='POST' action='/projects/%s/pause' class='inline m-0' data-confirm='Pause prosjektet (draining)?'>"
+                pause_btn = ("<form method='POST' action='/projects/%s/pause' class='inline m-0' "
+                             "data-confirm='Pause the project? Agents finish what they hold and take nothing new.'>"
                              "<input type='hidden' name='project' value='%s'>"
-                             "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' title='Pause prosjekt'>⏸ pause</button></form>"
+                             "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer'>Pause</button></form>"
                              % (escape(p["name"]), escape(p["name"])))
         h.append("<details class='pj border-t-2 border-base-300 last-of-type:border-b-2' "
                  "data-p='%s'><summary class='grid cursor-pointer list-none "
@@ -2480,10 +2863,11 @@ def html_status(project, token="", human=False):
                  "[&::-webkit-details-marker]:hidden'>"
                  "<span class='mark %s select-none' aria-hidden=true></span>"
                  "<h2 class='text-base font-semibold'>%s</h2>"
-                 "<span class='badge badge-sm badge-ghost'>%s</span>"
-                 "<span class='max-sm:col-start-2 max-sm:col-end-[-1] "
+                 "<span>%s</span>"
+                 "<span class='flex flex-wrap items-baseline justify-end gap-x-3 gap-y-1 "
+                 "max-sm:col-start-2 max-sm:col-end-[-1] "
                  "max-sm:justify-start'>%s%s%s</span></summary>" % (
-                     escape(p["name"]), DIM, escape(p["name"]), escape(p["phase"]),
+                     escape(p["name"]), DIM, escape(p["name"]), phase_control(p, human),
                      tell(p), (" " + pause) if pause else "", (" " + pause_btn) if pause_btn else ""))
         h.append("<div class='pb-4'>")
         if p.get("goal"):
@@ -2492,65 +2876,130 @@ def html_status(project, token="", human=False):
             h.append("<p class='mt-2 rounded-box border border-l-4 border-base-300 "
                      "border-l-error bg-base-200 p-3 text-sm'>%s</p>"
                      % escape(p["budget"]["note"]))
-        ceilings = {win_name(k): float(v or 0)
-                    for k, v in ((p.get("budget") or {}).get("ceilings") or {}).items()}
         h.append("<div class='pane mt-2'><section class='min-w-0'>")
         h.append("<div class='mt-6 mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>"
                  "<div class='flex items-center gap-1'>"
-                 "<p class='text-sm text-base-content/60 m-0'>agents</p>"
+                 "<p class='text-sm text-base-content/60 m-0'>fleet</p>"
                  "<span data-agent-badge class='text-xs text-base-content/60'></span></div>"
                  "<div class='ml-auto flex items-center gap-1'>"
-                 "<select data-agent-filter class='rounded border border-base-300 bg-base-100 px-2 py-1 text-xs font-sans cursor-pointer' data-project='%s'>"
-                 "<option value='active'>Kun aktive</option>"
-                 "<option value='1h'>&lt; 1 time</option>"
-                 "<option value='24h' selected>&lt; 24 timer</option>"
-                 "<option value='7d'>&lt; 7 dager</option>"
-                 "<option value='all'>Vis alle</option></select>"
-                 "<form method='POST' action='/agents/cleanup' class='m-0 flex items-center' data-confirm='Rydd opp døde agenter?'>"
+                 "<form method='POST' action='/agents/cleanup' class='m-0 flex items-center' "
+                 "data-confirm='Mark every agent that has been dead for a day as finished?'>"
                  "<input type='hidden' name='project' value='%s'>"
                  "<input type='hidden' name='older_than' value='24h' data-agent-cleanup>"
-                 "<button type='submit' class='badge badge-sm badge-error cursor-pointer' title='Merk døde agenter som ferdige'>rydd opp</button>"
-                 "</form></div></div>" % (escape(p["name"]), escape(p["name"])))
+                 "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
+                 "title='Mark dead agents as finished'>Clear out dead agents</button>"
+                 "</form></div></div>" % escape(p["name"]))
         if not p["agents"]:
-            h.append("<p class='%s text-sm'>No agents are registered here yet.</p>" % DIM)
+            h.append("<p class='%s text-sm'>No agent has registered here yet. Run "
+                     "<code class='rounded bg-base-200 px-1 font-mono'>/next</code> in the "
+                     "project to start one.</p>" % DIM)
+        ceilings = {win_name(k): float(v or 0)
+                    for k, v in ((p.get("budget") or {}).get("ceilings") or {}).items()}
         for a in p["agents"]:
             h.append(agent_block(a, ceilings, human=human, project=p["name"]))
+        h.append(limits_block(p, human))
         h.append("</section><section class='min-w-0'>")
         h.append("<div class='mt-6 mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>"
                  "<div class='flex items-center gap-1'>"
-                 "<p class='text-sm text-base-content/60 m-0'>tasks</p>"
+                 "<p class='text-sm text-base-content/60 m-0'>queue</p>"
                  "<span data-task-badge class='text-xs text-base-content/60'></span></div>"
                  "<div class='ml-auto flex items-center gap-1'>"
-                 "<select data-task-filter class='rounded border border-base-300 bg-base-100 px-2 py-1 text-xs font-sans cursor-pointer' data-project='%s'>"
-                 "<option value='active' selected>Aktive &amp; åpne</option>"
-                 "<option value='in_flight'>I arbeid</option>"
-                 "<option value='24h'>Endret &lt; 24t</option>"
-                 "<option value='7d'>Endret &lt; 7d</option>"
-                 "<option value='all'>Vis alle</option></select>"
-                 "<form method='POST' action='/tasks/cleanup' class='m-0 flex items-center' data-confirm='Arkiver fullførte oppgaver?'>"
+                 "<form method='POST' action='/tasks/cleanup' class='m-0 flex items-center' "
+                 "data-confirm='Archive every task that is already done?'>"
                  "<input type='hidden' name='project' value='%s'>"
-                 "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' title='Arkiver fullførte oppgaver'>arkiver ferdige</button>"
-                 "</form></div></div>" % (escape(p["name"]), escape(p["name"])))
+                 "<button type='submit' class='badge badge-sm badge-ghost cursor-pointer' "
+                 "title='Archive tasks that are done'>Archive landed work</button>"
+                 "</form></div></div>" % escape(p["name"]))
         if not p["tasks"]:
-            h.append("<p class='%s text-sm'>The queue is empty.</p>" % DIM)
+            h.append("<p class='%s text-sm'>The queue is empty. Add the next piece of work "
+                     "with <code class='rounded bg-base-200 px-1 font-mono'>board task create"
+                     "</code>.</p>" % DIM)
         else:
-            h.append(task_rows(p))
+            h.append(task_rows(p, human, back))
         h.append("</section></div>")
-        # The questions sit OUTSIDE the panel, at full width: this is the human's own
-        # surface, and it must not be squeezed into the right column with empty space
-        # beside it.
-        if p["questions"]:
+        # A question about no particular task has no row to hang under, so it keeps the
+        # card it always had — at full width, because this is the human's own surface.
+        loose = [q for q in p["questions"] if not q.get("task")]
+        loose_d = [q for q in p["questions_defaulted"] if not q.get("task")]
+        if loose:
             h.append("<p class='%s'>waiting for an answer from you</p>" % LBL)
+            h.append("<div class=qgrid>%s</div>" % "".join(q_card(q) for q in loose))
+        if loose_d:
+            h.append("<p class='%s'>the board answered itself — you can still override it</p>" % LBL)
             h.append("<div class=qgrid>%s</div>"
-                     % "".join(q_card(q) for q in p["questions"]))
-        if p["questions_defaulted"]:
-            h.append("<p class='%s'>the board answered itself — can be overridden</p>" % LBL)
-            h.append("<div class=qgrid>%s</div>"
-                     % "".join(q_card(q, q["answer"] or "") for q in p["questions_defaulted"]))
+                     % "".join(q_card(q, q["answer"] or "") for q in loose_d))
         h.append("</div></details>")
     h.append("</div>")
     h.append(FOCUS)
     return page("board", "".join(h))
+
+
+def cost_block(d):
+    """What the task has cost so far, and who spent it.
+
+    The estimate is shown against it on purpose: side by side they are a measurement of
+    the estimator, which is the only reason a relative size is worth writing down. A
+    dispatch still missing its token count is named rather than quietly dropped — the
+    sum would otherwise read as a total when it is a floor."""
+    ds = d.get("dispatches") or []
+    c = d.get("cost") or {}
+    if not ds:
+        return ("<p class='%s text-sm'>No subagent has reported a cost on this task yet. "
+                "The coordinator records one with "
+                "<code class='rounded bg-base-200 px-1 font-mono'>board task progress "
+                "--dispatch role:model --tokens N</code>.</p>" % DIM)
+    rows = "".join(
+        "<tr><td class='%s py-1 pr-3 align-top whitespace-nowrap text-xs'>%s"
+        "<td class='py-1 pr-3 align-top'>%s<td class='%s py-1 pr-3 align-top'>%s"
+        "<td class='%s py-1 pr-3 align-top text-right whitespace-nowrap'>%s"
+        "<td class='%s py-1 align-top'>%s" % (
+            MONO + " " + DIM, escape((x.get("ts") or "")[:16].replace("T", " ")),
+            escape(x.get("role") or ""), MONO, escape(x.get("model") or ""),
+            MONO, toks(x["tokens"]) if x.get("tokens") is not None else "—",
+            DIM, escape(x.get("result") or ""))
+        for x in ds)
+    est = d.get("estimate")
+    per = ""
+    if est and c.get("tokens") and c.get("complete"):
+        per = " <span class='%s'>%s per point</span>" % (DIM, toks(c["tokens"] / float(est)))
+    total = ("<p class='mt-2 text-sm'><b class='%s font-semibold'>%s</b> tokens over %d "
+             "%s%s%s</p>" % (
+                 MONO, toks(c.get("tokens")), c.get("dispatches", 0),
+                 "dispatch" if c.get("dispatches") == 1 else "dispatches",
+                 "" if c.get("complete") else
+                 " <span class='text-warning'>— at least one has not reported its tokens, "
+                 "so this is a floor</span>", per))
+    return ("<div class='min-w-0 overflow-x-auto'><table class='w-full text-sm'>"
+            "<thead><tr class='%s text-xs'><th class='py-1 pr-3 text-left font-semibold'>when"
+            "<th class='py-1 pr-3 text-left font-semibold'>role"
+            "<th class='py-1 pr-3 text-left font-semibold'>model"
+            "<th class='py-1 pr-3 text-right font-semibold'>tokens"
+            "<th class='py-1 text-left font-semibold'>result</thead>"
+            "<tbody>%s</tbody></table></div>%s" % (DIM, rows, total))
+
+
+def task_controls(d, human):
+    """The two things you do to a task from outside it: take it back, or put it away.
+
+    Both refuse for an agent that does not own the task, and both go through for the
+    owner of the board — a task held by an agent that has stopped moving is exactly the
+    case a person is looking at this page to fix."""
+    if not human:
+        return ""
+    tid = escape(d["id"])
+    rel = ("<form method='POST' action='/t/%s/release' class='m-0' "
+           "data-confirm='Put this task back in the queue? Whoever holds it loses it.'>"
+           "<input type='hidden' name='back' value='/t/%s'>"
+           "<button type='submit' class='btn btn-outline min-h-10'>Put back in the queue</button>"
+           "</form>" % (tid, tid)) if d.get("status") not in ("done", "archived") else ""
+    arc = ("<form method='POST' action='/t/%s/archive' class='m-0' "
+           "data-confirm='Archive this task? It leaves the board and the queue.'>"
+           "<input type='hidden' name='back' value='/status'>"
+           "<button type='submit' class='btn btn-outline min-h-10'>Archive</button></form>"
+           % tid) if d.get("status") != "archived" else ""
+    if not (rel or arc):
+        return ""
+    return "<div class='mt-4 flex flex-wrap gap-3'>%s%s</div>" % (rel, arc)
 
 
 def html_task(tid, token="", human=False):
@@ -2564,9 +3013,17 @@ def html_task(tid, token="", human=False):
     rev = "—"
     if d.get("review_open") is not None or d.get("review_fixed") is not None:
         rev = "%s open / %s fixed" % (d.get("review_open") or 0, d.get("review_fixed") or 0)
-    # status already stands as a badge in the heading, and must not be repeated here.
+    est = d.get("estimate")
+    est_h = "%s%s" % (
+        ("<span class='%s'>%s</span>" % (MONO, est)) if est else "—",
+        (" <span class='%s'>estimated by %s</span>" % (DIM, escape(d.get("estimate_model") or
+                                                                   d.get("estimate_by") or "")))
+        if est and (d.get("estimate_model") or d.get("estimate_by")) else "")
+    back = "/t/" + urllib.parse.quote(d["id"])
     facts = (("phase", escape(d.get("phase") or "—")),
              ("risk", escape(d.get("risk") or "—")),
+             ("priority", prio_cell(d, human, back)),
+             ("size", size_cell(d, human, back) if human else est_h),
              ("owner", owner_h),
              ("repo", escape(d.get("repo") or "—")),
              ("branch", "<span class='%s'>%s</span>" % (MONO, escape(d.get("branch") or "—"))),
@@ -2592,7 +3049,7 @@ def html_task(tid, token="", human=False):
                 (" — %s" % escape(e["note"])) if e.get("note") else ""))
     tl = ("<ul class='trail mt-1 list-none border-b border-base-300 p-0 text-sm'>%s</ul>"
           % "".join(evs) if evs else
-          "<p class='%s text-sm'>No events yet.</p>" % DIM)
+          "<p class='%s text-sm'>Nothing has happened here yet.</p>" % DIM)
     oa = d.get("owner_agent")
     if oa:
         ab = ("<div class='border-t border-base-300 py-2.5'>"
@@ -2612,25 +3069,28 @@ def html_task(tid, token="", human=False):
                           for w, pct in sorted((oa.get("budget") or {}).items())),
                   MONO, DIM, escape(oa.get("last_seen") or "—")))
     else:
-        ab = "<p class='%s text-sm'>No owner.</p>" % DIM
+        ab = "<p class='%s text-sm'>Nobody holds this task.</p>" % DIM
     return page(d["id"], """%s
         <h2 class='mt-5 max-w-[68ch] text-lg font-semibold leading-snug sm:text-2xl'>%s</h2>
         <dl class='mt-4 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 border-t
           border-base-300 pt-3 text-sm sm:grid-cols-[auto_minmax(0,1fr)_auto_minmax(0,1fr)]'>%s</dl>
+        %s
+        <p class='%s'>what it has cost</p>%s
         <p class='%s'>timeline</p>%s
         <p class='%s'>the owner's state</p>%s
         <form class='mt-6 max-w-[42rem]' method=post action='/t/%s/comment'>
           <label class='%s' for=comment>Add a comment</label>
           <input id=comment class='input w-full' type=text name=text
             placeholder='what you saw, or what the agent should do next'>
-          <button class='btn btn-primary mt-3 min-h-12'>Comment</button>
-        </form>""" % (
+          <button class='btn btn-primary mt-3 min-h-12'>Add comment</button>
+        </form>%s""" % (
         head(d["id"], "<span class='badge badge-sm %s'>%s</span>" % (
             BADGE.get(st, "badge-ghost"), escape(st)), human=human),
         escape(d.get("title") or ""),
         "".join("<dt class='%s'>%s<dd class='m-0 [overflow-wrap:anywhere]'>%s" % (DIM, k, v)
                 for k, v in facts),
-        LBL, tl, LBL, ab, escape(d["id"]), LBL))
+        task_controls(d, human),
+        LBL, cost_block(d), LBL, tl, LBL, ab, escape(d["id"]), LBL, FOCUS))
 
 
 def html_question(qid, token="", human=False):
@@ -2699,7 +3159,7 @@ ROUTES = [
         ("GET",    r"/routines$",                   lambda h, m, b, q: routine_list(q)),
     ("GET",    r"/tasks$",                      lambda h, m, b, q: task_list(q)),
     ("GET",    r"/tasks/([^/]+)$",              lambda h, m, b, q: task_show(m[0])),
-    ("PATCH",  r"/tasks/([^/]+)$",              lambda h, m, b, q: task_patch(m[0], actor(q, b), b)),
+    ("PATCH",  r"/tasks/([^/]+)$",              lambda h, m, b, q: task_patch(m[0], actor_h(q, b), b)),
     ("POST",   r"/tasks/([^/]+)/claim$",        lambda h, m, b, q: task_claim(m[0], actor(q, b))),
     ("POST",   r"/tasks/([^/]+)/progress$",     lambda h, m, b, q: task_progress(m[0], actor(q, b), b)),
     ("POST",   r"/tasks/([^/]+)/blocked$",      lambda h, m, b, q: task_blocked(m[0], actor(q, b), b)),
@@ -2710,11 +3170,11 @@ ROUTES = [
     ("POST",   r"/tasks/([^/]+)/comment$",     lambda h, m, b, q: task_comment(m[0], b)),
     ("POST",   r"/tasks/([^/]+)/deployed$",   lambda h, m, b, q: task_deployed(m[0], actor(q, b), b)),
     ("POST",   r"/tasks/([^/]+)/done$",         lambda h, m, b, q: task_done(m[0], actor(q, b), b)),
-    ("POST",   r"/tasks/([^/]+)/archive$",      lambda h, m, b, q: task_archive(m[0], actor(q, b), b)),
+    ("POST",   r"/tasks/([^/]+)/archive$",      lambda h, m, b, q: task_archive(m[0], actor_h(q, b), b)),
     ("POST",   r"/tasks/cleanup$",              lambda h, m, b, q: tasks_cleanup(
         (b or {}).get("project") or q.get("project", [None])[0],
         (b or {}).get("older_than") or q.get("older_than", ["0"])[0], b)),
-    ("POST",   r"/tasks/([^/]+)/release$",      lambda h, m, b, q: release(m[0], actor(q, b), b)),
+    ("POST",   r"/tasks/([^/]+)/release$",      lambda h, m, b, q: release(m[0], actor_h(q, b), b)),
     ("POST",   r"/questions$",                  lambda h, m, b, q: question_create(b, actor(q, b))),
     ("GET",    r"/questions$",                  lambda h, m, b, q: {"questions": [
         # 'defaulted' is still overridable by a human — it must not disappear from this
@@ -2735,10 +3195,70 @@ ROUTES = [
     ("POST",   r"/reap$",                       lambda h, m, b, q: reap()),
     ("POST",   r"/projects/([^/]+)/pause$",    lambda h, m, b, q: set_paused(m[0], b, True)),
     ("POST",   r"/projects/([^/]+)/resume$",   lambda h, m, b, q: set_paused(m[0], b, False)),
+    ("POST",   r"/projects/([^/]+)/ceilings$", lambda h, m, b, q: set_ceilings(m[0], b)),
+    ("POST",   r"/projects/([^/]+)/phase$",    lambda h, m, b, q: set_phase(m[0], b)),
     ("GET",    r"/status$",                     lambda h, m, b, q: status(q.get("project", [None])[0])),
     ("GET",    r"/events$",                     lambda h, m, b, q: events(q)),
 ]
 ROUTES = [(mth, re.compile("^" + API + pat), fn) for mth, pat, fn in ROUTES]
+
+
+def back_to(b, dflt):
+    """Where a form on the board returns to.
+
+    Every control exists on more than one page now — a priority can be changed from the
+    queue and from the task itself — and coming back to the wrong one costs a scroll and
+    a lost place in a list of forty tasks. The page says where it was; the server refuses
+    anything that is not a path on this board, so `back` cannot be turned into an open
+    redirect by a link somebody was sent."""
+    v = (b or {}).get("back") or ""
+    if v.startswith("/") and not v.startswith("//") and "\\" not in v:
+        return v
+    return dflt
+
+
+def proj_back(b, res):
+    p = (b or {}).get("project") or (res or {}).get("project")
+    return back_to(b, "/" if not p else "/status?project=" + urllib.parse.quote(p))
+
+
+# The pages POST here. Same handlers as the API, but the reply is a redirect to the page
+# the press came from, because the caller is a form in a browser and not a client that
+# reads JSON. A table, because this was eight copies of the same six lines and every new
+# control meant a ninth — which is how the grant form ended up being the only control on
+# the board for a year.
+UI_POST = [
+    (r"/agents/cleanup$",
+     lambda m, b, q: agents_cleanup(b.get("project"), b.get("older_than", "24h"), b), proj_back),
+    (r"/tasks/cleanup$",
+     lambda m, b, q: tasks_cleanup(b.get("project"), b.get("older_than", "0"), b), proj_back),
+    (r"/agents/([^/]+)/grants$",
+     lambda m, b, q: agent_grant_add(m.group(1), b), proj_back),
+    (r"/agents/([^/]+)/grants/revoke$",
+     lambda m, b, q: agent_grant_del(m.group(1), (b or {}).get("grant"), b, q), proj_back),
+    (r"/projects/([^/]+)/pause$",
+     lambda m, b, q: set_paused(m.group(1), b, True), proj_back),
+    (r"/projects/([^/]+)/resume$",
+     lambda m, b, q: set_paused(m.group(1), b, False), proj_back),
+    (r"/projects/([^/]+)/ceilings$",
+     lambda m, b, q: set_ceilings(m.group(1), b), proj_back),
+    (r"/projects/([^/]+)/phase$",
+     lambda m, b, q: set_phase(m.group(1), b), proj_back),
+    (r"/roles/([^/]+)/pin$",
+     lambda m, b, q: role_pin(b["project"], m.group(1), b["agent"], HUMAN, b), proj_back),
+    (r"/roles/([^/]+)/unpin$",
+     lambda m, b, q: role_unpin(b["project"], m.group(1), b), proj_back),
+    (r"/t/([^/]+)/patch$",
+     lambda m, b, q: task_patch(m.group(1), actor_h(q, b), b),
+     lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
+    (r"/t/([^/]+)/release$",
+     lambda m, b, q: dict(release(m.group(1), actor_h(q, b), b), id=m.group(1)),
+     lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
+    (r"/t/([^/]+)/archive$",
+     lambda m, b, q: dict(task_archive(m.group(1), actor_h(q, b), b), id=m.group(1)),
+     lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
+]
+UI_POST = [(re.compile("^" + pat), fn, loc) for pat, fn, loc in UI_POST]
 
 
 def actor(q, b):
@@ -2746,6 +3266,21 @@ def actor(q, b):
     if not a:
         raise Err(400, "agent is missing (set BOARD_AGENT_ID)")
     return a
+
+
+def actor_h(q, b):
+    """Like actor(), for the calls a person can make as themselves.
+
+    The human token is an identity, not a permission bit: the owner pressing a button on
+    the board has no BOARD_AGENT_ID and never will. Falling back to HUMAN here is what
+    lets one handler serve both the agent's API call and the form on the phone, with the
+    identity written into the event log either way."""
+    a = (b or {}).get("agent") or q.get("agent", [None])[0]
+    if a:
+        return a
+    if as_human(b or {}):
+        return HUMAN
+    raise Err(400, "agent is missing (set BOARD_AGENT_ID)")
 
 
 def as_human(b):
@@ -2757,7 +3292,9 @@ def human_only(b, what):
     if not as_human(b):
         raise Err(403, "%s requires the human token (BOARD_HUMAN_TOKEN). An agent cannot "
                        "act as %s — that is the entire point of §3.7." % (what, HUMAN),
-                  needs_human_token=True)
+                  # `what` on its own, so the refusal PAGE can name the action in a
+                  # sentence of its own instead of quoting a paragraph about tokens.
+                  needs_human_token=True, action=what)
 
 
 def set_paused(project, b, on):
@@ -2770,6 +3307,73 @@ def set_paused(project, b, on):
         ntfy("⏸ %s paused" % project, b.get("note") or "the agents are draining",
              "%s/status" % BASE_URL)
     return {"project": project, "paused": val}
+
+
+def set_ceilings(project, b):
+    """Move a quota ceiling, or the review limit, from the board itself.
+
+    Human-only, and that is the whole design: DESIGN.md §3.7 and CONTRIBUTING.md both say
+    an agent must never be able to decide its own quota. The gauge is draggable for the
+    owner and read-only for everyone else, enforced HERE — not in the markup, which an
+    agent with a token could simply POST past.
+
+    A window is cleared by sending it empty, which puts board-policy.json back in charge
+    of that window. Clearing them all removes the override entirely."""
+    human_only(b or {}, "setting a ceiling")
+    ensure_project(project)
+    b = b or {}
+    cur = ceilings_override(project)
+    changed = {}
+    for k, v in b.items():
+        if not k.startswith("ceiling."):
+            continue
+        w = win_name(k[len("ceiling."):])
+        if not w:
+            continue
+        if v in (None, ""):
+            cur.pop(w, None)
+            changed[w] = None
+            continue
+        pct = num(v)
+        if pct is None or pct < 0 or pct > 100:
+            raise Err(400, "a ceiling is a percentage between 0 and 100, not %r" % v)
+        cur[w] = round(float(pct), 1)
+        changed[w] = cur[w]
+    if "wip" in b:
+        if b["wip"] in (None, ""):
+            db.execute("UPDATE projects SET wip=NULL, updated=? WHERE name=?", (now(), project))
+            changed["wip"] = None
+        else:
+            try:
+                w = int(b["wip"])
+            except (TypeError, ValueError):
+                raise Err(400, "the review limit is a whole number of tasks")
+            if w < 1:
+                raise Err(400, "a review limit under 1 stops every task before review")
+            db.execute("UPDATE projects SET wip=?, updated=? WHERE name=?", (w, now(), project))
+            changed["wip"] = w
+    if not changed:
+        raise Err(400, "nothing to set (ceiling.<window>, wip)")
+    if any(k != "wip" for k in changed):
+        db.execute("UPDATE projects SET ceilings=?, updated=? WHERE name=?",
+                   (json.dumps(cur) if cur else None, now(), project))
+    ev(project, "project", "project.ceilings_set", HUMAN, **changed)
+    return {"project": project, "ceilings": ceilings_override(project),
+            "wip": wip_limit(project), "budget": budget(project)}
+
+
+def set_phase(project, b):
+    """The phase drives the merge gate and whether a prod deploy is allowed, so it is the
+    owner's to move (DESIGN.md §10) — `board project init` may declare one for a NEW
+    project, but changing it afterwards is a human action."""
+    human_only(b or {}, "changing the phase")
+    phase = (b or {}).get("phase")
+    if phase not in PHASES:
+        raise Err(400, "unknown phase %r (%s)" % (phase, "|".join(PHASES)))
+    ensure_project(project)
+    db.execute("UPDATE projects SET phase=?, updated=? WHERE name=?", (phase, now(), project))
+    ev(project, "project", "project.phase_set", HUMAN, phase=phase)
+    return {"project": project, "phase": phase}
 
 
 def set_caps(aid, b):
@@ -2960,6 +3564,60 @@ def prometheus_metrics():
         for (proj, role, model), tok_cnt in sorted(dispatch_tokens.items())
     ]
     add_metric("board_task_dispatch_tokens_total", "counter", token_samples)
+
+    # 9b. Estimate against actual — the pair of series that answers "which model sizes
+    # its own work well". Labelled by the model that GAVE the estimate, never by the one
+    # that did the work: they are usually different agents, and conflating them makes
+    # both numbers unreadable. Cardinality is bounded on purpose — six estimate values,
+    # a handful of models — so this stays a label and never becomes a per-task series.
+    #
+    # Only tasks whose cost is COMPLETE contribute tokens (cost_of: every dispatch has
+    # its number). A task still missing one would drag the average down for a model that
+    # did nothing wrong but forget a --tokens flag.
+    costs = task_costs()
+    est_n, est_tok, est_costed, est_points = {}, {}, {}, {}
+    for r in db.execute("SELECT id, project, status, estimate, estimate_model FROM tasks "
+                        "WHERE estimate IS NOT NULL"):
+        key = (r["project"] or "", r["estimate_model"] or "unknown", str(r["estimate"]))
+        est_n[key] = est_n.get(key, 0) + 1
+        est_points[(r["project"] or "", r["status"] or "")] = (
+            est_points.get((r["project"] or "", r["status"] or ""), 0) + int(r["estimate"]))
+        c = costs.get(r["id"])
+        if c and c["complete"] and c["dispatches"]:
+            est_tok[key] = est_tok.get(key, 0) + c["tokens"]
+            est_costed[key] = est_costed.get(key, 0) + 1
+    add_metric("board_tasks_estimated_total", "gauge", [
+        'board_tasks_estimated_total{project="%s",estimate_model="%s",estimate="%s"} %d' % (
+            prom_esc(p), prom_esc(m), prom_esc(e), n)
+        for (p, m, e), n in sorted(est_n.items())])
+    add_metric("board_task_estimate_tokens_total", "counter", [
+        'board_task_estimate_tokens_total{project="%s",estimate_model="%s",estimate="%s"} %d' % (
+            prom_esc(p), prom_esc(m), prom_esc(e), n)
+        for (p, m, e), n in sorted(est_tok.items())])
+    add_metric("board_tasks_estimate_costed_total", "gauge", [
+        'board_tasks_estimate_costed_total{project="%s",estimate_model="%s",estimate="%s"} %d' % (
+            prom_esc(p), prom_esc(m), prom_esc(e), n)
+        for (p, m, e), n in sorted(est_costed.items())])
+    add_metric("board_task_estimate_points", "gauge", [
+        'board_task_estimate_points{project="%s",status="%s"} %d' % (
+            prom_esc(p), prom_esc(st), n)
+        for (p, st), n in sorted(est_points.items())])
+
+    # 9c. What a task actually cost, by the model that did the work and by the task's
+    # own size. This is the other half of the question: not "did we guess right" but
+    # "what does this model cost per unit of work".
+    model_tok = {}
+    for r in db.execute("SELECT id, project, estimate FROM tasks"):
+        c = costs.get(r["id"])
+        if not c:
+            continue
+        for model, tok in c["by_model"].items():
+            k = (r["project"] or "", model, str(r["estimate"]) if r["estimate"] else "")
+            model_tok[k] = model_tok.get(k, 0) + tok
+    add_metric("board_task_tokens_total", "counter", [
+        'board_task_tokens_total{project="%s",model="%s",estimate="%s"} %d' % (
+            prom_esc(p), prom_esc(m), prom_esc(e), n)
+        for (p, m, e), n in sorted(model_tok.items())])
 
     # 10. board_agents_total{project="...",status="..."} (gauge for agenter)
     agent_rows = db.execute(
@@ -3222,57 +3880,24 @@ class Handler(BaseHTTPRequestHandler):
                                  "text/html")
             task_comment(m.group(1), body)
             return self.send(302, "", "text/html", extra=[("Location", "/t/" + m.group(1))])
-        if path == "/agents/cleanup" and method == "POST":
-            proj = (body or {}).get("project")
-            older = (body or {}).get("older_than", "24h")
-            res = agents_cleanup(proj, older, body)
+        for pat, fn, loc in UI_POST:
+            mm = pat.match(path)
+            if not (mm and method == "POST"):
+                continue
+            # A refused human action is a PAGE here, not a JSON blob. These are buttons a
+            # person presses on a phone, and `{"needs_human_token": true}` on a white
+            # screen tells them nothing they can act on (T-390).
+            try:
+                res = fn(mm, body or {}, q)
+            except Err as e:
+                if e.body.get("needs_human_token") and self.headers.get("accept") != "application/json":
+                    return self.send(403, not_human_page(e.body.get("action", "that")),
+                                     "text/html")
+                raise
             if self.headers.get("accept") == "application/json":
                 return self.send(200, res)
-            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
-            return self.send(302, "", "text/html", extra=[("Location", loc)])
-        if path == "/tasks/cleanup" and method == "POST":
-            proj = (body or {}).get("project")
-            older = (body or {}).get("older_than", "0")
-            res = tasks_cleanup(proj, older, body)
-            if self.headers.get("accept") == "application/json":
-                return self.send(200, res)
-            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
-            return self.send(302, "", "text/html", extra=[("Location", loc)])
-        m = re.match(r"^/agents/([^/]+)/grants$", path)
-        if m and method == "POST":
-            proj = (body or {}).get("project")
-            res = agent_grant_add(m.group(1), body)
-            proj = proj or res.get("project")
-            if self.headers.get("accept") == "application/json":
-                return self.send(200, res)
-            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
-            return self.send(302, "", "text/html", extra=[("Location", loc)])
-        m = re.match(r"^/agents/([^/]+)/grants/revoke$", path)
-        if m and method == "POST":
-            proj = (body or {}).get("project")
-            grant = (body or {}).get("grant")
-            res = agent_grant_del(m.group(1), grant, body, q)
-            proj = proj or res.get("project")
-            if self.headers.get("accept") == "application/json":
-                return self.send(200, res)
-            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
-            return self.send(302, "", "text/html", extra=[("Location", loc)])
-        m = re.match(r"^/projects/([^/]+)/pause$", path)
-        if m and method == "POST":
-            proj = m.group(1)
-            res = set_paused(proj, body, True)
-            if self.headers.get("accept") == "application/json":
-                return self.send(200, res)
-            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
-            return self.send(302, "", "text/html", extra=[("Location", loc)])
-        m = re.match(r"^/projects/([^/]+)/resume$", path)
-        if m and method == "POST":
-            proj = m.group(1)
-            res = set_paused(proj, body, False)
-            if self.headers.get("accept") == "application/json":
-                return self.send(200, res)
-            loc = "/" if not proj else ("/status?project=" + urllib.parse.quote(proj))
-            return self.send(302, "", "text/html", extra=[("Location", loc)])
+            return self.send(302, "", "text/html",
+                             extra=[("Location", loc(body or {}, res if isinstance(res, dict) else {}))])
         m = re.match(r"^/q/([^/]+)/answer$", path)
         if m and method == "POST":
             ans = body.get("answer", "")
