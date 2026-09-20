@@ -2856,6 +2856,11 @@ def agent_line(a, ceilings, human, project, known):
     if t:
         _, w, pct, c = t
         bar = meter(w, pct, c)
+    elif live:
+        # Reporting no quota window is a valid, honest answer (T-164) and a different
+        # thing from having stopped reporting at all. The first cut printed "last seen"
+        # for both, which told a working agent's row that it was dead.
+        bar = "<span class='%s text-xs'>reports no quota</span>" % DIM
     else:
         bar = "<span class='%s text-xs'>last seen %s</span>" % (
             DIM, escape((a.get("last_seen") or "—")[:16].replace("T", " ")))

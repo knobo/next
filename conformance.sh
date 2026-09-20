@@ -2091,6 +2091,22 @@ check "the human can" "$(hum POST '/projects/sizing/phase' '{"phase":"launch"}')
 check "an unknown phase is refused" "$(hum POST '/projects/sizing/phase' '{"phase":"shipping"}')" \
   '.error != null'
 
+echo "== a working agent that reports no quota is not a dead one =="
+NQ=$(api POST '/agents' '{"project":"sizing","harness":"codex","host":"nq","session":"nq1","model":"gpt-5"}' | jq -r .id)
+api POST "/agents/$NQ/heartbeat" '{"ctx_pct":10,"budget":[]}' >/dev/null
+NQH=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status?project=sizing")
+NQRES=$(python3 -c "
+import re, sys
+html = sys.argv[1]
+blocks = re.split(r\"(?=<div class='ag' data-agent)\", html)
+b = next((x for x in blocks if '>' + sys.argv[2] + '<' in x), '')
+b = b.split(\"<div class='lim'\")[0]
+print('ok' if 'reports no quota' in b and 'last seen' not in b else 'fail: ' + b[:200])
+" "$NQH" "$NQ")
+[ "$NQRES" = ok ] && ok "it says it reports no quota, not that it was last seen" \
+  || no "a live agent with no quota window reads as gone" "$NQRES"
+api POST "/agents/$NQ/finished" '{"reason":"queue empty"}' >/dev/null
+
 echo "== a question is never invisible, whatever became of its task =="
 QT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"will be archived\",\"agent\":\"$EA\"}" | jq -r .id)
 QQ=$(api POST '/questions' "{\"project\":\"sizing\",\"task\":\"$QT\",\"text\":\"still open when the task went away?\",\"agent\":\"$EA\"}" | jq -r .id)
