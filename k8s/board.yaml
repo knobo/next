@@ -64,6 +64,14 @@ spec:
           env:
             - name: PYTHONDONTWRITEBYTECODE
               value: "1"
+            # readOnlyRootFilesystem leaves /tmp, /var/tmp and /usr/tmp all unwritable,
+            # and SQLite needs a scratch file to SORT — building the events(type) index
+            # on the live log failed with SQLITE_IOERR_GETTEMPPATH (6410) every boot,
+            # which reads only as "disk I/O error" without the extended code. Small
+            # writes never touch this, which is why the board ran for a year without
+            # noticing. Explicit rather than relying on SQLite's fallback order.
+            - name: SQLITE_TMPDIR
+              value: /tmp
             - name: BOARD_DB
               value: /data/board.db
             - name: BOARD_POLICY
@@ -100,10 +108,14 @@ spec:
           resources: { requests: { cpu: 10m, memory: 64Mi }, limits: { memory: 256Mi } }
           volumeMounts:
             - { name: data, mountPath: /data }
+            # The scratch space SQLITE_TMPDIR points at. emptyDir and not the data volume:
+            # a sort spill is throwaway and has no business sharing the board's backup.
+            - { name: tmp, mountPath: /tmp }
             - { name: src, mountPath: /src }
             - { name: policy, mountPath: /policy }
       volumes:
         - { name: data, persistentVolumeClaim: { claimName: board-data } }
+        - { name: tmp, emptyDir: { sizeLimit: 64Mi } }
         - { name: src, configMap: { name: board-src } }
         - { name: policy, configMap: { name: board-policy } }
 ---
