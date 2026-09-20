@@ -338,6 +338,57 @@
                    gap: .4rem; white-space: nowrap; }
   .lim-wip .cell-num { flex: 0 0 auto; }
 
+  /* --- somebody else's prose ----------------------------------------------
+     A task spec, a plan, a question, a comment: text the board did not write, rendered
+     from a subset of markdown. Every rule here is explicit because Tailwind's preflight
+     strips list markers, heading sizes and margins down to nothing — inside `.md` those
+     are the content, not decoration.
+
+     68ch and not the full column: this is the only place on the board with real prose
+     in it, and a line you have to track back across a wide screen is a line you read
+     twice. */
+  .md { max-width: 68ch; }
+  /* The spec sits directly under the task's title and is the first thing read. It needs
+     air from the heading above it; every other .md block is inside something that has
+     already spaced it. */
+  .md-spec { margin-top: .9rem; }
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: .55rem 0; line-height: 1.55; overflow-wrap: anywhere; }
+  .md h3, .md h4, .md h5, .md h6 { margin: 1.15rem 0 .35rem; font-weight: 600;
+          line-height: 1.3; letter-spacing: -.01em; }
+  .md h3 { font-size: 1.0625rem; }
+  .md h4 { font-size: .9375rem; }
+  .md h5, .md h6 { font-size: .875rem;
+          color: color-mix(in oklab, var(--color-base-content) 70%, transparent); }
+  .md ul, .md ol { margin: .5rem 0; padding-left: 1.35rem; }
+  .md ul { list-style: disc; }
+  .md ol { list-style: decimal; }
+  .md ul ul, .md ol ul { margin: .2rem 0; list-style: circle; }
+  .md li { margin: .2rem 0; line-height: 1.5; }
+  .md li::marker { color: color-mix(in oklab, var(--color-base-content) 45%, transparent); }
+  .md code { padding: .05em .3em; border-radius: var(--radius-field);
+             background: var(--color-base-200); font-family: var(--font-mono);
+             font-size: .875em; }
+  .md pre { margin: .65rem 0; padding: .6rem .8rem; overflow-x: auto;
+            background: var(--color-base-200); border-radius: var(--radius-box);
+            border-left: 3px solid var(--color-base-300); }
+  .md pre code { padding: 0; background: none; font-size: .8125rem; line-height: 1.55; }
+  .md blockquote { margin: .65rem 0; padding-left: .85rem;
+                   border-left: 3px solid var(--color-base-300);
+                   color: color-mix(in oklab, var(--color-base-content) 70%, transparent); }
+  .md hr { margin: 1.1rem 0; border: 0; border-top: 1px solid var(--color-base-300); }
+  .md b { font-weight: 600; }
+
+  /* In the timeline a note shares a line with its clock, so it starts flush and stays
+     small — the structure still reads, at the size the surrounding list is set in. */
+  .md-note { margin-top: .15rem; font-size: .875rem; }
+  .md-note p { margin: .3rem 0; }
+  .md-note > :first-child { display: inline; }
+  /* The question page is the one surface that is nothing BUT somebody else's words. */
+  .md-lead { max-width: 68ch; font-size: 1.125rem; line-height: 1.5; }
+  .md-lead p { margin: .6rem 0; }
+
   /* --- the timeline ------------------------------------------------------
      The clock in a fixed monospace column, the text wrapping at reading width beside it. */
   .trail > li { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr);

@@ -60,6 +60,20 @@ board ceiling 7d ''               # hand that window back to board-policy.json
 board ceiling --wip 4             # how much finished work may wait for review at once
 ```
 
+Anything an agent writes for you to read — a task's `spec`, a plan posted as a progress
+note, a question, a comment — is rendered as **markdown** on the board: headings, lists,
+`code`, fenced blocks, quotes and links. Write it that way and it arrives readable.
+
+```bash
+board task create --title "..." --spec-file spec.md    # the spec now has a page to live on
+board ask --default "yes" --deadline 8h "$(cat question.md)"
+```
+
+The text is escaped before any of it is read as markup, so nothing written into a spec
+can become an element on the page. A link survives only if it points at `http(s)://` or
+at a path on the board itself — and a path is checked for more than a leading slash,
+since a browser normalises `\` to `/` and `/\elsewhere.example` is not local at all.
+
 Sizing work, so the board can tell you later how well each model guesses:
 
 ```bash

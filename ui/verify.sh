@@ -37,7 +37,7 @@ no() { printf '  FAIL %s\n' "$1"; fail=1; }
 A -X POST "$B/api/v1/projects" -d '{"project":"demo","phase":"build","goal":"a trial run"}' >/dev/null
 AG=$(A -X POST "$B/api/v1/agents" -d '{"project":"demo","model":"claude-opus-5","harness":"claude-code","capabilities":["forgejo"],"host":"h","session":"s"}' | jq -r .id)
 A -X POST "$B/api/v1/agents/$AG/heartbeat" -d '{"ctx_pct":42,"budget":[{"window":"5h","used_pct":58},{"window":"7d","used_pct":57}]}' >/dev/null
-TID=$(A -X POST "$B/api/v1/tasks" -d '{"project":"demo","title":"a task to look at","repo":".","agent":"'"$AG"'"}' | jq -r .id)
+TID=$(A -X POST "$B/api/v1/tasks" -d '{"project":"demo","title":"a task to look at","repo":".","spec":"## What this is\n\nThe spec is the one long piece of text on a task.\n\n- it renders as markdown\n- with `code` and **bold**\n\n```\nboard task show T-1\n```","agent":"'"$AG"'"}' | jq -r .id)
 A -X POST "$B/api/v1/tasks/$TID/claim" -d '{"agent":"'"$AG"'"}' >/dev/null
 QID=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"Should we use daisyUI?","kind":"product","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' | jq -r .id)
 TQ=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"Does the page look right?","agent":"'"$AG"'"}' | jq -r .id)
@@ -53,7 +53,7 @@ A -X POST "$B/api/v1/tasks/$DONEID/claim" -d '{"agent":"'"$AG"'"}' >/dev/null
 A -X POST "$B/api/v1/tasks/$DONEID/done" -d '{"agent":"'"$AG"'","no_merge":true}' >/dev/null
 # A second question on the SAME task: one question cannot show whether two of them stack
 # or draw on top of each other.
-A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"And should the second question sit under the first?","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' >/dev/null
+A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"And should the second question sit under the first? See [the RFC](https://example.com/rfc).","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' >/dev/null
 
 CSSURL=$(python3 - <<PY
 import hashlib
@@ -223,6 +223,39 @@ if bad:
     print("\n".join(bad))
 sys.exit(1 if bad else 0)
 PPY
+# The compact question under a task row IS a link. An <a> from the question's own text
+# closes it at the start tag, so the rest of the text and the badge fall out of the row's
+# click target — and the target becomes wherever the agent pointed.
+python3 - "$D/human.html" <<'APY' && ok "no link is nested inside the question row's own link" \
+  || no "an <a> inside the .qrow link will break the row"
+import re, sys
+h = open(sys.argv[1]).read()
+bad = [m.group(0)[:100] for m in re.finditer(r"<a class='qrow'.*?</a>", h, re.S)
+       if "<a " in m.group(0)[len("<a class='qrow'"):]]
+if bad:
+    print("\n".join(bad))
+sys.exit(1 if bad else 0)
+APY
+# The spec is the one long piece of text on a task and the board never showed it at all.
+# Rendered, it is the page's answer to "what is this work"; flat, it was a grey wall.
+SPECH=$(curl -s -H "Authorization: Bearer $HT" "$B/t/$TID")
+grep -q "class='md md-spec'" <<<"$SPECH" && grep -q "<h4>What this is</h4>" <<<"$SPECH" \
+  && grep -q "<pre><code>" <<<"$SPECH" \
+  && ok "the spec renders as prose, with its headings and code" \
+  || no "the spec is missing or flat"
+# Preflight strips list markers and heading sizes to nothing, so prose inside .md needs
+# every rule declared. A bullet with no marker is the failure this catches.
+python3 - "$D/human.html" ../board.css <<'MPY' && ok "the prose styles survive the CSS reset" \
+  || no "a prose element has no rule — preflight will have flattened it"
+import re, sys
+css = open(sys.argv[2]).read()
+need = [".md ul", ".md ol", ".md li", ".md h3", ".md h4", ".md code", ".md pre",
+        ".md blockquote", ".md p"]
+missing = [n for n in need if n.replace(" ", " ") not in css and n.replace(" ", "") not in css]
+if missing:
+    print("no rule for: " + ", ".join(missing))
+sys.exit(1 if missing else 0)
+MPY
 # The task page has to say what the task cost, or the estimate beside it means nothing.
 curl -s -H "Authorization: Bearer $HT" "$B/t/$TID" | grep -q "what it has cost" \
   && ok "/t shows what the task has cost" || no "/t does not show the cost"
