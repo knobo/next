@@ -223,6 +223,15 @@ if bad:
     print("\n".join(bad))
 sys.exit(1 if bad else 0)
 PPY
+# A comment is the only thing on a task page that a PERSON wrote. It is stored under a
+# different field from every other event's words, and the timeline used to read only the
+# other one — so it rendered as a bare "task.comment <who>".
+curl -s -H "Authorization: Bearer $HT" -H 'Content-Type: application/x-www-form-urlencoded' \
+  -X POST --data-urlencode 'text=a comment with **marks** in it' "$B/t/$TID/comment" >/dev/null
+CMTH=$(curl -s -H "Authorization: Bearer $HT" "$B/t/$TID")
+grep -q "a comment with <b>marks</b> in it" <<<"$CMTH" \
+  && ok "a comment reaches the timeline, rendered" \
+  || no "the comment text is missing from the timeline"
 # The compact question under a task row IS a link. An <a> from the question's own text
 # closes it at the start tag, so the rest of the text and the badge fall out of the row's
 # click target — and the target becomes wherever the agent pointed.

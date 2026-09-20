@@ -1049,9 +1049,14 @@ def task_show(tid):
         "ORDER BY id", ("task/" + tid,)))
     d["cost"] = cost_of(d["dispatches"])
     d["phase"] = phase_of(d["project"])
+    # `text` as well as `note`. A comment stores its words under `text` (task_comment),
+    # every other event that carries words uses `note` — and the timeline read only
+    # `note`. So the one line on the page that is a PERSON'S own words was the one line
+    # that lost them: "task.comment  knut" and nothing after it. The `progress` list
+    # above has always read both, and says why in its own comment; this one never did.
     d["events"] = [
         {"ts": r["ts"], "type": r["type"], "actor": r["actor"],
-         "note": jl(r["body"], {}).get("note")}
+         "note": (lambda b: b.get("note") or b.get("text"))(jl(r["body"], {}))}
         for r in db.execute(
             # LIMIT: the whole request holds the global lock, so a task with
             # thousands of events would stall every other agent's call while the
