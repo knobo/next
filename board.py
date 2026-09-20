@@ -54,12 +54,6 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY, ts TEXT NOT NULL, project TEXT NOT NULL, stream TEXT NOT NULL,
   type TEXT NOT NULL, actor TEXT NOT NULL, body TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS events_stream ON events(project, stream, id);
--- Reading the log BY TYPE: the cost of a task is folded out of its task.progress events,
--- and both /status and /metrics do it — /metrics under the global lock, where every
--- agent call waits behind it. Without this index those queries scan the whole log: at the
--- live board's 42k events that was 37 ms per /status render and about half of a 1 s
--- scrape. `id` last so the fold still gets its rows in insertion order for free.
-CREATE INDEX IF NOT EXISTS events_type ON events(type, project, id);
 CREATE TABLE IF NOT EXISTS projects (
   name TEXT PRIMARY KEY, phase TEXT NOT NULL, goal TEXT, manifest TEXT,
   manifest_host TEXT, manifest_path TEXT, updated TEXT);
@@ -130,6 +124,26 @@ for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
     except sqlite3.OperationalError:
         pass
+# Reading the log BY TYPE: the cost of a task is folded out of its task.progress events,
+# and both /status and /metrics do it — /metrics under the global lock, where every agent
+# call waits behind it. Measured against the live board's own database: /status 726 ms →
+# 214 ms, /metrics 95 ms → 24 ms.
+#
+# OUT of SCHEMA and into a try, deliberately. An index is an optimisation: the board ran
+# without this one for its whole life and merely scanned more rows. Inside executescript()
+# it was load-bearing instead — the first deploy of it met a `disk I/O error` on the live
+# volume, which I have not been able to reproduce anywhere since (same code against a copy
+# of that database, same securityContext with no writable temp directory, a concurrent
+# writer: all fine), and because the statement sat in the fatal block the board did not
+# start at all. Four restarts, CrashLoopBackOff, the board 503 until it was rolled back.
+# Whatever that I/O error was, the fault worth fixing is that a slower query was allowed
+# to become an outage.
+try:
+    db.execute("CREATE INDEX IF NOT EXISTS events_type ON events(type, project, id)")
+except sqlite3.Error as _e:
+    print("could not create the events(type) index — the board runs, reading the log by "
+          "type is slower: %r" % (_e,), file=sys.stderr, flush=True)
+
 _cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
 if {"rl5_pct", "rl7_pct"} <= _cols:      # T-164: existing database, old columns still there
     for _r in db.execute("SELECT id,rl5_pct,rl5_reset,rl7_pct FROM agents WHERE budget IS NULL "

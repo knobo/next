@@ -2136,6 +2136,27 @@ check "no living agents left after the suite" "$(api GET '/status?project=demo')
 # in-process against an empty database of its own. Only against our own board.py — a foreign
 # backend has its own reaper and must not be measured against ours.
 if [ "$OWN_SERVER" = 1 ]; then
+  echo "== a failed index does not stop the board =="
+  # The events(type) index is an optimisation. It once sat inside executescript(SCHEMA),
+  # where a `disk I/O error` on the live volume meant the board did not start at all —
+  # CrashLoopBackOff, 503, rolled back. A statement that only makes queries faster must
+  # degrade to "slower", never to "down". The failure is simulated by occupying the
+  # index's name, which raises at exactly the same point.
+  IDXCHK=$(BOARD_DB="$TMP/idxfail.db" python3 - <<'IDXPY' 2>"$TMP/idxfail.err"
+import sqlite3, os
+p = os.environ["BOARD_DB"]
+d = sqlite3.connect(p); d.execute("CREATE TABLE events_type (x INTEGER)"); d.commit(); d.close()
+import board
+board.status()
+print("ok")
+IDXPY
+)
+  [ "$IDXCHK" = ok ] && ok "the board starts and serves when the index cannot be created" \
+    || no "a failed index took the board down" "$IDXCHK $(head -c 160 "$TMP/idxfail.err")"
+  grep -q "reading the log by type is slower" "$TMP/idxfail.err" \
+    && ok "…and says so on stderr rather than silently running slow" \
+    || no "nothing was logged about the missing index"
+
   echo "== reaper =="
   R=$(BOARD_DB="$TMP/reap.db" python3 - <<'REAPPY'
 import board
