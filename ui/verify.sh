@@ -53,7 +53,7 @@ A -X POST "$B/api/v1/tasks/$DONEID/claim" -d '{"agent":"'"$AG"'"}' >/dev/null
 A -X POST "$B/api/v1/tasks/$DONEID/done" -d '{"agent":"'"$AG"'","no_merge":true}' >/dev/null
 # A second question on the SAME task: one question cannot show whether two of them stack
 # or draw on top of each other.
-A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"And should the second question sit under the first?","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' >/dev/null
+A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"And should the second question sit under the first? See [the RFC](https://example.com/rfc).","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' >/dev/null
 
 CSSURL=$(python3 - <<PY
 import hashlib
@@ -223,6 +223,19 @@ if bad:
     print("\n".join(bad))
 sys.exit(1 if bad else 0)
 PPY
+# The compact question under a task row IS a link. An <a> from the question's own text
+# closes it at the start tag, so the rest of the text and the badge fall out of the row's
+# click target — and the target becomes wherever the agent pointed.
+python3 - "$D/human.html" <<'APY' && ok "no link is nested inside the question row's own link" \
+  || no "an <a> inside the .qrow link will break the row"
+import re, sys
+h = open(sys.argv[1]).read()
+bad = [m.group(0)[:100] for m in re.finditer(r"<a class='qrow'.*?</a>", h, re.S)
+       if "<a " in m.group(0)[len("<a class='qrow'"):]]
+if bad:
+    print("\n".join(bad))
+sys.exit(1 if bad else 0)
+APY
 # The spec is the one long piece of text on a task and the board never showed it at all.
 # Rendered, it is the page's answer to "what is this work"; flat, it was a grey wall.
 SPECH=$(curl -s -H "Authorization: Bearer $HT" "$B/t/$TID")

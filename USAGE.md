@@ -70,7 +70,9 @@ board ask --default "yes" --deadline 8h "$(cat question.md)"
 ```
 
 The text is escaped before any of it is read as markup, so nothing written into a spec
-can become an element on the page, and a link only survives if it points at http(s).
+can become an element on the page. A link survives only if it points at `http(s)://` or
+at a path on the board itself — and a path is checked for more than a leading slash,
+since a browser normalises `\` to `/` and `/\elsewhere.example` is not local at all.
 
 Sizing work, so the board can tell you later how well each model guesses:
 

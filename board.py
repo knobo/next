@@ -2167,14 +2167,17 @@ def md_href(url):
     from shipping a script as a link. Relative paths are allowed because the board links
     to its own pages; anything else is left as plain text by the caller."""
     u = url.strip()
-    if u.startswith("http://") or u.startswith("https://"):
+    if any(c in u for c in "\\<>\"'") or any(ord(c) < 0x20 or ord(c) == 0x7f for c in u):
+        return None          # a backslash is normalised to "/" — "/\evil.com" is off-site
+    low = u.lower()
+    if low.startswith("http://") or low.startswith("https://"):
         return u
     if u.startswith("/") and not u.startswith("//"):
         return u
     return None
 
 
-def md_inline(esc):
+def md_inline(esc, links=True):
     """Inline marks, on text that is ALREADY escaped.
 
     Code spans are lifted out first and put back untouched: a backticked `**x**` is a
@@ -2187,6 +2190,12 @@ def md_inline(esc):
             continue
 
         def link(m):
+            if not links:
+                # Inside something that is ITSELF a link — the one-line question under a
+                # task row — an <a> would close the outer one at its start tag: the rest
+                # of the text falls out of the row's click target, and the target becomes
+                # whatever the agent wrote. The words stay, the anchor does not.
+                return m.group(1)
             href = md_href(m.group(2))
             if not href:
                 return m.group(0)          # not a link: leave the source text standing
@@ -2204,18 +2213,25 @@ def md_list(lines, start):
     one level of nesting — deeper than that is an outline, and an outline in a task spec
     is a sign the task wants splitting, not that the renderer wants features."""
     ordered = bool(MD_OLI.match(lines[start]))
+    # The indent the list itself starts at. A list written indented under a lead-in line —
+    # "PLAN:" and then two-space bullets, which is what SKILL.md step 4 asks for — has no
+    # parent item to nest under, and measuring nesting from column 0 meant the first item
+    # matched no branch at all: md_list returned `start`, md() never advanced, and the
+    # page hung and grew until the process died. Nesting is relative to where the list
+    # begins, and md() will not accept a non-advancing return either way.
+    base = len((MD_OLI.match(lines[start]) or MD_ULI.match(lines[start])).group(1))
     items, i, sub = [], start, []
     while i < len(lines):
         m = MD_OLI.match(lines[i]) if ordered else MD_ULI.match(lines[i])
         other = MD_ULI.match(lines[i]) if ordered else MD_OLI.match(lines[i])
-        if m and len(m.group(1)) < 2:
+        if m and len(m.group(1)) - base < 2:
             if sub:
                 items[-1] += "<ul>%s</ul>" % "".join("<li>%s</li>" % s for s in sub)
                 sub = []
             items.append(md_inline(m.group(2)))
-        elif (m or other) and len((m or other).group(1)) >= 2 and items:
+        elif (m or other) and len((m or other).group(1)) - base >= 2 and items:
             sub.append(md_inline((m or other).group(2)))
-        elif other and len(other.group(1)) < 2:
+        elif other and len(other.group(1)) - base < 2:
             break            # the other kind of list at this level starts a list of its own
         elif lines[i].strip() and items and not MD_HEAD.match(lines[i]) \
                 and not MD_FENCE.match(lines[i]) and not MD_HR.match(lines[i]) \
@@ -2233,7 +2249,7 @@ def md_list(lines, start):
     return "<%s>%s</%s>" % (tag, "".join("<li>%s</li>" % x for x in items), tag), i
 
 
-def md(text, inline=False):
+def md(text, inline=False, links=True):
     """Markdown, for text the board did not write.
 
     `inline=True` gives the marks only — for a title or a goal, which live inside a line
@@ -2242,7 +2258,7 @@ def md(text, inline=False):
         return ""
     esc = escape(str(text)).replace("\r\n", "\n").replace("\r", "\n")
     if inline:
-        return md_inline(esc.replace("\n", " "))
+        return md_inline(esc.replace("\n", " "), links)
     lines, out, i = esc.split("\n"), [], 0
     while i < len(lines):
         line = lines[i]
@@ -2269,8 +2285,12 @@ def md(text, inline=False):
             i += 1
             continue
         if MD_ULI.match(line) or MD_OLI.match(line):
-            block, i = md_list(lines, i)
+            block, nxt = md_list(lines, i)
             out.append(block)
+            # Never trust a helper to advance. If one ever fails to, this costs a line;
+            # the version without it cost the whole board — the loop appended an empty
+            # list forever and the process grew until it was killed.
+            i = nxt if nxt > i else i + 1
             continue
         if line.lstrip().startswith("&gt; "):
             quote = []
@@ -2824,7 +2844,8 @@ def q_inline(q, answer=None):
     return ("<a class='qrow' href='/q/%s'>"
             "<span class='%s text-xs'>%s</span>"
             "<span class='max-w-[68ch]'>%s</span>%s</a>" % (
-                escape(q["id"]), MONO, escape(q["id"]), md(q["text"], inline=True), answered))
+                escape(q["id"]), MONO, escape(q["id"]),
+                md(q["text"], inline=True, links=False), answered))
 
 
 def prio_cell(t, human, back):

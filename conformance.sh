@@ -2124,6 +2124,51 @@ check "an http link is a link" "$(jq -nc --arg h "$XH" '{h:$h}')" \
   '.h|test("href=.https://example.com/a.")'
 for X in $MDT $XT; do api POST "/tasks/$X/archive" "{\"agent\":\"$EA\"}" >/dev/null; done
 
+# The renderer must TERMINATE, on anything. An indented list under a lead-in line —
+# `PLAN:` and then two-space bullets, which is exactly what SKILL.md step 4 asks the
+# coordinator to write — left md_list unable to place its first item, so it returned the
+# line it started on, md() never advanced, and the page grew an empty list forever until
+# the process was killed. A spec, a question or one progress note could take the board
+# down for good. In-process with a hard budget: a hang must fail the suite, not join it.
+if [ "$OWN_SERVER" = 1 ]; then
+  MDTERM=$(BOARD_DB="$TMP/mdterm.db" timeout 25 python3 - <<'MDPY' 2>&1
+import itertools, time, board
+bullets = ["- a", "  - a", "    - a", "1. a", "  1. a", "* a", "  + a"]
+others = ["", "PLAN:", "# h", "> q", "---", "```", "  text", "\ttab"]
+slow = []
+t0 = time.perf_counter()
+for combo in itertools.product(bullets, others, bullets, others):
+    s = "\n".join(combo)
+    t = time.perf_counter()
+    board.md(s)
+    if time.perf_counter() - t > 0.25:
+        slow.append(s)
+print("ok %d shapes in %.1fs" % (len(bullets)**2 * len(others)**2, time.perf_counter() - t0)
+      if not slow else "SLOW: %r" % slow[:2])
+MDPY
+)
+  case "$MDTERM" in
+    ok\ *) ok "markdown terminates on every list/lead-in shape ($MDTERM)" ;;
+    *)     no "markdown did not terminate" "$MDTERM" ;;
+  esac
+fi
+# The indented-PLAN shape end to end, because the hang was over HTTP and held the lock.
+PT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"an indented plan\",\"agent\":\"$EA\",\"spec\":\"PLAN:\\n\\n  - acceptance: ./conformance.sh\\n  - files: board.py\"}" | jq -r .id)
+PH=$(curl -sS -m 8 -o "$TMP/plan.html" -w '%{http_code}' -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$PT")
+if [ "$PH" = 200 ] && grep -q "<li>acceptance: ./conformance.sh</li>" "$TMP/plan.html"; then
+  ok "an indented list under a lead-in line renders instead of hanging the board"
+else
+  no "the indented-plan spec did not render" "http $PH"
+fi
+api POST "/tasks/$PT/archive" "{\"agent\":\"$EA\"}" >/dev/null
+# A relative href is checked for more than a leading slash: browsers normalise "\" to
+# "/", so "/\evil.com/x" navigates off-site while looking board-internal in the markup.
+BT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"backslash\",\"agent\":\"$EA\",\"spec\":\"[looks local](/\\\\evil.example/x) and [real](https://ok.example/a)\"}" | jq -r .id)
+BH=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$BT")
+check "a backslash path is not turned into a link" "$(jq -nc --arg h "$BH" '{h:$h}')" \
+  '((.h|test("href=./.\\\\\\\\")) | not) and (.h|test("href=.https://ok.example/a."))'
+api POST "/tasks/$BT/archive" "{\"agent\":\"$EA\"}" >/dev/null
+
 echo "== a question keeps the default under either spelling =="
 DA=$(api POST '/questions' "{\"project\":\"sizing\",\"text\":\"written with the name the board itself prints?\",\"default_answer\":\"yes\",\"deadline\":\"8h\",\"agent\":\"$EA\"}" | jq -r .id)
 check "default_answer is accepted, not silently dropped" "$(api GET '/questions')" \
