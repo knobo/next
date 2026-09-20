@@ -2169,6 +2169,19 @@ check "a backslash path is not turned into a link" "$(jq -nc --arg h "$BH" '{h:$
   '((.h|test("href=./.\\\\\\\\")) | not) and (.h|test("href=.https://ok.example/a."))'
 api POST "/tasks/$BT/archive" "{\"agent\":\"$EA\"}" >/dev/null
 
+echo "== a comment is words a PERSON wrote, and must survive to the page =="
+CT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"a task to comment on\",\"agent\":\"$EA\"}" | jq -r .id)
+hum POST "/tasks/$CT/comment" '{"text":"the merge gate is the bit to check first"}' >/dev/null
+check "the comment is on the task's timeline over the API" "$(api GET "/tasks/$CT")" \
+  '[.events[]?|select(.type=="task.comment")][0].note == "the merge gate is the bit to check first"'
+# The HTML is where it was lost: every other event that carries words uses `note` and a
+# comment uses `text`, so the timeline rendered "task.comment  <who>" and nothing after
+# it — the one line on the page that is a person's own words was the one that lost them.
+CH=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$CT")
+check "…and on the page, not just in the database" "$(jq -nc --arg h "$CH" '{h:$h}')" \
+  '.h | test("the merge gate is the bit to check first")'
+api POST "/tasks/$CT/archive" "{\"agent\":\"$EA\"}" >/dev/null
+
 echo "== a question keeps the default under either spelling =="
 DA=$(api POST '/questions' "{\"project\":\"sizing\",\"text\":\"written with the name the board itself prints?\",\"default_answer\":\"yes\",\"deadline\":\"8h\",\"agent\":\"$EA\"}" | jq -r .id)
 check "default_answer is accepted, not silently dropped" "$(api GET '/questions')" \
