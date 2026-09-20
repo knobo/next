@@ -2215,9 +2215,15 @@ def md_list(lines, start):
             items.append(md_inline(m.group(2)))
         elif (m or other) and len((m or other).group(1)) >= 2 and items:
             sub.append(md_inline((m or other).group(2)))
+        elif other and len(other.group(1)) < 2:
+            break            # the other kind of list at this level starts a list of its own
         elif lines[i].strip() and items and not MD_HEAD.match(lines[i]) \
-                and not MD_FENCE.match(lines[i]):
-            items[-1] += " " + md_inline(lines[i].strip())    # a wrapped line
+                and not MD_FENCE.match(lines[i]) and not MD_HR.match(lines[i]) \
+                and not lines[i].lstrip().startswith("&gt; "):
+            # A lazy continuation — markdown lets a wrapped line keep belonging to the
+            # item above it. Everything that starts a block of its own is excluded, or a
+            # rule or a quote written straight after a list is swallowed into the list.
+            items[-1] += " " + md_inline(lines[i].strip())
         else:
             break
         i += 1
