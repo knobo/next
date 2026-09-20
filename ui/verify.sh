@@ -76,6 +76,75 @@ curl -s -H "Authorization: Bearer $T" "$B/status" | grep -qE "<u data-c='(85|60)
 curl -s -H "Authorization: Bearer $T" "$B/status" | grep -q "working." \
   && ok "/status opens with the watch line" || no "/status is missing the watch line"
 
+# --- the operator's surface --------------------------------------------------
+# Every control on the board is drawn only for the human token and enforced again on the
+# server. Both halves are checked: markup an agent can see is markup an agent will press,
+# and a control the human CANNOT see is a feature that does not exist.
+curl -s -H "Authorization: Bearer $HT" "$B/status" > "$D/human.html"
+curl -s -H "Authorization: Bearer $T"  "$B/status" > "$D/agent.html"
+grep -q "class='rail'" "$D/human.html" \
+  && ok "/status carries one filter rail for the whole board" || no "/status has no filter rail"
+grep -q "name='ceiling\." "$D/human.html" \
+  && ok "the ceiling is a handle the owner can drag" || no "/status has no ceiling handle"
+# Not `data-ceiling`: the script that drives the handle is served on EVERY page and
+# mentions it, so that grep passes on a page with no handle at all.
+grep -q "name='ceiling\." "$D/agent.html" \
+  && no "an agent is shown a ceiling handle it cannot use" \
+  || ok "an agent sees the ceiling drawn, not a handle"
+grep -q "name='priority'" "$D/human.html" \
+  && ok "the queue's priority can be set in place" || no "the queue has no priority control"
+grep -q "name='estimate'" "$D/human.html" \
+  && ok "the queue's size can be set in place" || no "the queue has no size control"
+grep -q "name='priority'" "$D/agent.html" \
+  && no "an agent is shown the owner's queue controls" || ok "an agent sees the queue read-only"
+# Who coordinates is the owner's call (§3.8). `board role pin` was the only way to say
+# so; the button has to reach the same handler and refuse the same way.
+grep -q "action='/roles/coordinator/pin'" "$D/human.html" \
+  && ok "the owner can pin a coordinator from the board" || no "no role control on /status"
+grep -q "action='/roles/coordinator/" "$D/agent.html" \
+  && no "an agent is shown the role control" || ok "an agent cannot pin a role from the board"
+# A form that reaches a handler without its fields must answer 400, not raise into the
+# 500 handler.
+grep -q '"error"' <<<"$(curl -s -H "Authorization: Bearer $HT" -H 'Accept: application/json' \
+  -H 'Content-Type: application/x-www-form-urlencoded' -X POST -d 'project=demo' \
+  "$B/roles/coordinator/pin")" \
+  && ok "pinning with no agent says which field is missing" \
+  || no "a missing form field is not a 400"
+# A question belongs under the task it is about, at that task's place in the order.
+grep -q "data-task-child" "$D/human.html" \
+  && ok "a question hangs under the task it is about" \
+  || no "the question is not attached to its task row"
+# Pressing an owner's control with an agent cookie must answer a PAGE, not a JSON blob on
+# a phone.
+REF=$(curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/x-www-form-urlencoded' \
+      -X POST -d 'ceiling.5h=99&project=demo' "$B/projects/demo/ceilings")
+grep -q "signed in as an" <<<"$REF" \
+  && ok "an agent pressing an owner's control gets a page that says why" \
+  || no "the refusal is not a page" "$(head -c 120 <<<"$REF")"
+# `back` is a path this board serves, or it is dropped. http.server's send_header does
+# not sanitize, so a CR or LF that got this far would be a response header the caller
+# wrote. The check reads the RAW headers: the redirect must go to the default and no
+# X-Injected must exist anywhere in them.
+INJ=$(curl -s -o /dev/null -D - -H "Authorization: Bearer $HT" \
+      -H 'Content-Type: application/x-www-form-urlencoded' -X POST \
+      --data-urlencode 'back=/status
+X-Injected: yes' --data 'priority=70' "$B/t/$TID/patch")
+grep -qi 'x-injected' <<<"$INJ" \
+  && no "a newline in back wrote a response header" \
+  || ok "a newline in back is dropped, not written into the headers"
+grep -qi "^Location: /t/$TID" <<<"$INJ" \
+  && ok "a back that is not a path on this board falls back to the task" \
+  || no "the refused back did not fall back" "$(grep -i location <<<"$INJ")"
+OPEN=$(curl -s -o /dev/null -D - -H "Authorization: Bearer $HT" \
+       -H 'Content-Type: application/x-www-form-urlencoded' -X POST \
+       -d 'back=//example.com&priority=71' "$B/t/$TID/patch")
+grep -qi "^Location: //" <<<"$OPEN" \
+  && no "back accepted a protocol-relative URL — that is an open redirect" \
+  || ok "back refuses a URL with a host"
+# The task page has to say what the task cost, or the estimate beside it means nothing.
+curl -s -H "Authorization: Bearer $HT" "$B/t/$TID" | grep -q "what it has cost" \
+  && ok "/t shows what the task has cost" || no "/t does not show the cost"
+
 # the stylesheet itself
 HC=$(curl -s -o "$D/css" -w '%{http_code}' -D "$D/chdr" -H "Authorization: Bearer $T" "$B$CSSURL")
 [ "$HC" = 200 ] && ok "$CSSURL answers 200" || no "$CSSURL answered $HC"
@@ -92,8 +161,12 @@ grep -qE 'prefers-color-scheme: ?dark' "$D/css" && ok "dark mode follows prefers
 # A Tailwind class split across two Python string literals is never seen by the text
 # extractor: the markup looks right, and the rule does not exist. The failure is mute.
 # It caught `.pane` once and made the meters page-wide without anything complaining.
+# Both identities: half the markup on this board (the gauges, the in-place fields, the
+# phase pill) is drawn ONLY for the human token, and a class used only there would
+# otherwise never reach this check — which is the exact failure it exists to catch.
 for pth in "/status" "/q/$QID" "/t/$TID"; do
   curl -s -H "Authorization: Bearer $T" "$B$pth"
+  curl -s -H "Authorization: Bearer $HT" "$B$pth"
 done > "$D/all.html"
 # Pages you only reach by POSTing a form were invisible to this check, and the
 # confirmation page had been rendering unstyled because of it: it used a `.top` class

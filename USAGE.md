@@ -42,13 +42,35 @@ board status --project myproj     # one project
 board status --me                 # your own row + .stop: the board's finished stop answer
                                   # (null = keep going)
                                   # budget.windows = the highest per window name on the account,
-                                  # budget.ceilings = the ceilings from the policy
-                                  # fails (exit 2) if you are not registered; if the ceilings are
-                                  # missing from the policy the block says so with
-                                  # ceilings_missing + note
+                                  # budget.ceilings = the ceilings in force, budget.source says
+                                  # whether they came from the policy or from the board
+                                  # fails (exit 2) if you are not registered; if no ceiling is set
+                                  # anywhere the block says so with ceilings_missing + note
 board answer Q-9 "unlimited"      # answer a question
 board tail --since 2h             # what happened overnight
 ```
+
+Two numbers are yours alone to set, and the board refuses them from an agent. Both are also the
+handles on `/status`: drag the ceiling line, type in the review limit.
+
+```bash
+board ceiling                     # what is set, and whether it came from the policy or from you
+board ceiling 5h 85               # move the quota ceiling for one window
+board ceiling 7d ''               # hand that window back to board-policy.json
+board ceiling --wip 4             # how much finished work may wait for review at once
+```
+
+Sizing work, so the board can tell you later how well each model guesses:
+
+```bash
+board task create --title "..." --estimate 5     # relative size: 1 2 3 5 8 13, nothing else
+board task estimate T-42 8                       # or afterwards, from anyone in the project
+board task patch T-42 --priority 80              # what should be picked up next
+```
+
+The board records which model gave each estimate and what the task then cost in tokens, and
+publishes both on `/metrics` — see `docs/grafana-ai-agents-dashboard.json` for the panels that
+put one against the other.
 
 Role control, for when you want to decide who coordinates:
 

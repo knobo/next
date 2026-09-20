@@ -805,13 +805,22 @@ conformance script as its acceptance criterion (Q1=yes, Q2=yes, Q3=no). It was.
 
   The asymmetry between windows matters: a 5-hour window heals overnight, a week-long one does
   not, and it is the same budget the human works from. The ceiling
-  (`budget.<project>.ceilings`) is therefore the human's decision in the policy, like `phase`, and
+  (`budget.<project>.ceilings`) is therefore the human's decision, like `phase`, and
   a missing one means a ceiling of 0. Because 0 ≥ 0 is always true, a missing line stops the
   ENTIRE fleet — so the board distinguishes "set to 0" from "missing": when it is missing, the
   `budget` block carries `ceilings_missing` + `note`, the status page shows it, and `finished`
-  pushes the reason. **Deploying board.py requires adding `budget.<project>.ceilings` to the live
-  policy in the same motion; otherwise every agent in every project stands down at its next status
-  check.**
+  pushes the reason.
+
+  The decision is the human's; the *place* it is written is now either of two, and the board says
+  which. `board-policy.json` is still the default. On top of it sits an override the owner sets
+  **from the board itself** — the draggable ceiling on `/status`, or `board ceiling 5h 85` — stored
+  per project and reported as `budget.source: board`. It exists because the policy file is
+  deliberately never deployed (`k8s/board.yaml`), which made it the right place to keep a living
+  decision and the wrong place to reach at three in the morning: a project the file did not
+  mention stopped its whole fleet, and the only remedy was to ssh in and edit YAML. The override
+  is written behind the human token and nothing else — a ceiling an agent can raise is not a
+  ceiling (§3.7). Clearing a window hands it back to the policy. The same surface carries
+  `limits.<project>.unreviewed`, the review limit.
 - **Convention drift between projects.** The manifest covers *shape* (paths, repos, worktrees), but
   not project-specific *rules* ("merge means production here", migration numbering, explicit
   `model:`). Those belong in the project's `onboarding:` file, and the skill has to read it. A

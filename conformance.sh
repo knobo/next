@@ -1973,6 +1973,139 @@ for A in "$AID" "$BID" "$CLIID" $(api GET '/status?project=demo' \
          | jq -r '.projects[0].agents[]?|select(.status!="finished")|.id'); do
   [ -n "$A" ] && api POST "/agents/$A/finished" '{"reason":"conformance done"}' >/dev/null
 done
+# ---------------------------------------------------------------------------
+echo "== estimates: a relative size, and who gave it =="
+# `sizing` is the suite's own project, like zerobudget/rampproject above. It deliberately
+# has NO entry in the test policy's budget, which is also what makes it the right place to
+# test the ceiling override: a project the policy does not mention is exactly the case
+# that used to stop a whole fleet with a note telling the owner to go and edit YAML.
+api POST '/projects' '{"project":"sizing","phase":"build"}' >/dev/null
+EA=$(api POST '/agents' '{"project":"sizing","harness":"claude-code","host":"sz","session":"sz1","model":"claude-opus-5"}' | jq -r .id)
+EB=$(api POST '/agents' '{"project":"sizing","harness":"codex","host":"sz","session":"sz2","model":"gpt-5"}' | jq -r .id)
+ET=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"sized at birth\",\"estimate\":5,\"agent\":\"$EA\"}" | jq -r .id)
+check "a task can be created with an estimate" "$(api GET "/tasks/$ET")" '.estimate == 5'
+check "the estimate records the model that gave it" "$(api GET "/tasks/$ET")" \
+  '.estimate_model == "claude-opus-5" and .estimate_by == "'"$EA"'"'
+check "an estimate off the scale is refused, and says what the scale is" \
+  "$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"no\",\"estimate\":4,\"agent\":\"$EA\"}")" \
+  '.error != null and (.estimates|index(13)) != null'
+# The queue fields describe the QUEUE, not the work: they are set while grooming, before
+# anyone has claimed anything. Requiring ownership made the estimate unrecordable in the
+# one moment it is actually made.
+check "another agent can size an unclaimed task" \
+  "$(api PATCH "/tasks/$ET" "{\"agent\":\"$EB\",\"estimate\":8}")" '.estimate == 8'
+check "sizing it again records the NEW estimator" "$(api GET "/tasks/$ET")" \
+  '.estimate_model == "gpt-5"'
+api POST "/tasks/$ET/claim" "{\"agent\":\"$EA\"}" >/dev/null
+check "another agent can still reprioritise a claimed task" \
+  "$(api PATCH "/tasks/$ET" "{\"agent\":\"$EB\",\"priority\":91}")" '.priority == 91'
+# risk gates the merge (§3.6). It is not a queue field and must stay the owner's.
+check "another agent cannot lower the risk on a claimed task" \
+  "$(api PATCH "/tasks/$ET" "{\"agent\":\"$EB\",\"risk\":\"low\"}")" '.error != null'
+check "clearing an estimate clears who gave it" \
+  "$(api PATCH "/tasks/$ET" "{\"agent\":\"$EA\",\"estimate\":null}")" \
+  '.estimate == null and .estimate_model == null'
+api PATCH "/tasks/$ET" "{\"agent\":\"$EA\",\"estimate\":5}" >/dev/null
+
+echo "== what a task cost, and the metrics it feeds =="
+api POST "/tasks/$ET/progress" "{\"agent\":\"$EA\",\"dispatch\":\"implementer:claude-sonnet-5\"}" >/dev/null
+api POST "/tasks/$ET/progress" "{\"agent\":\"$EA\",\"dispatch\":\"implementer:claude-sonnet-5\",\"tokens\":12000,\"result\":\"green\"}" >/dev/null
+check "the two halves of one dispatch fold into one costed row" "$(api GET "/tasks/$ET")" \
+  '.cost.dispatches == 1 and .cost.tokens == 12000 and .cost.complete == true'
+check "the queue carries each task's cost" "$(api GET '/status?project=sizing')" \
+  '[.projects[0].tasks[]|select(.id=="'"$ET"'")][0].cost.tokens == 12000'
+MET=$(curl -sS -m 5 "$BOARD_URL/metrics")
+check "metrics: tasks are counted by the model that sized them" \
+  "$(jq -nc --arg m "$MET" '{m:$m}')" \
+  '.m | test("board_tasks_estimated_total\\{project=\"sizing\",estimate_model=\"claude-opus-5\",estimate=\"5\"\\} 1")'
+check "metrics: tokens are counted against the estimate they were spent on" \
+  "$(jq -nc --arg m "$MET" '{m:$m}')" '.m | test("board_task_estimate_tokens_total")'
+check "metrics: tokens are also counted by the model that did the work" \
+  "$(jq -nc --arg m "$MET" '{m:$m}')" \
+  '.m | test("board_task_tokens_total\\{project=\"sizing\",model=\"claude-sonnet-5\"")'
+check "metrics: the queue's size in points" "$(jq -nc --arg m "$MET" '{m:$m}')" \
+  '.m | test("board_task_estimate_points\\{project=\"sizing\"")'
+# An estimate is only worth measuring against a cost that is WHOLE. One dispatch that
+# never reported its tokens turns the sum into a floor, and a floor averaged over a model
+# says that model is cheaper than it is — so the task drops out of the estimate series
+# entirely until the number arrives.
+api POST "/tasks/$ET/progress" "{\"agent\":\"$EA\",\"dispatch\":\"reviewer:claude-opus-5\"}" >/dev/null
+check "a dispatch with no token count makes the sum a floor, not a total" "$(api GET "/tasks/$ET")" \
+  '.cost.complete == false and .cost.tokens == 12000'
+check "metrics: a floor is left out of the estimate series rather than averaged in" \
+  "$(jq -nc --arg m "$(curl -sS -m 5 "$BOARD_URL/metrics")" '{m:$m}')" \
+  '(.m | test("board_task_estimate_tokens_total\\{project=\"sizing\"")) == false'
+
+echo "== the ceiling is the owner's, and only the owner's =="
+check "a project the policy does not mention says so in plain words" \
+  "$(api GET '/status?project=sizing')" \
+  '.projects[0].budget.ceilings_missing == true and (.projects[0].budget.note|test("board"))'
+check "an agent cannot set a ceiling" \
+  "$(api POST '/projects/sizing/ceilings' '{"ceiling.5h":99}')" \
+  '.needs_human_token == true'
+check "the human sets one from the board" \
+  "$(hum POST '/projects/sizing/ceilings' '{"ceiling.5h":70,"ceiling.7d":40,"wip":2}')" \
+  '.ceilings["5h"] == 70 and .wip == 2'
+check "what the owner set beats board-policy.json, and says which it is" \
+  "$(api GET '/status?project=sizing')" \
+  '.projects[0].budget.source == "board" and .projects[0].budget.ceilings["7d"] == 40
+   and (.projects[0].budget.ceilings_missing // false) == false'
+check "the review limit the owner set is the one the board enforces" \
+  "$(api GET '/status?project=sizing')" '.projects[0].wip == 2'
+# The bug this check exists for: each gauge is its own form carrying ONE window, so
+# dragging one handle posted one window — and an override that replaced the policy dict
+# wholesale then deleted every other ceiling and stopped the project, with a note pointing
+# at a file that already had the value. That is the exact gesture the feature is for.
+check "setting one window leaves the others standing" \
+  "$(hum POST '/projects/demo/ceilings' '{"ceiling.5h":70}')" '.ceilings["5h"] == 70'
+check "…and the project keeps the policy's other windows" "$(api GET '/status?project=demo')" \
+  '.projects[0].budget.ceilings["7d"] == 75 and .projects[0].budget.ceilings["5h"] == 70'
+check "…with the overridden window named, not the whole project claimed" \
+  "$(api GET '/status?project=demo')" \
+  '.projects[0].budget.overridden == ["5h"] and .projects[0].budget.source == "board"'
+check "…and no agent is stopped for a window nobody touched" \
+  "$(api GET '/status?project=demo')" \
+  '(.projects[0].budget.ceilings_missing // false) == false'
+hum POST '/projects/demo/ceilings' '{"ceiling.5h":""}' >/dev/null
+check "clearing it hands the window back to the policy, in full" \
+  "$(api GET '/status?project=demo')" \
+  '.projects[0].budget.ceilings["5h"] == 85 and .projects[0].budget.source == "policy"
+   and .projects[0].budget.overridden == []'
+check "a percentage outside 0-100 is refused" \
+  "$(hum POST '/projects/sizing/ceilings' '{"ceiling.5h":140}')" '.error != null'
+check "an empty value hands the window back to the policy" \
+  "$(hum POST '/projects/sizing/ceilings' '{"ceiling.7d":""}')" '.ceilings["7d"] == null'
+check "an agent cannot change the phase" \
+  "$(api POST '/projects/sizing/phase' '{"phase":"live"}')" '.needs_human_token == true'
+check "the human can" "$(hum POST '/projects/sizing/phase' '{"phase":"launch"}')" \
+  '.phase == "launch"'
+check "an unknown phase is refused" "$(hum POST '/projects/sizing/phase' '{"phase":"shipping"}')" \
+  '.error != null'
+
+echo "== a question is never invisible, whatever became of its task =="
+QT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"will be archived\",\"agent\":\"$EA\"}" | jq -r .id)
+QQ=$(api POST '/questions' "{\"project\":\"sizing\",\"task\":\"$QT\",\"text\":\"still open when the task went away?\",\"agent\":\"$EA\"}" | jq -r .id)
+hum POST "/tasks/$QT/archive" '{}' >/dev/null
+check "archiving a task does not answer its open question" "$(api GET '/questions')" \
+  '[.questions[]?|select(.id=="'"$QQ"'" and .status=="open")]|length == 1'
+# The HTML is where it was actually lost: questions hang under their task row, and an
+# archived task has no row. `board task cleanup-done` archives in bulk, so this is routine.
+HQ=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status?project=sizing")
+check "…and the board still shows it, in a card of its own" \
+  "$(jq -nc --arg h "$HQ" '{h:$h}')" '.h | test("'"$QQ"'")'
+api POST "/questions/$QQ/answer" '{"answer":"tidied by conformance","by":"board"}' >/dev/null
+
+echo "== the owner can take a task back from a live agent =="
+check "another agent cannot release someone else's task" \
+  "$(api POST "/tasks/$ET/release" "{\"agent\":\"$EB\"}")" '.error != null'
+check "the human can" "$(hum POST "/tasks/$ET/release" '{}')" '.ok == true'
+check "and the task is back in the queue, unowned" "$(api GET "/tasks/$ET")" \
+  '.owner == null and .status == "open"'
+api POST "/tasks/$ET/claim" "{\"agent\":\"$EA\"}" >/dev/null
+check "the human can archive a task a live agent holds" \
+  "$(hum POST "/tasks/$ET/archive" '{}')" '.ok == true'
+for X in $EA $EB; do api POST "/agents/$X/finished" '{"reason":"queue empty"}' >/dev/null; done
+
 # The suite owns `demo` entirely and must hand it back EMPTY. If we left remnants behind they
 # sorted first in `task next` on the next run and failed the suite's own assertions — it
 # tripped over its own litter.

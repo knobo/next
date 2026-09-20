@@ -277,6 +277,7 @@ message::board message <agent> --text "..."::Send a free-text message to an agen
 routines|routine::board routines [--project <p>] [--status <s>] [--json]::List scheduled routines.
 role::board role pin|unpin|claim|recommend [role]::Claim, release, or recommend a coordination role.
 pause|resume::board pause|resume [note]::Pause or resume a project.
+ceiling::board ceiling [<window> <pct>] [--wip <n>] [--project <p>]::Show or set the quota ceiling and the review limit (human token).
 status::board status [--project <p>] [--json|--md|--me]::Show agents, tasks and open questions.
 tail::board tail [--since <n>]::Stream board events since a point in time.
 open::board open [page] [--qr]::Open the board UI (or print a login QR for a phone).
@@ -299,6 +300,7 @@ cleanup-done::board task cleanup-done [--project <p>]::Bulk-archive old done tas
 release::board task release <id>::Release a claimed task back to the queue.
 show::board task show <id> [--json]::Show a task's detail and timeline.
 patch::board task patch <id> [fields...]::Patch arbitrary fields on a task.
+estimate::board task estimate <id> <points>::Set a task's relative size (1 2 3 5 8 13).
 deployed::board task deployed <id>::Mark a task as deployed.
 comment::board task comment <id> "note"::Add a free-text comment to a task.
 deploy::board task deploy <id> --env <env>::Run the manifest's deploy against origin/main.
@@ -703,6 +705,13 @@ print(next((l['token'] for l in c['logins'] if l['name']=='${FORGE_LOGIN:-claude
                else "owner  (none)" end)
             ' <<<"$r" ;;
     patch)  req PATCH "/tasks/$t" "$(with_agent "$(body)")" ;;
+    estimate) # board task estimate <id> <points>   — relative size, one of 1 2 3 5 8 13.
+            # A first-class verb rather than `task patch --estimate`, because the number
+            # is only worth recording if it is easy enough to record that it actually
+            # gets recorded. The board refuses anything off the scale: a size that is
+            # not comparable across agents answers no question at all.
+            [ "${POS[1]:-}" ] || die "board task estimate <id> <points> — one of 1 2 3 5 8 13"
+            req PATCH "/tasks/$t" "$(with_agent "$(body estimate "${POS[1]}")")" ;;
     deployed) req POST "/tasks/$t/deployed" "$(with_agent "$(body)")" ;;
     comment) # free text on a task. The human token makes the human the sender.
             req POST "/tasks/$t/comment" "$(with_agent "$(body text "${POS[1]:-}")")" ;;
@@ -944,6 +953,35 @@ role)
     recommend) req GET "/roles/recommendation?project=$proj&role=$role" ;;
     *) die "board role pin|unpin|claim|recommend [role]" ;;
   esac ;;
+
+ceiling)
+  # board ceiling [<window> <pct>] [--wip <n>] [--project <p>] [--json]
+  # The quota ceiling and the review limit, set from a shell instead of by hand-editing
+  # board-policy.json on the host. Human token only, and deliberately so: DESIGN.md §3.7
+  # and CONTRIBUTING.md both say an agent must never be able to raise its own ceiling.
+  # With no arguments it prints what is set and where it came from.
+  parse "$@"
+  b=$(body)
+  p=$(project_name "$(jq -r '.project // empty' <<<"$b")")
+  [ -n "$p" ] || die "no project found — run this inside a project that has project.yaml, or use --project"
+  wip=$(jq -r '.wip // empty' <<<"$b")
+  if [ ${#POS[@]} -eq 0 ] && [ -z "$wip" ]; then
+    r=$(req GET "/status?project=$p")
+    jq -e '.json' >/dev/null <<<"$b" && { jq -c '.projects[0]|{project:.name,budget,wip}' <<<"$r"; exit 0; }
+    jq -r '.projects[0] | "\(.name): " + ((.budget.ceilings|to_entries|map("\(.key)=\(.value)")|join(" ")) // "none")
+            + " (\(.budget.source // "policy"))  review limit \(.wip)"' <<<"$r"
+    exit 0
+  fi
+  req_body='{}'
+  if [ ${#POS[@]} -ge 2 ]; then
+    req_body=$(jq -nc --arg k "ceiling.${POS[0]}" --arg v "${POS[1]}" '{($k): $v}')
+  elif [ ${#POS[@]} -eq 1 ]; then
+    die "a ceiling needs a window and a percentage: board ceiling 5h 85"
+  fi
+  [ -n "$wip" ] && req_body=$(jq -c --arg w "$wip" '.wip=$w' <<<"$req_body")
+  r=$(req POST "/projects/$p/ceilings" "$req_body") || { echo "$r"; exit 1; }
+  jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
+  jq -r '"\(.project): " + (.ceilings|to_entries|map("\(.key)=\(.value)")|join(" ")) + "  review limit \(.wip)"' <<<"$r" ;;
 
 pause|resume)
   parse "$@"; b=$(body)

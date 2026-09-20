@@ -10,11 +10,16 @@ cd "$(dirname "$0")"
 W="$(cd .. && pwd)"
 OUT="${1:-$(mktemp -d)/board-shots}"; mkdir -p "$OUT"; rm -f "$OUT"/*.png
 T=shot-$RANDOM; P=$((19000 + RANDOM % 900)); D=$(mktemp -d)
+# The screenshots are taken AS THE OWNER. Half the surface this exists to look at — the
+# ceiling handles, the priority and size fields, pause, phase — only renders for the human
+# token, so a shot taken with the agent token shows a board with its controls missing and
+# nothing to say that is why.
+HT=shothum-$RANDOM
 cat > "$D/policy.json" <<'POL'
 {"budget": {"*": {"ceilings": {"5h": 85, "7d": 60}, "fallback": {"max_tasks": 12}}},
  "grants": {"*": ["merge", "deploy-dev"]}}
 POL
-BOARD_TOKEN=$T BOARD_DB=$D/b.db BOARD_POLICY=$D/policy.json BOARD_PORT=$P \
+BOARD_TOKEN=$T BOARD_HUMAN_TOKEN=$HT BOARD_DB=$D/b.db BOARD_POLICY=$D/policy.json BOARD_PORT=$P \
   python3 "$W/board.py" >"$D/log" 2>&1 &
 SRV=$!; trap 'kill $SRV 2>/dev/null' EXIT
 for _ in $(seq 40); do curl -sf "http://127.0.0.1:$P/healthz" >/dev/null && break; sleep .1; done
@@ -33,24 +38,26 @@ A -X POST "$B/api/v1/agents/$A3/heartbeat" -d '{"ctx_pct":88,"budget":[{"window"
 A -X PUT "$B/api/v1/agents/$A1/preference" -d '{"role":"coordinator"}' >/dev/null 2>&1
 curl -s -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -X POST "$B/api/v1/roles" -d "{\"project\":\"board\",\"role\":\"coordinator\",\"agent\":\"$A1\"}" >/dev/null 2>&1
 
-t(){ A -X POST "$B/api/v1/tasks" -d "{\"project\":\"$1\",\"title\":\"$2\",\"repo\":\"$3\",\"risk\":\"$4\",\"priority\":$5,\"agent\":\"$A1\"}" | jq -r .id; }
-T1=$(t board "the board gets a UI framework: Tailwind + daisyUI, built in and checked in" . normal 99)
-T2=$(t board "the merge gate no longer waits on a human test" . normal 96)
-T3=$(t board "the coordinator's own cost per task" . low 45)
-T4=$(t board "a statusline heartbeat every 1-3 s captures 85% of the events" . low 30)
-T5=$(t shopfront "per-item try/catch in the scheduled sweep" api high 80)
-T6=$(t board "the merge mutex is released once the merge has landed" . normal 60)
+t(){ A -X POST "$B/api/v1/tasks" -d "{\"project\":\"$1\",\"title\":\"$2\",\"repo\":\"$3\",\"risk\":\"$4\",\"priority\":$5,\"estimate\":$6,\"agent\":\"$A1\"}" | jq -r .id; }
+T1=$(t board "the board gets a UI framework: Tailwind + daisyUI, built in and checked in" . normal 99 13)
+T2=$(t board "the merge gate no longer waits on a human test" . normal 96 3)
+T3=$(t board "the coordinator's own cost per task" . low 45 5)
+T4=$(t board "a statusline heartbeat every 1-3 s captures 85% of the events" . low 30 2)
+T5=$(t shopfront "per-item try/catch in the scheduled sweep" api high 80 1)
+T6=$(t board "the merge mutex is released once the merge has landed" . normal 60 8)
 A -X POST "$B/api/v1/tasks/$T1/claim" -d "{\"agent\":\"$A1\"}" >/dev/null
 A -X POST "$B/api/v1/tasks/$T1/progress" -d "{\"agent\":\"$A1\",\"note\":\"model=opus Q1=y Q3=n — the acceptance criterion is a command, but the CSP makes the choice of framework more than a one-repo change\",\"dispatch\":\"implementer:sonnet\"}" >/dev/null
 A -X POST "$B/api/v1/tasks/$T1/progress" -d "{\"agent\":\"$A1\",\"note\":\"stylesheet built and checked in, 47 kB, no network references\",\"dispatch\":\"implementer:sonnet\",\"tokens\":84213,\"result\":\"four pages rebuilt, conformance green\"}" >/dev/null
 A -X POST "$B/api/v1/tasks/$T1/progress" -d "{\"agent\":\"$A1\",\"pr\":\"http://forge.example.com/demo/board/pulls/42\",\"status\":\"in_review\"}" >/dev/null
 A -X POST "$B/api/v1/tasks/$T1/review" -d "{\"agent\":\"$A1\",\"open\":1,\"fixed\":3}" >/dev/null
+A -X POST "$B/api/v1/tasks/$T1/progress" -d "{\"agent\":\"$A1\",\"dispatch\":\"reviewer:opus\",\"tokens\":21870,\"result\":\"3 findings, 1 blocking\"}" >/dev/null
 A -X POST "$B/api/v1/tasks/$T6/claim" -d "{\"agent\":\"$A2\"}" >/dev/null
+A -X POST "$B/api/v1/tasks/$T6/progress" -d "{\"agent\":\"$A2\",\"dispatch\":\"implementer:sonnet\",\"tokens\":9100,\"result\":\"green\"}" >/dev/null
 A -X POST "$B/api/v1/tasks/$T3/blocked" -d "{\"agent\":\"$A1\",\"note\":\"waiting on a human design decision: total_input_tokens is the context window size and GOES DOWN on compaction, so the difference claimed→done is meaningless. The only cumulative field is cost.total_cost_usd, which breaks the vendor neutrality T-164 introduced.\"}" >/dev/null
 A -X POST "$B/api/v1/tasks/$T5/claim" -d "{\"agent\":\"$A3\"}" >/dev/null
 QP=$(A -X POST "$B/api/v1/questions" -d "{\"project\":\"board\",\"task\":\"$T3\",\"kind\":\"product\",\"text\":\"Should the board measure the coordinator's own share in USD (cumulative, but only one harness reports it), or should the task be closed as unbuildable?\",\"default\":\"a unit-tagged optional field\",\"options\":[\"usd\",\"close\"],\"deadline\":\"8h\",\"agent\":\"$A1\"}" | jq -r .id)
 QD=$(A -X POST "$B/api/v1/questions" -d "{\"project\":\"board\",\"task\":\"$T4\",\"kind\":\"question\",\"text\":\"Should the heartbeat fire on every statusline render, or be throttled to every 20 seconds?\",\"default\":\"throttle to 20s\",\"deadline\":\"1s\",\"agent\":\"$A1\"}" | jq -r .id)
-echo "QP=$QP QD=$QD"; sleep 2; curl -s "$B/status" -H "Authorization: Bearer $T" >/dev/null
+echo "QP=$QP QD=$QD"; sleep 2; curl -s "$B/status" -H "Authorization: Bearer $HT" >/dev/null
 
 cat > "$D/shot.js" <<JS
 const { chromium } = require('playwright');
@@ -60,7 +67,7 @@ const { chromium } = require('playwright');
   for (const scheme of ['light','dark']) {
     for (const vp of [[1280,900,'wide'],[390,844,'phone']]) {
       const c = await b.newContext({colorScheme: scheme, viewport: {width: vp[0], height: vp[1]},
-        deviceScaleFactor: 2, extraHTTPHeaders: {Authorization: 'Bearer $T'}});
+        deviceScaleFactor: 2, extraHTTPHeaders: {Authorization: 'Bearer $HT'}});
       const p = await c.newPage();
       const errs = [];
       p.on('console', m => { if (m.type() === 'error') errs.push(m.text()); });

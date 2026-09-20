@@ -220,8 +220,15 @@ kubectl -n board create configmap board-policy \
 ```
 
 The board-policy ConfigMap is deliberately never applied by a deploy: it holds the grants and the
-quota ceilings, it is edited on the host between deploys, and a copy in the repo would silently
-roll back any ceiling set since the last commit — for the whole fleet at once.
+default quota ceilings, it is edited on the host between deploys, and a copy in the repo would
+silently roll back any ceiling set since the last commit — for the whole fleet at once.
+
+That file is still where the grants live, but it is no longer the only place a ceiling can be set.
+The quota ceiling and the review limit can be set from the board itself — the handle on the meter
+on `/status`, or `board ceiling 5h 85` — and what is set there beats the file, which the page and
+`board status --me` both say outright. It exists because a project the file did not mention stopped
+its whole fleet, and the only remedy was to ssh in and edit YAML at whatever hour it happened.
+Behind the human token, and only that: a ceiling an agent can raise is not a ceiling.
 
 ### Change the HTML pages
 
@@ -276,11 +283,15 @@ code), and the human tests in dev or prod after deploy.
   20/s in front of the ingress.
 - Grants come from `board-policy.json` on the board — an agent cannot give itself merge or prod
   rights (DESIGN.md §3.7).
+- The same holds for everything the owner decides: the quota ceiling, the review limit, the phase,
+  who is pinned to a role, and taking a task back off a running agent. Every one of them is drawn
+  only for the human token AND refused on the server without it, so a browser signed in as an
+  agent renders the board and can change nothing on it.
 
 ## Status and honesty
 
 What works: the board, the CLI, the skill, the gate, the reaper, the quota accounting, the
-notification path, the HTML pages, and 219 conformance checks over the whole API.
+notification path, the HTML pages, and 360 conformance checks over the whole API.
 
 What is not covered:
 
