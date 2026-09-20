@@ -2054,13 +2054,17 @@ def ribbon_events(project, hours=RIBBON_HOURS):
     Indexed by events(type, project, id) — four seeks, not a scan of the log."""
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
     out = []
+    # DESC, then put back in order. `ORDER BY ts LIMIT 300` truncates from the far end:
+    # a project with more than 300 of these in twelve hours would have rendered its
+    # OLDEST ones and left the last few hours — the part a morning reader opens the board
+    # for — silently empty.
     for r in db.execute(
             "SELECT ts, type, stream FROM events WHERE project=? AND ts>=? AND type IN (%s) "
-            "ORDER BY ts LIMIT 300" % ",".join("?" * len(RIBBON_KINDS)),
+            "ORDER BY ts DESC LIMIT 300" % ",".join("?" * len(RIBBON_KINDS)),
             [project, since] + list(RIBBON_KINDS)):
         out.append({"ts": r["ts"], "kind": RIBBON_KINDS[r["type"]], "type": r["type"],
                     "ref": r["stream"].split("/", 1)[-1] if "/" in r["stream"] else r["stream"]})
-    return out
+    return out[::-1]
 
 
 
@@ -2495,16 +2499,9 @@ var LS={g:function(k,d){try{return localStorage.getItem(k)||d;}catch(e){return d
 var AGE={'1h':60,'24h':1440,'7d':10080};
 var STOP={'blocked':1,'orphaned':1},FLY={'claimed':1,'merging':1};
 
-/* the project you last had open comes back open */
-var pjs=document.querySelectorAll('.pj'),FK='board:focus',want=LS.g(FK,''),found;
-for(var i=0;i<pjs.length;i++){
-  if(pjs[i].dataset.p===want)found=pjs[i];
-  pjs[i].addEventListener('toggle',function(){
-    if(this.open)LS.s(FK,this.dataset.p);
-    else if(LS.g(FK,'')===this.dataset.p)LS.s(FK,'');
-  });
-}
-(found||pjs[0]||{}).open=true;
+/* Projects are bands, not <details>: nothing to open, nothing to remember. The rail's
+   project filter is what narrows the board now, and it remembers its own value. */
+var pjs=document.querySelectorAll('.pj');
 
 /* links from a notification carry the filter with them */
 var qs=new URLSearchParams(window.location.search);
@@ -2925,7 +2922,7 @@ QUEUE_GROUPS = (
 )
 
 
-def queue_card(t, human, back, questions, big):
+def queue_card(t, human, back, questions, big, hidden=False):
     """A task. `big` ones carry their title at reading size; the rest are one line,
     because forty rows that all look important look like a spreadsheet and get read like
     one.
@@ -2943,9 +2940,13 @@ def queue_card(t, human, back, questions, big):
     pr_h = (("<a class='%s %s' href='%s'>#%s</a>" % (LINK, MONO, escape(t["pr"]), escape(pn))
              if str(t.get("pr", "")).startswith("http") else
              "<span class='%s'>#%s</span>" % (MONO, escape(pn))) if pn else "")
-    qs = "".join(q_inline(q, q["answer"] if q["status"] == "defaulted" else None)
-                 for q in questions)
-    return ("<article class='tk-row %s%s' data-task data-status='%s' data-mins='%d' id='%s'>"
+    # One container owning the grid area, not N items placed into it: named-area
+    # placement does not auto-flow, so two questions on the same task landed in the
+    # identical cell and drew on top of each other.
+    qs = ("<div class='tk-qs'>%s</div>" % "".join(
+        q_inline(q, q["answer"] if q["status"] == "defaulted" else None)
+        for q in questions)) if questions else ""
+    return ("<article class='tk-row %s%s' data-task data-status='%s' data-mins='%d' id='%s'%s>"
             "<span class='tk-pri'>%s</span>"
             "<a class='tk-id %s %s' href='/t/%s'>%s</a>"
             "<span class='badge badge-sm %s tk-st'>%s</span>"
@@ -2954,6 +2955,10 @@ def queue_card(t, human, back, questions, big):
             "%s</article>" % (
                 "tk-big" if big else "", " " + SPINE.get(st, "") if SPINE.get(st) else "",
                 escape(st), mins, escape(t["id"]),
+                # Hidden in the markup and not only by the script at the end of <body>:
+                # thirty landed rows would otherwise paint and then disappear, and stay
+                # for good if the script never runs.
+                " style='display:none;'" if hidden else "",
                 prio_cell(t, human, back),
                 LINK, MONO, escape(t["id"]), escape(t["id"]),
                 BADGE.get(st, "badge-ghost"), escape(st),
@@ -3006,11 +3011,19 @@ def queue(p, human, back):
         "SELECT * FROM tasks WHERE project=? AND status='done' ORDER BY updated DESC LIMIT 30",
         (p["name"],))]
     if done:
-        html.append("<h3 class='grp grp-landed' data-task data-status='done' data-mins='0'>"
-                    "landed<span class='%s grp-n'>%d</span></h3>" % (MONO, len(done)))
+        # No data-task on the heading: the row loop counts every [data-task] into the
+        # rail's "N shown, M hidden" readout, so the heading reported itself as a task.
+        # Empty groups are hidden by the group pass, which needs no marker here.
+        html.append("<h3 class='grp grp-landed'>landed<span class='%s grp-n'>%d</span></h3>"
+                    % (MONO, len(done)))
         for t in done:
             shown.add(t["id"])
-            html.append(queue_card(t, human, back, (), big=False))
+            # Landed rows carry their own questions like any other: a task can be done
+            # with a question still open on it, and `shown` then denies it the fallback
+            # card too — so it vanished from the board entirely while the API still
+            # reported it open. `board task cleanup-done` makes that routine.
+            html.append(queue_card(t, human, back, by_task.get(t["id"], ()),
+                                   big=False, hidden=True))
     return "".join(html), shown
 
 
@@ -3058,8 +3071,8 @@ def band_head(p, human):
     stacked as identical accordions, nothing on screen told you which one you were
     reading once its heading had scrolled away. The name now stays, and a rule runs the
     full height of the band beside everything that belongs to it."""
-    pause = ("<span class='badge badge-sm badge-error'>paused</span>"
-             if p.get("paused") else "")
+    pause = ("<span class='badge badge-sm badge-error'>paused: %s</span>"
+             % escape(p["paused"]) if p.get("paused") else "")
     btn = ""
     if human:
         act, label, cls, confirm = (

@@ -46,6 +46,14 @@ TQ=$(A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","te
 A -X POST "$B/api/v1/projects" -d '{"project":"other","phase":"live","goal":"a second project"}' >/dev/null
 AG2=$(A -X POST "$B/api/v1/agents" -d '{"project":"other","model":"grok-4","harness":"grok","host":"h2","session":"s2"}' | jq -r .id)
 A -X POST "$B/api/v1/tasks" -d '{"project":"other","title":"work in the other project","agent":"'"$AG2"'"}' >/dev/null
+# A task that has landed, so the check on hidden landed rows has something to measure —
+# and so the `landed` group is exercised at all.
+DONEID=$(A -X POST "$B/api/v1/tasks" -d '{"project":"demo","title":"a task that already landed","repo":".","agent":"'"$AG"'"}' | jq -r .id)
+A -X POST "$B/api/v1/tasks/$DONEID/claim" -d '{"agent":"'"$AG"'"}' >/dev/null
+A -X POST "$B/api/v1/tasks/$DONEID/done" -d '{"agent":"'"$AG"'","no_merge":true}' >/dev/null
+# A second question on the SAME task: one question cannot show whether two of them stack
+# or draw on top of each other.
+A -X POST "$B/api/v1/questions" -d '{"project":"demo","task":"'"$TID"'","text":"And should the second question sit under the first?","default_answer":"yes","deadline":"8h","agent":"'"$AG"'"}' >/dev/null
 
 CSSURL=$(python3 - <<PY
 import hashlib
@@ -176,15 +184,28 @@ grep -q "chip chip-off" "$D/agent.html" \
 # The theme switch is on EVERY page, because the header is, and its script is admitted by
 # its own hash — a second inline script means a second hash, and forgetting one is a
 # silent CSP block, not an error anyone sees.
+THEMEOK=1
 for pth in "/status" "/t/$TID" "/q/$QID"; do
   curl -s -H "Authorization: Bearer $HT" "$B$pth" | grep -q "data-theme-set='dark'" \
-    || { no "$pth has no theme switch"; continue; }
+    || { no "$pth has no theme switch"; THEMEOK=0; }
 done
-ok "the theme switch is on every page"
+# The ok belongs inside the result, not after the loop: it used to print unconditionally
+# and claim success on the very page it had just reported as missing the switch.
+[ "$THEMEOK" = 1 ] && ok "the theme switch is on every page"
 HASHES=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $HT" "$B/status" \
          | grep -i '^content-security-policy' | grep -o "sha256-" | wc -l)
 [ "$HASHES" = 2 ] && ok "both inline scripts are admitted by hash" \
   || no "the CSP names $HASHES script hashes, expected 2 (theme + filters)"
+# Landed rows must be hidden in the MARKUP, not only by the script at the end of <body>:
+# up to thirty of them per project would otherwise paint and then vanish, and stay for
+# good wherever the script does not run.
+python3 - "$D/human.html" <<'LPY' && ok "landed rows are hidden in the markup, not only by script" \
+  || no "a landed row would paint before the script hides it"
+import re, sys
+h = open(sys.argv[1]).read()
+rows = re.findall(r"<article class='tk-row[^>]*data-status='done'[^>]*>", h)
+sys.exit(0 if rows and all("display:none" in r for r in rows) else 1)
+LPY
 # <form> is not allowed inside <p>. The browser closes the paragraph at the form's start
 # tag and re-parents the form as a sibling — so a control laid out inside a phrase ends up
 # on a line of its own, and NOTHING in the served markup shows it. It cost a real
@@ -264,6 +285,23 @@ const { chromium } = require('playwright');
         if (await p.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)) {
           console.log('  FAIL ' + path + ' ' + scheme + '/' + name + ' scrolls horizontally'); bad++;
         }
+      }
+      // Two questions on one task used to be placed into the SAME named grid area and
+      // drew one over the other. Only layout can show that; the markup looks fine.
+      if (scheme === 'light' && name === 'wide') {
+        await p.goto(B + '/status', { waitUntil: 'networkidle' });
+        const overlap = await p.evaluate(() => {
+          for (const row of document.querySelectorAll('.tk-row')) {
+            const qs = [...row.querySelectorAll('.qrow')];
+            for (let i = 1; i < qs.length; i++) {
+              const a = qs[i-1].getBoundingClientRect(), b = qs[i].getBoundingClientRect();
+              if (b.top < a.bottom - 1) return 'rows ' + (i-1) + '/' + i + ' overlap';
+            }
+          }
+          return null;
+        });
+        if (overlap) { console.log('  FAIL questions on one task overlap: ' + overlap); bad++; }
+        else console.log('  ok   two questions on one task stack instead of overlapping');
       }
       // The rail filters the whole board, and the theme switch is a real setting. Both
       // are script, so only a browser can say whether they work.

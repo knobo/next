@@ -2133,6 +2133,18 @@ HQ=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status?pr
 check "…and the board still shows it, in a card of its own" \
   "$(jq -nc --arg h "$HQ" '{h:$h}')" '.h | test("'"$QQ"'")'
 api POST "/questions/$QQ/answer" '{"answer":"tidied by conformance","by":"board"}' >/dev/null
+# The other half of the same failure, and the one that came back: a task that is DONE is
+# still drawn (landed rows are rendered and hidden), so it counts as "shown" and is denied
+# the fallback card — while its question is only drawn inline if the landed row is given
+# it. Miss that and the question is on neither surface.
+DT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"landed with a question open\",\"agent\":\"$EA\"}" | jq -r .id)
+api POST "/tasks/$DT/claim" "{\"agent\":\"$EA\"}" >/dev/null
+DQ=$(api POST '/questions' "{\"project\":\"sizing\",\"task\":\"$DT\",\"text\":\"open when the task landed?\",\"agent\":\"$EA\"}" | jq -r .id)
+api POST "/tasks/$DT/done" "{\"agent\":\"$EA\",\"no_merge\":true}" >/dev/null
+DH=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status?project=sizing")
+check "a question on a task that has landed is still on the board" \
+  "$(jq -nc --arg h "$DH" '{h:$h}')" '.h | test("'"$DQ"'")'
+api POST "/questions/$DQ/answer" '{"answer":"tidied by conformance","by":"board"}' >/dev/null
 
 echo "== the owner can take a task back from a live agent =="
 check "another agent cannot release someone else's task" \

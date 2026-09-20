@@ -204,7 +204,10 @@
              justify-content: flex-end;
              font-size: .8125rem; white-space: nowrap;
              color: color-mix(in oklab, var(--color-base-content) 60%, transparent); }
-  .tk-row > .qrow { grid-area: q; margin: .4rem 0 .2rem; }
+  /* One container owning the area, with the questions stacked inside it. Placing each
+     .qrow into the same named area put two questions on one task in the identical cell,
+     one drawn over the other: named-area placement does not auto-flow. */
+  .tk-qs { grid-area: q; display: grid; gap: .3rem; margin: .4rem 0 .2rem; }
 
   /* The first row of `stopped` and of `in flight` is the one you are most likely to act
      on, so it gets the reading size. Bigness is the hierarchy; if every row had it,
