@@ -2105,6 +2105,31 @@ grep -q "The queue is empty" <<<"$EQH" \
   || no "an empty queue behind landed work says nothing" "$(head -c 120 <<<"$EQH")"
 api POST "/agents/$EQA/finished" '{"reason":"queue empty"}' >/dev/null
 
+echo "== markdown: somebody else's text, rendered and not trusted =="
+MDT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"spec in markdown\",\"agent\":\"$EA\",\"spec\":\"## Heading\\n\\n- one\\n- two\\n\\nUse \\u0060--repo\\u0060 and **bold**.\"}" | jq -r .id)
+MDH=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$MDT")
+check "the spec is rendered, not printed flat" "$(jq -nc --arg h "$MDH" '{h:$h}')" \
+  '(.h|test("<h4>Heading</h4>")) and (.h|test("<li>one</li>"))
+   and (.h|test("<code>--repo</code>")) and (.h|test("<b>bold</b>"))'
+# The text is somebody ELSE'S. It is escaped first and the markup is built from the
+# escaped text, so nothing written into a spec can become an element — and a link only
+# survives if it goes somewhere over http.
+XT=$(api POST '/tasks' "{\"project\":\"sizing\",\"title\":\"untrusted\",\"agent\":\"$EA\",\"spec\":\"<script>alert(1)</script>\\n\\n[x](javascript:alert(1))\\n\\n[ok](https://example.com/a)\"}" | jq -r .id)
+XH=$(curl -sS -m 5 -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$XT")
+check "a script tag in a spec is text, never an element" "$(jq -nc --arg h "$XH" '{h:$h}')" \
+  '(.h|test("&lt;script&gt;")) and ((.h|test("<script>alert")) | not)'
+check "a javascript: link is left as plain text" "$(jq -nc --arg h "$XH" '{h:$h}')" \
+  '((.h|test("href=.javascript:")) | not) and (.h|test("\\[x\\]"))'
+check "an http link is a link" "$(jq -nc --arg h "$XH" '{h:$h}')" \
+  '.h|test("href=.https://example.com/a.")'
+for X in $MDT $XT; do api POST "/tasks/$X/archive" "{\"agent\":\"$EA\"}" >/dev/null; done
+
+echo "== a question keeps the default under either spelling =="
+DA=$(api POST '/questions' "{\"project\":\"sizing\",\"text\":\"written with the name the board itself prints?\",\"default_answer\":\"yes\",\"deadline\":\"8h\",\"agent\":\"$EA\"}" | jq -r .id)
+check "default_answer is accepted, not silently dropped" "$(api GET '/questions')" \
+  '[.questions[]?|select(.id=="'"$DA"'")][0].default_answer == "yes"'
+api POST "/questions/$DA/answer" '{"answer":"tidied by conformance","by":"board"}' >/dev/null
+
 echo "== a working agent that reports no quota is not a dead one =="
 NQ=$(api POST '/agents' '{"project":"sizing","harness":"codex","host":"nq","session":"nq1","model":"gpt-5"}' | jq -r .id)
 api POST "/agents/$NQ/heartbeat" '{"ctx_pct":10,"budget":[]}' >/dev/null

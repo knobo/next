@@ -1741,7 +1741,13 @@ def question_create(b, actor):
     db.execute("""INSERT INTO questions (id,project,task,asked_by,kind,text,options,
                   default_answer,deadline,status,created) VALUES (?,?,?,?,?,?,?,?,?,'open',?)""",
                (qid, project, b.get("task"), actor, kind,
-                b.get("text"), json.dumps(b.get("options", [])), b.get("default"),
+                # Both spellings. The column, the status payload and `board status --json`
+                # all say `default_answer`; only the request field said `default`. Anyone
+                # who read a question and wrote one back used the name they had just seen
+                # and lost their default in silence — and a question with no default never
+                # self-answers, so the agent blocks on it until a human appears.
+                b.get("text"), json.dumps(b.get("options", [])),
+                b.get("default") or b.get("default_answer"),
                 deadline_of(b.get("deadline")), now()))
     ev(project, "question/" + qid, "question.asked", actor, kind=kind, task=b.get("task"),
        text=b.get("text"))
@@ -2128,6 +2134,162 @@ def status(project=None):
             "roles": [dict(r) for r in db.execute("SELECT * FROM roles WHERE project=?", (name,))],
         })
     return out
+
+
+# ---------- markdown ------------------------------------------------------
+#
+# The board renders text somebody else wrote: a task spec, a plan, a question, a comment.
+# Until now all of it was escaped and printed flat, so a spec with headings and a list
+# arrived as one grey wall and the structure its author gave it was thrown away.
+#
+# Stdlib only, like the rest of the board (DESIGN.md §10) — and deliberately a SUBSET.
+# The rule that makes it safe is the order: the text is escaped FIRST and the markup is
+# built out of the escaped text afterwards, so nothing an agent writes can become an
+# element. `<script>` in a spec is `&lt;script&gt;` before this code ever looks at it.
+# That is also why every pattern below matches on escaped text (`&lt;`, `&amp;`) and why
+# the only href that survives is one this file wrote.
+MD_LINK = re.compile(r"\[([^\]\n]{1,200})\]\(([^)\s]{1,500})\)")
+MD_CODE = re.compile(r"(`[^`\n]+`)")
+MD_BOLD = re.compile(r"\*\*([^*\n]{1,300})\*\*")
+MD_ITAL = re.compile(r"(?<![*\w])\*([^*\n]{1,300})\*(?!\w)")
+MD_ITAL_ = re.compile(r"(?<![_\w])_([^_\n]{1,300})_(?!\w)")
+MD_HEAD = re.compile(r"^(#{1,4})\s+(.*)$")
+MD_ULI = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+MD_OLI = re.compile(r"^(\s*)\d{1,3}[.)]\s+(.*)$")
+MD_HR = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+MD_FENCE = re.compile(r"^\s*```+\s*([A-Za-z0-9_+-]*)\s*$")
+
+
+def md_href(url):
+    """The only links that survive are ones that go somewhere over http.
+
+    `[click](javascript:…)` is the reason: a scheme check here is what keeps a task spec
+    from shipping a script as a link. Relative paths are allowed because the board links
+    to its own pages; anything else is left as plain text by the caller."""
+    u = url.strip()
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    if u.startswith("/") and not u.startswith("//"):
+        return u
+    return None
+
+
+def md_inline(esc):
+    """Inline marks, on text that is ALREADY escaped.
+
+    Code spans are lifted out first and put back untouched: a backticked `**x**` is a
+    literal in every markdown there is, and treating it as bold is how a spec that
+    documents markdown ends up rendering its own examples."""
+    out = []
+    for i, part in enumerate(MD_CODE.split(esc)):
+        if i % 2:
+            out.append("<code>%s</code>" % part[1:-1])
+            continue
+
+        def link(m):
+            href = md_href(m.group(2))
+            if not href:
+                return m.group(0)          # not a link: leave the source text standing
+            return "<a class='%s' href='%s' rel='noreferrer'>%s</a>" % (LINK, href, m.group(1))
+        part = MD_LINK.sub(link, part)
+        part = MD_BOLD.sub(r"<b>\1</b>", part)
+        part = MD_ITAL.sub(r"<i>\1</i>", part)
+        part = MD_ITAL_.sub(r"<i>\1</i>", part)
+        out.append(part)
+    return "".join(out)
+
+
+def md_list(lines, start):
+    """One list, from `start`, returning the markup and the line it stopped at. Handles
+    one level of nesting — deeper than that is an outline, and an outline in a task spec
+    is a sign the task wants splitting, not that the renderer wants features."""
+    ordered = bool(MD_OLI.match(lines[start]))
+    items, i, sub = [], start, []
+    while i < len(lines):
+        m = MD_OLI.match(lines[i]) if ordered else MD_ULI.match(lines[i])
+        other = MD_ULI.match(lines[i]) if ordered else MD_OLI.match(lines[i])
+        if m and len(m.group(1)) < 2:
+            if sub:
+                items[-1] += "<ul>%s</ul>" % "".join("<li>%s</li>" % s for s in sub)
+                sub = []
+            items.append(md_inline(m.group(2)))
+        elif (m or other) and len((m or other).group(1)) >= 2 and items:
+            sub.append(md_inline((m or other).group(2)))
+        elif lines[i].strip() and items and not MD_HEAD.match(lines[i]) \
+                and not MD_FENCE.match(lines[i]):
+            items[-1] += " " + md_inline(lines[i].strip())    # a wrapped line
+        else:
+            break
+        i += 1
+    if sub:
+        items[-1] += "<ul>%s</ul>" % "".join("<li>%s</li>" % s for s in sub)
+    tag = "ol" if ordered else "ul"
+    return "<%s>%s</%s>" % (tag, "".join("<li>%s</li>" % x for x in items), tag), i
+
+
+def md(text, inline=False):
+    """Markdown, for text the board did not write.
+
+    `inline=True` gives the marks only — for a title or a goal, which live inside a line
+    the page has already laid out and must not suddenly contain a heading."""
+    if not text:
+        return ""
+    esc = escape(str(text)).replace("\r\n", "\n").replace("\r", "\n")
+    if inline:
+        return md_inline(esc.replace("\n", " "))
+    lines, out, i = esc.split("\n"), [], 0
+    while i < len(lines):
+        line = lines[i]
+        fence = MD_FENCE.match(line)
+        if fence:
+            body, i = [], i + 1
+            while i < len(lines) and not MD_FENCE.match(lines[i]):
+                body.append(lines[i])
+                i += 1
+            i += 1                                   # the closing fence, if there is one
+            out.append("<pre><code>%s</code></pre>" % "\n".join(body))
+            continue
+        if not line.strip():
+            i += 1
+            continue
+        if MD_HR.match(line):
+            out.append("<hr>")
+            i += 1
+            continue
+        h = MD_HEAD.match(line)
+        if h:
+            lvl = min(len(h.group(1)) + 2, 6)        # a spec's "#" is not the page's h1
+            out.append("<h%d>%s</h%d>" % (lvl, md_inline(h.group(2).strip()), lvl))
+            i += 1
+            continue
+        if MD_ULI.match(line) or MD_OLI.match(line):
+            block, i = md_list(lines, i)
+            out.append(block)
+            continue
+        if line.lstrip().startswith("&gt; "):
+            quote = []
+            while i < len(lines) and lines[i].lstrip().startswith("&gt;"):
+                quote.append(lines[i].lstrip()[4:].lstrip())
+                i += 1
+            out.append("<blockquote>%s</blockquote>" % md_inline(" ".join(quote)))
+            continue
+        para = []
+        while i < len(lines) and lines[i].strip() and not MD_HEAD.match(lines[i]) \
+                and not MD_ULI.match(lines[i]) and not MD_OLI.match(lines[i]) \
+                and not MD_FENCE.match(lines[i]) and not MD_HR.match(lines[i]) \
+                and not lines[i].lstrip().startswith("&gt; "):
+            para.append(lines[i].strip())
+            i += 1
+        out.append("<p>%s</p>" % md_inline("<br>".join(para)))
+    return "".join(out)
+
+
+def prose(text, cls=""):
+    """A block of somebody else's text, in a container the stylesheet can reach."""
+    body = md(text)
+    if not body:
+        return ""
+    return "<div class='%s'>%s</div>" % (("md " + cls).strip(), body)
 
 
 # ---------- HTML ----------------------------------------------------------
@@ -2656,7 +2818,7 @@ def q_inline(q, answer=None):
     return ("<a class='qrow' href='/q/%s'>"
             "<span class='%s text-xs'>%s</span>"
             "<span class='max-w-[68ch]'>%s</span>%s</a>" % (
-                escape(q["id"]), MONO, escape(q["id"]), escape(q["text"] or ""), answered))
+                escape(q["id"]), MONO, escape(q["id"]), md(q["text"], inline=True), answered))
 
 
 def prio_cell(t, human, back):
@@ -2704,14 +2866,14 @@ def q_card(q, answer=None):
             "<h3 class='mb-2 text-base font-semibold'><a class='%s %s' href='/q/%s'>%s</a>%s</h3>"
             "<dl class='mb-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-sm'>"
             "<dt class='%s'>kind<dd>%s<dt class='%s'>task<dd class='%s'>%s%s</dl>"
-            "<p class='max-w-[68ch]'>%s</p></div>" % (
+            "<div class='md'>%s</div></div>" % (
                 LINK, MONO, escape(q["id"]), escape(q["id"]),
                 " <span class='badge badge-sm badge-warning'>board answered</span>"
                 if answer is not None else "",
                 DIM, escape(q["kind"]), DIM, MONO, escape(q["task"] or "—"),
                 ("<dt class='%s'>board's answer<dd>%s" % (DIM, escape(answer)))
                 if answer is not None else "",
-                escape(q["text"] or "")))
+                md(q["text"])))
 
 
 def rail(s):
@@ -2962,7 +3124,7 @@ def queue_card(t, human, back, questions, big, hidden=False):
                 prio_cell(t, human, back),
                 LINK, MONO, escape(t["id"]), escape(t["id"]),
                 BADGE.get(st, "badge-ghost"), escape(st),
-                escape(t.get("title") or ""),
+                md(t.get("title"), inline=True),
                 size_cell(t, human, back), pr_h,
                 qs))
 
@@ -3122,7 +3284,7 @@ def html_status(project, token="", human=False):
         h.append(band_head(p, human))
         h.append("<div class='band-body'>")
         if p.get("goal"):
-            h.append("<p class='band-goal %s'>%s</p>" % (DIM, escape(p["goal"])))
+            h.append("<p class='band-goal %s'>%s</p>" % (DIM, md(p["goal"], inline=True)))
         if (p.get("budget") or {}).get("ceilings_missing"):
             h.append("<p class='mt-2 rounded-box border border-l-4 border-base-300 "
                      "border-l-error bg-base-200 p-3 text-sm'>%s</p>"
@@ -3184,7 +3346,7 @@ def cost_block(d):
             MONO + " " + DIM, escape((x.get("ts") or "")[:16].replace("T", " ")),
             escape(x.get("role") or ""), MONO, escape(x.get("model") or ""),
             MONO, toks(x["tokens"]) if x.get("tokens") is not None else "—",
-            DIM, escape(x.get("result") or ""))
+            DIM, md(x.get("result"), inline=True))
         for x in ds)
     est = d.get("estimate")
     per = ""
@@ -3274,7 +3436,7 @@ def html_task(tid, token="", human=False):
             "text-xs'>%s</code> <span class='%s'>%s</span>%s</span></li>" % (
                 MONO, DIM, escape(ts[11:19]), escape(e["type"]), MONO,
                 escape(e["actor"] or ""),
-                (" — %s" % escape(e["note"])) if e.get("note") else ""))
+                prose(e["note"], "md-note") if e.get("note") else ""))
     tl = ("<ul class='trail mt-1 list-none border-b border-base-300 p-0 text-sm'>%s</ul>"
           % "".join(evs) if evs else
           "<p class='%s text-sm'>Nothing has happened here yet.</p>" % DIM)
@@ -3300,6 +3462,7 @@ def html_task(tid, token="", human=False):
         ab = "<p class='%s text-sm'>Nobody holds this task.</p>" % DIM
     return page(d["id"], """%s
         <h2 class='mt-5 max-w-[68ch] text-lg font-semibold leading-snug sm:text-2xl'>%s</h2>
+        %s
         <dl class='mt-4 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 border-t
           border-base-300 pt-3 text-sm sm:grid-cols-[auto_minmax(0,1fr)_auto_minmax(0,1fr)]'>%s</dl>
         %s
@@ -3314,7 +3477,8 @@ def html_task(tid, token="", human=False):
         </form>%s""" % (
         head(d["id"], "<span class='badge badge-sm %s'>%s</span>" % (
             BADGE.get(st, "badge-ghost"), escape(st)), human=human),
-        escape(d.get("title") or ""),
+        md(d.get("title"), inline=True),
+        prose(d.get("spec"), "md-spec"),
         "".join("<dt class='%s'>%s<dd class='m-0 [overflow-wrap:anywhere]'>%s" % (DIM, k, v)
                 for k, v in facts),
         task_controls(d, human),
@@ -3347,7 +3511,7 @@ def html_question(qid, token="", human=False):
     return page(qid, """%s
         <div class='mt-5 max-w-[42rem] rounded-box border border-base-300 border-l-4
           border-l-warning bg-base-200 p-4'>
-          <p class='max-w-[68ch] text-lg leading-snug'>%s</p>
+          <div class='md md-lead'>%s</div>
           <form class='mt-4' method=post action='/q/%s/answer'>
             <div class='flex flex-wrap gap-3'>%s</div>
             <label class='%s' for=freetext>Or answer in your own words</label>
@@ -3360,7 +3524,7 @@ def html_question(qid, token="", human=False):
         # the browser. Project names are not validated, so it really can happen.
         head(q["project"], "<span class='%s %s text-xs'>%s</span>" % (
             MONO, DIM, escape(q["task"] or "")), human=human),
-        escape(q["text"] or ""), qid, opts, LBL, foot))
+        md(q["text"]), qid, opts, LBL, foot))
 
 
 # ---------- routes --------------------------------------------------------
