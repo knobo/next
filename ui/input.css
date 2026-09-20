@@ -227,7 +227,7 @@
   .band { border-left: 3px solid var(--color-base-300); padding-left: 1rem;
           margin-top: 2.25rem; }
   .band:first-of-type { margin-top: 1rem; }
-  .band-head { position: sticky; top: 2.6rem; z-index: 4;
+  .band-head { position: sticky; top: 0; z-index: 4;
                display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem .75rem;
                padding: .5rem 0 .45rem; margin-bottom: .25rem;
                background: var(--color-base-100);
@@ -238,6 +238,7 @@
      the project's own edge rather than as a divider between two of them. */
   .band-body { min-width: 0; padding-bottom: .5rem; }
   .band-goal { max-width: 68ch; margin: .5rem 0 0; font-size: .875rem; }
+  @media (min-width: 60rem) { .band-head { top: var(--rail-h); } }
   .band-foot { display: grid; gap: 1.5rem 2.5rem; margin-top: 1.75rem; }
   @media (min-width: 60rem) {
     .band-foot { grid-template-columns: minmax(0, 1fr) 24rem; align-items: start; }
@@ -350,11 +351,21 @@
      the second project is already below the fold: a filter you cannot see while you read
      the thing it filters is a filter you set twice. Sits on base-100 so the rows scroll
      UNDER it rather than through it. */
-  .rail { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap;
-          align-items: center; gap: .4rem 1.25rem; margin-top: 1.5rem;
-          padding: .55rem .25rem; background: var(--color-base-100);
+  /* Two sticky layers, and only where there is room for two. On a narrow screen the rail
+     wraps to three rows: sticking it AND a project heading would spend a fifth of a
+     phone on chrome, so there the heading alone stays and the rail scrolls away — you
+     reach for a filter far less often than you need to know where you are.
+     The heights are declared rather than measured: the heading's offset has to clear the
+     rail exactly, and a rail whose height depends on how its labels happen to wrap is
+     a heading that sits 4px under it (measured). */
+  .rail { z-index: 5; display: flex; flex-wrap: wrap; align-items: center;
+          gap: .4rem 1.25rem; margin-top: 1.5rem; padding: .55rem .25rem;
+          background: var(--color-base-100);
           border-top: 1px solid var(--color-base-300);
           border-bottom: 1px solid var(--color-base-300); }
+  @media (min-width: 60rem) {
+    .rail { position: sticky; top: 0; min-height: var(--rail-h); box-sizing: border-box; }
+  }
   .rail .f { display: inline-flex; align-items: baseline; gap: .4rem; font-size: .8125rem; }
   .rail select, .pill, .cell-num, .quiet {
           border: 1px solid var(--color-base-300); border-radius: var(--radius-field);
@@ -437,3 +448,6 @@
    tried to load it and logged a CSP violation on every page view. The texture is invisible
    anyway (--noise: 0), so it cost nothing but error messages. */
 :root { --fx-noise: none; }
+/* The height of the sticky filter rail. The project headings offset themselves by
+   exactly this, so the two layers meet instead of overlapping. */
+:root { --rail-h: 2.9rem; }
