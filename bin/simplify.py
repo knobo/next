@@ -129,7 +129,12 @@ def matches(task, match):
 
 
 def analyze(tasks, rules):
-    claimable = [t for t in tasks if t.get("status") in ("open", "orphaned")]
+    # Planned tasks stay as they are. Merging one that others wait `after` would archive
+    # it, and archived counts as landed — the dependants would start before the work they
+    # wait for. And the owner's own tasks are not the fleet's to consolidate.
+    waited = {x for t in tasks for x in json.loads(t.get("after") or "[]")}
+    claimable = [t for t in tasks if t.get("status") in ("open", "orphaned")
+                 and not t.get("human") and not t.get("after") and t["id"] not in waited]
     used, groups = set(), []
 
     def take(name, spec, predicate):

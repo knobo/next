@@ -19,7 +19,7 @@ Role ≠ coordinator → read `reference/roles.md`; the loop is the same, only w
    - Clusters related fragmented tasks (INNMELDING.md, counterless, web-stabilitet, infra, mobil, betaling) into consolidated packages, preserving all specs and shortening the dev cycle by 60–70%.
    - Closes and archives obsolete/retracted cards (`FAIL fra menneske-test`, `TRUKKET`) and completed tasks (`status: done` → `status: archived`), keeping active listings and searches (`board task search`) focused only on open work.
    Can also be triggered manually anytime (`board simplify --archive-done`).
-6. Only if `board task list` is empty (any status — `blocked` tasks are not an empty queue): read `$ROOT/$ENTRY`, `board task create` one per item (`--repo --requires --risk --touches --estimate`). Otherwise **do not read it**: the board is the queue, that file is one you write, not read.
+6. Only if `board task list` is empty (any status — `blocked` tasks are not an empty queue): read `$ROOT/$ENTRY`, `board task create` one per item (`--repo --requires --risk --touches --estimate`, plus `--after T-a,T-b` for order, `--milestone` for the release it belongs to, `--kind bug|incident|chore|support` when it is not a feature, `--human` when only the owner can do it). Order goes in `--after`, never in the title: `[ETTER T-586]` is invisible to `task next`, `--after` holds the task back until T-586 is merged. Otherwise **do not read it**: the board is the queue, that file is one you write, not read.
 
 ## Loop — until the queue is empty or a stop rule fires
 
@@ -59,7 +59,8 @@ Role ≠ coordinator → read `reference/roles.md`; the loop is the same, only w
 ## Never stop
 
 - Product choice → `board ask --task $T --default "<best guess>" --deadline 8h "<q>"`, implement the default, mark the PR "assumes X (Q-n)". risk=high never merges on a default.
-- Only a human can do it → `board task blocked $T --note "needs human: …"` → next task.
+- Only a human can do it → `board task blocked $T --note "needs human: …"` → next task. A whole task that is the owner's (create a key, register a webhook, test on the phone) → `board task patch $T --human` instead: it leaves the fleet's queue for the owner's "for you" list, and the work that needs it waits with `--after $T`.
+- Found a bug outside your task → `board task create --kind bug` (prod down: `--kind incident`, it goes to the front and pushes). Do not widen your own task.
 - Never wait on CI in the foreground. `board task progress $T "waiting CI"` → next task.
 
 ## Stop rules — read `board status --me`. The board has already done the arithmetic: `.stop`

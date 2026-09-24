@@ -118,7 +118,7 @@ agent_id() {
 }
 
 # ---- flag parsing: --foo bar --no-merge  ->  {"foo":"bar","no_merge":true} ----
-LIST_KEYS='["capabilities","requires","needs_grants","touches","options","cap"]'
+LIST_KEYS='["capabilities","requires","needs_grants","touches","options","cap","after"]'
 POS=(); JQARGS=()
 parse() {
   POS=(); JQARGS=()
@@ -286,7 +286,7 @@ EOF
 )
 HELP_TASK=$(cat <<'EOF'
 simplify::board task simplify [--project <p>] [--apply] [--archive-done] [--json]::Merge duplicate tasks, drop invalid ones, tidy the queue.
-create::board task create --title <t> [--spec-file <f>]::Create a new task.
+create::board task create --title <t> [--spec-file <f>] [--kind feature|bug|incident|chore|support] [--after T-1,T-2] [--milestone <m>] [--human]::Create a new task. --after holds it back until those land; --human keeps agents off it.
 next::board task next [--repo <repo>]::Claim the next available task for this agent.
 claim::board task claim <id>::Claim a specific task by id.
 progress::board task progress <id> ["note"]::Post a progress note on the current task.

@@ -118,7 +118,15 @@ for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
                           ("tasks", "estimate_by", "TEXT"),
                           ("tasks", "estimate_model", "TEXT"),
                           ("projects", "ceilings", "TEXT"),
-                          ("projects", "wip", "INTEGER")):
+                          ("projects", "wip", "INTEGER"),
+                          # Planning (see PLAN_FIELDS). `after` held in the title before
+                          # this — "[ETTER T-586 merget]" — where no agent could see it and
+                          # nothing stopped the task being picked first. `human` marks work
+                          # only the owner can do; agents claimed those and let them orphan.
+                          ("tasks", "after", "TEXT"),
+                          ("tasks", "human", "INTEGER"),
+                          ("tasks", "kind", "TEXT"),
+                          ("tasks", "milestone", "TEXT")):
 
     try:                                # database from before the column existed
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
@@ -927,11 +935,84 @@ def task(tid):
     return t
 
 
+# What KIND of work a task is. The life of a project after launch is mostly not features:
+# it is bugs found in prod, incidents, upkeep and questions from users. The kind is what
+# lets the board treat an incident as one (to the front, and a push) and lets the owner
+# see at a glance how much of the queue is keeping the lights on.
+KINDS = ("feature", "bug", "incident", "chore", "support")
+# An incident with no priority given goes to the front. Anything that is on fire and waits
+# behind forty features at the default 50 is not being treated as an incident.
+INCIDENT_PRIORITY = 95
+
+
+def plan_fields(b, project, tid=None):
+    """Validate the planning fields of a create or a patch, and return them as columns.
+
+    `after` takes a list or a comma-separated string, because the CLI's generic flag
+    parser sends `--after T-1,T-2` as one string on any CLI older than this change —
+    and an older CLI is what half the fleet is running on the night this ships."""
+    out = {}
+    if "after" in b:
+        v = b["after"]
+        if isinstance(v, str):
+            v = [x.strip() for x in v.split(",")]
+        if v is None:
+            v = []
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise Err(400, "after must be a list of task ids")
+        v = sorted({x for x in v if x})
+        if tid and tid in v:
+            raise Err(400, "a task cannot wait for itself")
+        missing = [x for x in v if not db.execute(
+            "SELECT 1 FROM tasks WHERE id=? AND project=?", (x, project)).fetchone()]
+        if missing:
+            raise Err(400, "unknown task in after (in %s): %s" % (project, ", ".join(missing)),
+                      unknown=missing)
+        # A cycle would hide every task in it from `task next` for good, silently.
+        if tid:
+            seen, todo = set(), list(v)
+            while todo:
+                x = todo.pop()
+                if x == tid:
+                    raise Err(400, "after would make a cycle through %s" % tid)
+                if x in seen:
+                    continue
+                seen.add(x)
+                r = db.execute("SELECT after FROM tasks WHERE id=?", (x,)).fetchone()
+                todo += jl(r["after"]) if r else []
+        out["after"] = json.dumps(v) if v else None
+    if "human" in b:
+        h = b["human"]
+        out["human"] = 1 if h in (True, 1, "1", "true", "on", "yes") else None
+    if "kind" in b:
+        k = b["kind"] or None
+        if k is not None and k not in KINDS:
+            raise Err(400, "unknown kind %r" % k, kinds=list(KINDS))
+        out["kind"] = k
+    if "milestone" in b:
+        out["milestone"] = (str(b["milestone"]).strip()[:60] or None) if b["milestone"] else None
+    return out
+
+
+def waiting_on(t):
+    """The tasks in `after` that have not landed. Landed = merged, done or archived:
+    "[ETTER T-586 merget]" was the phrase in use, so merged is enough to start."""
+    ids = jl(dict(t).get("after"))
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    landed = {r["id"] for r in db.execute(
+        "SELECT id FROM tasks WHERE id IN (%s) AND (status IN ('done','archived') "
+        "OR merge_sha IS NOT NULL)" % marks, ids)}
+    return [x for x in ids if x not in landed]
+
+
 def task_create(b, actor):
     project = b.get("project")
     if not project or not b.get("title"):
         raise Err(400, "project and title are mandatory")
     ensure_project(project)
+    plan = plan_fields(b, project)
     # Only on what comes from outside. The board itself creates follow-up tasks that
     # INHERIT the repo from a task already on the board (an overridden default on a done
     # task). If the manifest's `repos` shrinks afterwards, the human's answer must
@@ -942,17 +1023,28 @@ def task_create(b, actor):
     # Validated BEFORE the insert: a task that exists with a silently dropped estimate is
     # worse than one that was refused, because the number never comes back.
     est = estimate_fields(b.get("estimate"), actor)
+    prio = b.get("priority")
+    if prio in (None, ""):
+        prio = INCIDENT_PRIORITY if plan.get("kind") == "incident" else 50
+    try:
+        prio = int(prio)
+    except (TypeError, ValueError):
+        raise Err(400, "priority must be an integer")
     db.execute("""INSERT INTO tasks (id,project,repo,title,spec,status,requires,needs_grants,touches,
-                  risk,review_open,created,updated,priority,routine,estimate,estimate_by,estimate_model)
-                  VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?,?,?,?,?)""",
-               (tid, project, b.get("repo"), b["title"], b.get("spec"),
+                  risk,review_open,created,updated,priority,routine,estimate,estimate_by,estimate_model,
+                  after,human,kind,milestone)
+                  VALUES (?,?,?,?,?,'open',?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?)""",
+               (tid, project, b.get("repo") or None, b["title"], b.get("spec") or None,
                 json.dumps(b.get("requires", [])), json.dumps(b.get("needs_grants", [])),
-                json.dumps(b.get("touches", [])), b.get("risk", "normal"), now(), now(),
-                int(b.get("priority", 50)), b.get("routine"),
-                est["estimate"], est["estimate_by"], est["estimate_model"]))
+                json.dumps(b.get("touches", [])), b.get("risk") or "normal", now(), now(),
+                prio, b.get("routine"),
+                est["estimate"], est["estimate_by"], est["estimate_model"],
+                plan.get("after"), plan.get("human"), plan.get("kind"), plan.get("milestone")))
     ev(project, "task/" + tid, "task.created", actor, title=b["title"], repo=b.get("repo"),
        risk=b.get("risk", "normal"), from_project=b.get("from_project"),
-       estimate=est["estimate"])
+       estimate=est["estimate"], **{k: b[k] for k in PLAN_FIELDS if b.get(k)})
+    if plan.get("kind") == "incident":
+        ntfy("🚨 %s %s incident" % (project, tid), b["title"], "%s/t/%s" % (BASE_URL, tid))
     return {"id": tid, "status": "open"}
 
 
@@ -1063,6 +1155,7 @@ def task_show(tid):
             # page renders. The last 200 are what anyone actually reads.
             "SELECT ts, type, actor, body FROM events WHERE stream=? AND type<>'agent.heartbeat' "
             "ORDER BY id DESC LIMIT 200", ("task/" + tid,))][::-1]
+    d["waiting_on"] = waiting_on(t)
     ost, oa = owner_view(t)
     d["owner_status"] = ost
     d["owner_agent"] = oa
@@ -1195,6 +1288,11 @@ def task_next(aid, q):
             continue
         if {(t["repo"], x) for x in jl(t["touches"])} & taken:
             continue
+        # The owner's work, and work whose prerequisites have not landed, are not on
+        # offer. Both only for `open`: a row already in flight is finished whatever it
+        # says, or the fleet deadlocks on a patch made halfway through.
+        if t["status"] == "open" and (t["human"] or waiting_on(t)):
+            continue
         return dict(t)
     if full:
         return {"wip_full": True, "unreviewed": unreviewed(project),
@@ -1222,6 +1320,13 @@ def task_claim(tid, aid):
         raise Err(409, "missing capabilities", requires=jl(t["requires"]))
     if not set(jl(t["needs_grants"])) <= agent_grants(aid, t["project"]):
         raise Err(409, "missing grants", needs_grants=jl(t["needs_grants"]))
+    if t["status"] == "open" and t["human"]:
+        raise Err(409, "%s is marked for %s — only the owner can do it. Take the next "
+                       "task; the owner closes this one from the board." % (tid, HUMAN),
+                  human=True)
+    if t["status"] == "open" and waiting_on(t):
+        raise Err(409, "%s waits for %s to land first" % (tid, ", ".join(waiting_on(t))),
+                  waiting_on=waiting_on(t))
     # An `in_review` keeps its status through a claim: the new owner is to review what is
     # there, not start the task over. Worktree, branch and PR are on the board.
     # 'blocked' is here only for owner IS NULL: a task blocked by a live owner is never
@@ -1333,7 +1438,8 @@ def task_progress(tid, aid, b):
     return {"ok": True}
 
 
-PATCHABLE = ("repo", "touches", "risk", "priority", "estimate")
+PLAN_FIELDS = ("after", "human", "kind", "milestone")
+PATCHABLE = ("repo", "touches", "risk", "priority", "estimate") + PLAN_FIELDS
 PATCH_LOCKED = ("status", "owner", "merge_sha")
 # Two kinds of field, and they do not have the same owner.
 #   repo/touches/risk describe THE WORK: where it lands and how dangerous it is. `risk`
@@ -1343,7 +1449,10 @@ PATCH_LOCKED = ("status", "owner", "merge_sha")
 #   think it is. Both are set while grooming, BEFORE anyone has claimed anything, so
 #   demanding ownership for them made an estimate impossible to record in the one moment
 #   it is actually made ("the task is no longer yours (open)" on a task nobody held).
-QUEUE_FIELDS = ("priority", "estimate")
+# The planning fields are queue fields too: they say WHEN and BY WHOM, not what the work
+# is. And a task marked for the human has no agent owner by design, so an ownership check
+# on them would make them unsettable by anyone but the owner of the board.
+QUEUE_FIELDS = ("priority", "estimate") + PLAN_FIELDS
 # Relative sizes, not hours. A closed set, because the whole point of the number is that
 # it is comparable ACROSS agents and models — "how well does this model size its own
 # work" is unanswerable if every agent invents its own scale. Fibonacci-ish: the gaps
@@ -1397,7 +1506,7 @@ def task_patch(tid, aid, b):
                   % ", ".join(locked))
     fields = {k: b[k] for k in PATCHABLE if k in b}
     if not fields:
-        raise Err(400, "nothing to change (repo, touches, risk, priority, estimate)")
+        raise Err(400, "nothing to change (%s)" % ", ".join(PATCHABLE))
     if "touches" in fields:
         v = fields["touches"]
         if isinstance(v, str):
@@ -1416,6 +1525,26 @@ def task_patch(tid, aid, b):
         raise Err(400, "unknown risk %r" % fields["risk"])
     if "repo" in fields:
         check_repo(t["project"], fields["repo"])
+    for k in PLAN_FIELDS:
+        fields.pop(k, None)
+    fields.update(plan_fields(b, t["project"], tid))
+    # Handing a task to the human takes it off whichever agent had let it orphan: an
+    # orphaned row is offered FIRST by `task next`, which is how "Opprett GEMINI_API_KEY"
+    # went round the fleet. Back to open, unowned — it waits for the owner now.
+    # Only the owner of the board may hand a task BACK to the fleet: an agent that could
+    # clear `human` could clear it and claim the owner's task.
+    if "human" in fields and not fields["human"] and t["human"] and aid != HUMAN:
+        raise Err(403, "only %s can hand their own task back to the agents" % HUMAN,
+                  needs_human_token=True, action="handing a task back to the agents")
+    if fields.get("human") and t["status"] in ("orphaned", "claimed", "blocked") \
+            and not t["merge_sha"] and not t["pr"]:
+        # Taking a task off an agent: the same rule as every other state change — its
+        # holder, or anyone once the holder is dead, or the owner of the board. Without
+        # it an agent could flip `human` on a rival's live task and have it for itself.
+        if t["owner"] and aid != HUMAN:
+            owns(t, aid)
+        fields.update(status="open", owner=None, lease_until=None)
+        db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (tid,))
     db.execute("UPDATE tasks SET %s, updated=? WHERE id=?" % (", ".join("%s=?" % k for k in fields)),
                list(fields.values()) + [now(), tid])
     ev(t["project"], "task/" + tid, "task.patched", aid,
@@ -1624,8 +1753,21 @@ def task_deployed(tid, aid, b):
 
 def task_done(tid, aid, b):
     t = task(tid)
-    owns(t, aid)
-    if not t["merge_sha"] and not b.get("no_merge"):
+    # The owner's own task: something done by hand (a key created, a form filed, a test
+    # run on the phone). Nothing was merged and nothing is to be deployed. Proven by the
+    # human token, not by the `by` field — an agent that could close these could close
+    # its own "the owner must look at this" tasks.
+    # Not under a PR or a merge: an owner's "done" there would pull the task out from
+    # under an agent still landing code for it.
+    by_hand = (bool(t["human"]) and as_human(b) and not t["merge_sha"] and not t["pr"]
+               and t["status"] in ("open", "orphaned", "blocked", "claimed", "done", "archived"))
+    if by_hand:
+        if t["status"] in ("done", "archived"):
+            raise Err(409, "%s is already %s" % (tid, t["status"]))
+        aid = HUMAN
+    else:
+        owns(t, aid)
+    if not by_hand and not t["merge_sha"] and not b.get("no_merge"):
         raise Err(409, "missing merge_verified (use no_merge for docs-only)")
     # Merged code that is not rolled out is not done: it is invisible to the human who is
     # to test it. Requires a deploy event AFTER the merge sha.
@@ -2079,6 +2221,24 @@ def ribbon_events(project, hours=RIBBON_HOURS):
 
 
 
+def milestones(project):
+    """How far each milestone has come: tasks and points, closed against total.
+
+    Closed is done or archived — a task dropped from a milestone should be moved out of
+    it, not left to count as open for ever. Only milestones with something still open
+    are shown: a finished one is history, and the band is for what is in progress."""
+    out = []
+    for r in db.execute(
+            "SELECT milestone, COUNT(*) n, SUM(status IN ('done','archived')) closed, "
+            "SUM(COALESCE(estimate,0)) pts, "
+            "SUM(CASE WHEN status IN ('done','archived') THEN COALESCE(estimate,0) END) pts_closed, "
+            "MIN(created) since FROM tasks WHERE project=? AND milestone IS NOT NULL "
+            "GROUP BY milestone HAVING closed < n ORDER BY since", (project,)):
+        out.append({"name": r["milestone"], "tasks": r["n"], "closed": r["closed"] or 0,
+                    "points": r["pts"] or 0, "points_closed": r["pts_closed"] or 0})
+    return out
+
+
 def status(project=None):
     with NTFY_LOCK:
         fails = ntfy_failures_since_success
@@ -2111,6 +2271,14 @@ def status(project=None):
                           % (sm, a["current_task"])) if sm is not None and sm >= SILENT_MIN else None
             agents.append(d)
         costs = task_costs(name)
+        # When anything last happened to each task — a comment or a progress note counts,
+        # which `updated` does not (it moves only with the row's own columns).
+        # MAX(id) is read off the events(project, stream, id) index alone; ts is then one
+        # row per task, not one per event, under the global lock.
+        touched = {r["stream"][5:]: r["ts"] for r in db.execute(
+            "SELECT e.stream, e.ts FROM events e JOIN (SELECT MAX(id) id FROM events "
+            "WHERE project=? AND stream >= 'task/' AND stream < 'task0' GROUP BY stream) m "
+            "ON e.id = m.id", (name,))}
         out["projects"].append({
             # The fold over this project's dispatch events, done ONCE. The HTML reads it
             # again for the done rows it draws; a second call here is a second scan of
@@ -2126,9 +2294,12 @@ def status(project=None):
             # The cost travels with the task, not in a separate section: "what has this
             # one already spent" is read next to "how big did we think it was", or it is
             # not read at all.
-            "tasks": [dict(brief(t), cost=costs.get(t["id"])) for t in db.execute(
+            "tasks": [dict(brief(t), cost=costs.get(t["id"]), waiting_on=waiting_on(t),
+                           last_activity=touched.get(t["id"]) or t["updated"])
+                      for t in db.execute(
                 "SELECT * FROM tasks WHERE project=? AND status NOT IN ('done', 'archived') "
                 "ORDER BY priority DESC, created", (name,))],
+            "milestones": milestones(name),
             "questions": [dict(q) for q in db.execute(
                 "SELECT * FROM questions WHERE project=? AND status='open' ORDER BY created", (name,))],
             # the board answered itself (the deadline ran out) — still overridable by a
@@ -2564,8 +2735,12 @@ BADGE = {"blocked": "badge-error", "orphaned": "badge-error",
 
 
 def waiting_on_you(p):
-    """What requires a human in this project."""
-    return len(p["questions"])
+    """What requires a human in this project: questions, and the tasks marked for them."""
+    return len(p["questions"]) + len(yours(p))
+
+
+def yours(p):
+    return [t for t in p["tasks"] if t.get("human") and t.get("status") == "open"]
 
 
 def stuck(p):
@@ -2584,7 +2759,8 @@ def watchline(s):
     # an anchor that does not exist on the page.
     first = lambda gen, dflt: next(gen, dflt)
     wait_url = first((("/q/%s" % q["id"]) for p in s["projects"] for q in p["questions"]),
-                     "/status")
+                     first((("/t/%s" % t["id"]) for p in s["projects"] for t in yours(p)),
+                           "/status"))
     stop_url = first((("/t/%s" % t["id"]) for p in s["projects"] for t in p["tasks"]
                       if t["status"] in ("blocked", "orphaned")), "/status")
     n = lambda v, cls, href, txt: (
@@ -2848,9 +3024,10 @@ def q_inline(q, answer=None):
                 % escape(answer)) if answer is not None else ""
     return ("<a class='qrow' href='/q/%s'>"
             "<span class='%s text-xs'>%s</span>"
-            "<span class='max-w-[68ch]'>%s</span>%s</a>" % (
+            "<span class='max-w-[68ch]'>%s</span>%s %s</a>" % (
                 escape(q["id"]), MONO, escape(q["id"]),
-                md(q["text"], inline=True, links=False), answered))
+                md(q["text"], inline=True, links=False), answered,
+                when(q.get("created"), "asked ")))
 
 
 def prio_cell(t, human, back):
@@ -2897,12 +3074,14 @@ def q_card(q, answer=None):
             "bg-base-200 p-4'>"
             "<h3 class='mb-2 text-base font-semibold'><a class='%s %s' href='/q/%s'>%s</a>%s</h3>"
             "<dl class='mb-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-sm'>"
-            "<dt class='%s'>kind<dd>%s<dt class='%s'>task<dd class='%s'>%s%s</dl>"
+            "<dt class='%s'>kind<dd>%s<dt class='%s'>task<dd class='%s'>%s"
+            "<dt class='%s'>asked<dd>%s%s</dl>"
             "<div class='md'>%s</div></div>" % (
                 LINK, MONO, escape(q["id"]), escape(q["id"]),
                 " <span class='badge badge-sm badge-warning'>board answered</span>"
                 if answer is not None else "",
                 DIM, escape(q["kind"]), DIM, MONO, escape(q["task"] or "—"),
+                DIM, when(q.get("created")) or "—",
                 ("<dt class='%s'>board's answer<dd>%s" % (DIM, escape(answer)))
                 if answer is not None else "",
                 md(q["text"])))
@@ -3157,8 +3336,57 @@ def queue_card(t, human, back, questions, big, hidden=False):
                 LINK, MONO, escape(t["id"]), escape(t["id"]),
                 BADGE.get(st, "badge-ghost"), escape(st),
                 md(t.get("title"), inline=True),
-                size_cell(t, human, back), pr_h,
+                size_cell(t, human, back), pr_h + plan_chips(t) + " " + when(
+                    t.get("last_activity") or t.get("updated") or t.get("created"),
+                    "last activity ")
+                + done_button(t, human, back),
                 qs))
+
+
+def when(ts, label=""):
+    """A timestamp a person can read at a glance — "3h ago" — with the exact UTC time
+    on hover and in the markup. Relative on the row, because "is this fresh" is the
+    question a queue answers; exact on hover, because the log speaks UTC."""
+    if not ts:
+        return ""
+    m = int(mins_since(ts))
+    rel = ("just now" if m < 1 else "%dm ago" % m if m < 60 else
+           "%dh ago" % (m // 60) if m < 48 * 60 else "%dd ago" % (m // 1440))
+    return ("<time class='%s %s text-xs whitespace-nowrap' datetime='%s' title='%s%s UTC'>%s</time>"
+            % (MONO, DIM, escape(ts), escape(label), escape(ts[:16].replace("T", " ")), rel))
+
+
+def plan_chips(t):
+    """Kind, milestone and what the task waits for — as small marks after the size.
+
+    `feature` is the default kind and is not drawn: forty rows that all say feature say
+    nothing, and the ones that say bug or incident are the ones worth seeing."""
+    out = []
+    k = t.get("kind")
+    if k and k != "feature":
+        out.append("<span class='badge badge-sm %s'>%s</span>" % (
+            "badge-error" if k == "incident" else "badge-outline", escape(k)))
+    if t.get("milestone"):
+        out.append("<span class='badge badge-sm badge-ghost' title='milestone'>%s</span>"
+                   % escape(t["milestone"]))
+    w = t.get("waiting_on") or []
+    if w:
+        out.append("<span class='%s text-xs' title='waits for these to land'>after %s</span>"
+                   % (DIM, " ".join("<a class='%s %s' href='/t/%s'>%s</a>" % (
+                       LINK, MONO, escape(x), escape(x)) for x in w)))
+    return "".join(" " + x for x in out)
+
+
+def done_button(t, human, back):
+    """The one control on a task that is the owner's own work: say it is done."""
+    if not (human and t.get("human") and t.get("status") not in ("done", "archived")
+            and not t.get("merge_sha") and not t.get("pr")):
+        return ""
+    return (" <form method='POST' action='/t/%s/done' class='inline m-0'>"
+            "<input type='hidden' name='back' value='%s'>"
+            "<button type='submit' class='badge badge-sm badge-success cursor-pointer'>"
+            "done</button></form>"
+            % (escape(t["id"]), escape(back)))
 
 
 def queue(p, human, back):
@@ -3182,6 +3410,16 @@ def queue(p, human, back):
         html.append("<p class='%s mt-2 text-sm'>The queue is empty. Add the next piece of "
                     "work with <code class='rounded bg-base-200 px-1 font-mono'>board task "
                     "create</code>.</p>" % DIM)
+    # The owner's own tasks first, and apart: they are not "waiting" for the fleet, and
+    # an agent will never pick them up. Left in the queue they read as work in hand.
+    mine = yours(p)
+    if mine:
+        html.append("<h3 class='grp grp-stopped'>for you<span class='%s grp-n'>%d</span></h3>"
+                    % (MONO, len(mine)))
+        for t in mine:
+            shown.add(t["id"])
+            html.append(queue_card(t, human, back, by_task.get(t["id"], ()), big=False))
+        left = [t for t in left if t["id"] not in shown]
     for key, label, statuses in QUEUE_GROUPS:
         rows = [t for t in left if (t.get("status") or "") in statuses]
         if not rows:
@@ -3283,6 +3521,64 @@ def band_head(p, human):
         (" " + pause) if pause else "", (" " + btn) if btn else ""))
 
 
+def milestone_row(p):
+    """One line per milestone still in progress: how many tasks and points have closed.
+
+    Points when the tasks are sized, because five one-point tasks closed out of six is
+    not the same progress as one thirteen-point task left of six."""
+    ms = p.get("milestones") or []
+    if not ms:
+        return ""
+    rows = []
+    for m in ms:
+        pts = m["points"]
+        pct = round(100.0 * (m["points_closed"] if pts else m["closed"]) / (pts or m["tasks"]))
+        rows.append(
+            "<div class='flex flex-wrap items-center gap-3 text-sm'>"
+            "<b class='font-semibold'>%s</b>"
+            "<progress class='progress w-32' value='%d' max='100'></progress>"
+            "<span class='%s %s text-xs'>%d/%d tasks%s</span></div>" % (
+                escape(m["name"]), pct, MONO, DIM, m["closed"], m["tasks"],
+                (" · %d/%d pts" % (m["points_closed"], pts)) if pts else ""))
+    return ("<div class='mt-2'><p class='%s'>milestones</p>%s</div>" % (LBL, "".join(rows)))
+
+
+def new_task_form(p, human, back):
+    """Put work on the board from the page — the phone, above all.
+
+    The human tests after deploy (§5), in dev or in prod, and until now a bug found there
+    had to wait for a terminal to become `board task create`. A support request, an
+    incident, or a thing only the owner can do, all start here too."""
+    if not human:
+        return ""
+    name = escape(p["name"])
+    kinds = "".join("<option value='%s'>%s</option>" % (k, k) for k in KINDS)
+    known = [m["name"] for m in p.get("milestones") or []]
+    dl = "".join("<option value='%s'>" % escape(m) for m in known)
+    return (
+        "<details class='mt-3'><summary class='%s cursor-pointer text-sm'>+ new task</summary>"
+        "<form method='POST' action='/tasks/new' class='mt-2 grid max-w-[42rem] gap-3'>"
+        "<input type='hidden' name='project' value='%s'>"
+        "<input type='hidden' name='back' value='%s'>"
+        "<input class='input w-full' type='text' name='title' required maxlength='200' "
+        "placeholder='what should happen' aria-label='title'>"
+        "<textarea class='textarea w-full' name='spec' rows='4' "
+        "placeholder='details, steps to reproduce, acceptance — markdown' aria-label='spec'></textarea>"
+        "<div class='flex flex-wrap items-center gap-3'>"
+        "<select class='select w-auto' name='kind' aria-label='kind'>%s</select>"
+        "<input class='input w-24' type='number' name='priority' min='0' max='100' step='5' "
+        "placeholder='prio' aria-label='priority'>"
+        "<input class='input w-40' type='text' name='milestone' list='ms-%s' "
+        "placeholder='milestone' aria-label='milestone'><datalist id='ms-%s'>%s</datalist>"
+        "<input class='input w-40' type='text' name='after' placeholder='after T-1,T-2' "
+        "aria-label='waits for'>"
+        "<label class='flex items-center gap-2 text-sm'><input type='checkbox' "
+        "class='checkbox' name='human' value='1'>for me, not an agent</label></div>"
+        "<button type='submit' class='btn btn-primary min-h-12 w-auto justify-self-start'>"
+        "Create task</button></form></details>" % (
+            DIM, name, escape(back), kinds, name, name, dl))
+
+
 def html_status(project, token="", human=False):
     s = status(project)
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
@@ -3321,8 +3617,10 @@ def html_status(project, token="", human=False):
             h.append("<p class='mt-2 rounded-box border border-l-4 border-base-300 "
                      "border-l-error bg-base-200 p-3 text-sm'>%s</p>"
                      % escape(p["budget"]["note"]))
+        h.append(milestone_row(p))
         rows_html, shown = queue(p, human, back)
         h.append(rows_html)
+        h.append(new_task_form(p, human, back))
         h.append("<div class='band-foot'><div class='fleet'>"
                  "<div class='fleet-head'><span>fleet</span>"
                  "<span data-agent-badge class='%s text-xs'></span>"
@@ -3419,9 +3717,40 @@ def task_controls(d, human):
            "<input type='hidden' name='back' value='/status'>"
            "<button type='submit' class='btn btn-outline min-h-10'>Archive</button></form>"
            % tid) if d.get("status") != "archived" else ""
-    if not (rel or arc):
+    done = ("<form method='POST' action='/t/%s/done' class='m-0'>"
+            "<input type='hidden' name='back' value='/t/%s'>"
+            "<button type='submit' class='btn btn-primary min-h-10'>I have done this</button>"
+            "</form>" % (tid, tid)) if d.get("human") and d.get("status") not in (
+                "done", "archived") and not d.get("merge_sha") and not d.get("pr") else ""
+    if not (rel or arc or done):
         return ""
-    return "<div class='mt-4 flex flex-wrap gap-3'>%s%s</div>" % (rel, arc)
+    return "<div class='mt-4 flex flex-wrap gap-3'>%s%s%s</div>" % (done, rel, arc)
+
+
+def plan_form(d, human):
+    """Change when, and by whom: kind, milestone, what it waits for, whether it is the
+    owner's own. The fields an agent sets from the CLI, for the person on the page."""
+    if not human or d.get("status") in ("done", "archived"):
+        return ""
+    tid = escape(d["id"])
+    kinds = "".join("<option value='%s'%s>%s</option>" % (
+        k, " selected" if (d.get("kind") or "feature") == k else "", k) for k in KINDS)
+    return (
+        "<details class='mt-4'><summary class='%s cursor-pointer text-sm'>plan: kind, "
+        "milestone, order, who</summary>"
+        "<form method='POST' action='/t/%s/plan' class='mt-2 flex flex-wrap items-center gap-3'>"
+        "<input type='hidden' name='back' value='/t/%s'>"
+        "<select class='select w-auto' name='kind' aria-label='kind'>%s</select>"
+        "<input class='input w-40' type='text' name='milestone' value='%s' "
+        "placeholder='milestone' aria-label='milestone'>"
+        "<input class='input w-40' type='text' name='after' value='%s' "
+        "placeholder='after T-1,T-2' aria-label='waits for'>"
+        "<label class='flex items-center gap-2 text-sm'><input type='checkbox' class='checkbox' "
+        "name='human' value='1'%s>for %s, not an agent</label>"
+        "<button type='submit' class='btn btn-outline min-h-10'>Save</button></form></details>"
+        % (DIM, tid, tid, kinds, escape(d.get("milestone") or ""),
+           escape(",".join(jl(d.get("after")))), " checked" if d.get("human") else "",
+           escape(HUMAN)))
 
 
 def html_task(tid, token="", human=False):
@@ -3442,7 +3771,22 @@ def html_task(tid, token="", human=False):
                                                                    d.get("estimate_by") or "")))
         if est and (d.get("estimate_model") or d.get("estimate_by")) else "")
     back = "/t/" + urllib.parse.quote(d["id"])
+    after = jl(d.get("after"))
     facts = (("phase", escape(d.get("phase") or "—")),
+             ("kind", escape(d.get("kind") or "feature")),
+             ("for", escape(HUMAN) if d.get("human") else "any agent"),
+             ("milestone", escape(d.get("milestone") or "—")),
+             ("after", " ".join(
+                 "<a class='%s %s' href='/t/%s'>%s</a>%s" % (
+                     LINK, MONO, escape(x), escape(x),
+                     "" if x not in d.get("waiting_on", []) else
+                     " <span class='%s text-xs'>(not landed)</span>" % DIM)
+                 for x in after) or "—"),
+             ("created", "%s %s" % (escape((d.get("created") or "—")[:16].replace("T", " ")),
+                                     when(d.get("created")))),
+             ("last activity", (lambda ts: "%s %s" % (escape((ts or "—")[:16].replace("T", " ")),
+                                                       when(ts)))(
+                 max([d.get("updated") or ""] + [e["ts"] or "" for e in d.get("events") or []]))),
              ("risk", escape(d.get("risk") or "—")),
              ("priority", prio_cell(d, human, back)),
              ("size", size_cell(d, human, back) if human else est_h),
@@ -3513,7 +3857,7 @@ def html_task(tid, token="", human=False):
         prose(d.get("spec"), "md-spec"),
         "".join("<dt class='%s'>%s<dd class='m-0 [overflow-wrap:anywhere]'>%s" % (DIM, k, v)
                 for k, v in facts),
-        task_controls(d, human),
+        task_controls(d, human) + plan_form(d, human),
         LBL, cost_block(d), LBL, tl, LBL, ab, escape(d["id"]), LBL, FOCUS))
 
 
@@ -3578,7 +3922,7 @@ ROUTES = [
     ("GET",    r"/agents/([^/]+)/inbox$",       lambda h, m, b, q: inbox(m[0], q)),
     ("POST",   r"/projects$",                   lambda h, m, b, q: dict(ensure_project(
         b["project"], b.get("phase"), b.get("goal"), b.get("manifest"), b.get("host"), b.get("path")))),
-    ("POST",   r"/tasks$",                      lambda h, m, b, q: task_create(b, actor(q, b))),
+    ("POST",   r"/tasks$",                      lambda h, m, b, q: task_create(b, actor_h(q, b))),
     ("GET",    r"/tasks/next$",                 lambda h, m, b, q: task_next(q["agent"][0], q)),
         ("GET",    r"/routines$",                   lambda h, m, b, q: routine_list(q)),
     ("GET",    r"/tasks$",                      lambda h, m, b, q: task_list(q)),
@@ -3593,7 +3937,7 @@ ROUTES = [
     ("POST",   r"/tasks/([^/]+)/merge_verified$",  lambda h, m, b, q: task_merge_verified(m[0], actor(q, b), b)),
     ("POST",   r"/tasks/([^/]+)/comment$",     lambda h, m, b, q: task_comment(m[0], b)),
     ("POST",   r"/tasks/([^/]+)/deployed$",   lambda h, m, b, q: task_deployed(m[0], actor(q, b), b)),
-    ("POST",   r"/tasks/([^/]+)/done$",         lambda h, m, b, q: task_done(m[0], actor(q, b), b)),
+    ("POST",   r"/tasks/([^/]+)/done$",         lambda h, m, b, q: task_done(m[0], actor_h(q, b), b)),
     ("POST",   r"/tasks/([^/]+)/archive$",      lambda h, m, b, q: task_archive(m[0], actor_h(q, b), b)),
     ("POST",   r"/tasks/cleanup$",              lambda h, m, b, q: tasks_cleanup(
         (b or {}).get("project") or q.get("project", [None])[0],
@@ -3690,6 +4034,25 @@ UI_POST = [
      proj_back),
     (r"/roles/([^/]+)/unpin$",
      lambda m, b, q: role_unpin(need(b, "project"), m.group(1), b), proj_back),
+    # Only the fields the form has: the page is a person, and a person does not write
+    # `requires` or `needs_grants`. Everything else keeps its API default.
+    (r"/tasks/new$",
+     lambda m, b, q: (human_only(b, "creating a task from the board"),
+                      task_create({k: v for k, v in b.items() if k in (
+                          "project", "title", "spec", "kind", "priority", "milestone",
+                          "after", "human", "_human")}, HUMAN))[1],
+     lambda b, res: "/t/" + urllib.parse.quote(res.get("id", ""))),
+    # A form drops its empty fields on the way in (parse_qs), so an unticked box and a
+    # cleared milestone would arrive as "not mentioned" and change nothing. On this form
+    # every plan field is always meant: missing is empty.
+    (r"/t/([^/]+)/plan$",
+     lambda m, b, q: (human_only(b, "planning a task"), task_patch(
+         m.group(1), HUMAN, dict(b, **{k: b.get(k, "") for k in PLAN_FIELDS})))[1],
+     lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
+    (r"/t/([^/]+)/done$",
+     lambda m, b, q: (human_only(b, "closing a task"),
+                      dict(task_done(m.group(1), HUMAN, {"_human": True}), id=m.group(1)))[1],
+     proj_back),
     (r"/t/([^/]+)/patch$",
      lambda m, b, q: task_patch(m.group(1), actor_h(q, b), b),
      lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),

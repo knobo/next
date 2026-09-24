@@ -31,8 +31,45 @@ clickable straight through.
 ## Testing
 
 There is no test queue. The agents test their own work with the CLI, playwright or test code
-before merge; you test in dev or prod after deploy. Found something? `board task create`, or
-comment on the task at `/t/<id>`.
+before merge; you test in dev or prod after deploy. Found something? **+ new task** under the
+project's queue on `/status` (works on the phone), `board task create`, or comment on the task
+at `/t/<id>`.
+
+## Planning: order, milestones, and your own tasks
+
+Four fields on a task say *when* and *by whom*, and the board acts on all four:
+
+| Field | Set with | What the board does with it |
+|---|---|---|
+| after | `--after T-12,T-14` | `task next` does not offer the task until those are merged, done or archived. Claiming it early is refused. |
+| human | `--human`, or "for me" on the page | No agent is offered it or may claim it. It shows under **for you** on `/status`, and **done** / **I have done this** closes it — no merge, no deploy. |
+| kind | `--kind feature\|bug\|incident\|chore\|support` | Drawn on the row. An `incident` with no priority given goes to 95 and pushes to your phone. |
+| milestone | `--milestone v1.2` | `/status` shows each milestone still in progress with tasks and points closed. |
+
+```bash
+board task create --title "core: cart items" --milestone v1.2 --estimate 5
+board task create --title "web: item picker" --after T-586 --milestone v1.2
+board task create --title "Create GEMINI_API_KEY" --human
+board task patch T-638 --human            # an agent's task that turned out to be yours
+board task patch T-593 --after ''         # take the order away again
+```
+
+All of it can also be set from the page: **+ new task** on `/status`, and **plan** on `/t/<id>`.
+
+## A project's life on the board
+
+The same board carries a project from the first idea to years of upkeep. What changes is the
+phase, and what you put in the queue.
+
+| Stage | Phase | What you do | What the board does |
+|---|---|---|---|
+| Idea | `idea` | `board project init`, set `goal:`. Put the first slice in as tasks, grouped in a milestone. | Merges on the mechanical checks only; breaking things is fine. |
+| Iterations | `build` | One milestone per iteration. Order with `--after`, size with `--estimate`, raise what matters with priority. | Review findings must be closed before a merge. The milestone line shows how far the iteration is. |
+| Going live | `launch` | Your own launch work (DNS, keys, store listings, legal) as `--human` tasks, and what depends on them `--after` them. `onboarding:` must point at a file. | The fleet builds around your tasks instead of claiming and abandoning them. |
+| Prod testing | `launch`/`live` | Test after each deploy. What you find: **+ new task**, kind `bug`. | The bug lands in the fleet's queue at once, from the phone. |
+| Live, support | `live` | Users' problems as `support` or `bug`, outages as `incident`. | An incident goes to the front and pushes. |
+| Upkeep | `live` | Recurring work as `routines:` in `project.yaml` (dependency bumps, backups checked, certificates). Chores as kind `chore`. | The reaper turns a due routine into a task. |
+| New development | `live` | A new milestone. The phase stays `live`, so the gate stays strict. | Features and upkeep share one queue, ordered by priority; the kinds show the mix. |
 
 ## The commands you actually use
 
