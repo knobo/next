@@ -279,7 +279,11 @@ CREATE TABLE tasks (
   owner TEXT, lease_until TEXT,
   worktree TEXT, branch TEXT, pr TEXT, merge_sha TEXT,
   human_test TEXT,      -- legacy, unused since T-352 (kept so old databases load)
-  created TEXT, updated TEXT, priority INTEGER
+  created TEXT, updated TEXT, priority INTEGER,
+  after TEXT,           -- JSON: task ids that must land (merged/done/archived) before this is offered
+  human INTEGER,        -- 1 = only the human can do it: never offered to or claimable by an agent
+  kind TEXT,            -- feature|bug|incident|chore|support (NULL = feature); incident → priority 95 + push
+  milestone TEXT        -- free text; /status shows progress per milestone still open
 );
 CREATE TABLE questions (
   id TEXT PRIMARY KEY, project TEXT, task TEXT, asked_by TEXT,

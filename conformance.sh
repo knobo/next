@@ -357,6 +357,8 @@ for sub in $TASK_SUBS; do
       # --title is sent through untouched to the API (with_agent/with_project forward the
       # whole body); bin/board itself never dereferences it, so there is no literal to grep.
       create:--title) continue ;;
+      # The planning fields travel the same way, validated by the board (plan_fields).
+      create:--kind|create:--after|create:--milestone|create:--human) continue ;;
     esac
     if grep -qE -- "[.\"\$]$field\\b" <<<"$block"; then continue; fi
     # --project is handled by the shared with_project/project_name idiom, not a per-command
@@ -1982,6 +1984,92 @@ for A in "$AID" "$BID" "$CLIID" $(api GET '/status?project=demo' \
          | jq -r '.projects[0].agents[]?|select(.status!="finished")|.id'); do
   [ -n "$A" ] && api POST "/agents/$A/finished" '{"reason":"conformance done"}' >/dev/null
 done
+# ---------------------------------------------------------------------------
+echo "== planning: order, the owner's own work, kind, milestone =="
+# Before this, "[ETTER T-586 merget]" in a title was the only way to say "not before", and
+# "Opprett GEMINI_API_KEY" was claimed by agent after agent and left orphaned. `plan` is
+# the suite's own project, alone, so `task next` has nothing else to offer.
+api POST '/projects' '{"project":"plan","phase":"build"}' >/dev/null
+PA=$(api POST '/agents' '{"project":"plan","harness":"claude-code","host":"pl","session":"pl1","model":"m"}' | jq -r .id)
+P1=$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"core first\",\"priority\":10,\"agent\":\"$PA\"}" | jq -r .id)
+P2=$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"web after core\",\"priority\":90,\"after\":\"$P1\",\"milestone\":\"v1\",\"agent\":\"$PA\"}" | jq -r .id)
+P3=$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"create the API key\",\"priority\":99,\"human\":true,\"agent\":\"$PA\"}" | jq -r .id)
+check "after is accepted as a comma string, the shape an older CLI sends" \
+  "$(api GET "/tasks/$P2")" '(.after|fromjson) == ["'"$P1"'"] and .waiting_on == ["'"$P1"'"] and .milestone == "v1"'
+check "task next skips the owner's task and the one still waiting, whatever their priority" \
+  "$(api GET "/tasks/next?agent=$PA")" '.id == "'"$P1"'"'
+check "claiming a task whose prerequisite has not landed is refused, and says which" \
+  "$(api POST "/tasks/$P2/claim" "{\"agent\":\"$PA\"}")" '.waiting_on == ["'"$P1"'"]'
+check "an agent cannot claim the owner's task" \
+  "$(api POST "/tasks/$P3/claim" "{\"agent\":\"$PA\"}")" '.human == true'
+check "an unknown task in after is refused" \
+  "$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"x\",\"after\":[\"T-999999\"],\"agent\":\"$PA\"}")" '.unknown == ["T-999999"]'
+check "after cannot make a cycle" \
+  "$(api PATCH "/tasks/$P1" "{\"agent\":\"$PA\",\"after\":[\"$P2\"]}")" '.error | test("cycle")'
+check "an unknown kind is refused, and says what the kinds are" \
+  "$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"x\",\"kind\":\"epic\",\"agent\":\"$PA\"}")" '(.kinds|index("incident")) != null'
+PI=$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"prod is down\",\"kind\":\"incident\",\"agent\":\"$PA\"}" | jq -r .id)
+check "an incident with no priority goes to the front" "$(api GET "/tasks/$PI")" '.priority == 95 and .kind == "incident"'
+api PATCH "/tasks/$PI" "{\"agent\":\"$PA\",\"kind\":\"bug\",\"priority\":1}" >/dev/null
+api POST "/tasks/$P1/claim" "{\"agent\":\"$PA\"}" >/dev/null
+api POST "/tasks/$P1/merge_verified" "{\"agent\":\"$PA\",\"sha\":\"abc1234\"}" >/dev/null
+[ "$(api GET "/tasks/$P1" | jq -r .merge_sha)" = null ] && \
+  api POST "/tasks/$P1/done" "{\"agent\":\"$PA\",\"no_merge\":true}" >/dev/null
+check "once the prerequisite has landed the waiting task is offered" \
+  "$(api GET "/tasks/next?agent=$PA")" '.id == "'"$P2"'"'
+check "an agent cannot close the owner's task" \
+  "$(api POST "/tasks/$P3/done" "{\"agent\":\"$PA\",\"no_merge\":true}")" '.error != null'
+check "the owner closes their own task with the human token, no merge needed" \
+  "$(hum POST "/tasks/$P3/done" '{}'; api GET "/tasks/$P3")" '.status == "done"'
+P4=$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"register the webhook\",\"agent\":\"$PA\"}" | jq -r .id)
+api POST "/tasks/$P4/claim" "{\"agent\":\"$PA\"}" >/dev/null
+PB=$(api POST '/agents' '{"project":"plan","harness":"claude-code","host":"pl","session":"pl2","model":"m"}' | jq -r .id)
+check "another agent cannot take a live agent's task by handing it to the human" \
+  "$(api PATCH "/tasks/$P4" "{\"agent\":\"$PB\",\"human\":true}"; api GET "/tasks/$P4")" '.owner == "'"$PA"'" and .human == null'
+check "handing a task to the human takes it off the agent and puts it back open" \
+  "$(api PATCH "/tasks/$P4" "{\"agent\":\"$PA\",\"human\":true}")" '.status == "open" and .owner == null and .human == 1'
+check "an agent cannot hand the owner's task back to the fleet" \
+  "$(api PATCH "/tasks/$P4" "{\"agent\":\"$PB\",\"human\":false}")" '.needs_human_token == true'
+check "a task in another project cannot be waited on" \
+  "$(api POST '/tasks' "{\"project\":\"plan\",\"title\":\"x\",\"after\":[\"$TID\"],\"agent\":\"$PA\"}")" '.unknown != null'
+check "status carries milestone progress for what is still open" \
+  "$(api GET '/status?project=plan')" '.projects[0].milestones[0] | .name == "v1" and .tasks == 1 and .closed == 0'
+api POST "/tasks/$P2/comment" '{"text":"a word later"}' >/dev/null
+check "a comment moves the task's last activity, which updated alone does not" \
+  "$(api GET '/status?project=plan')" '[.projects[0].tasks[] | select(.id == "'"$P2"'") | .last_activity >= .updated] == [true]'
+check "status carries waiting_on on each task" \
+  "$(api GET '/status?project=plan')" '[.projects[0].tasks[] | has("waiting_on")] | all'
+if [ "$OWN_SERVER" = 1 ]; then
+  NC=$(curl -si -H "Authorization: Bearer $HUMAN_TOKEN" -H 'Content-Type: application/x-www-form-urlencoded' \
+       -X POST --data-urlencode 'project=plan' --data-urlencode 'title=found in prod: login loops' \
+       --data-urlencode 'kind=bug' --data-urlencode 'spec=**steps**' --data-urlencode 'priority=' \
+       --data-urlencode 'back=/status' "$BOARD_URL/tasks/new" | tr -d '\r')
+  NL=$(grep -i '^location:' <<<"$NC" | awk '{print $2}')
+  NID=${NL#/t/}
+  check "the new-task form creates a task and lands on its page" \
+    "$(api GET "/tasks/$NID")" '.title == "found in prod: login loops" and .kind == "bug" and .priority == 50'
+  NA=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+       -H 'Content-Type: application/x-www-form-urlencoded' -X POST -d 'project=plan&title=x' "$BOARD_URL/tasks/new")
+  [ "$NA" = 403 ] && ok "the new-task form refuses an agent-token browser" || no "agent-token new-task form" "HTTP $NA"
+  ND=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+       -H 'Content-Type: application/x-www-form-urlencoded' -X POST -d 'no_merge=1' "$BOARD_URL/t/$P2/done")
+  [ "$ND" = 403 ] && ok "the done button refuses an agent-token browser" || no "agent-token done form" "HTTP $ND"
+  curl -s -o /dev/null -H "Authorization: Bearer $HUMAN_TOKEN" -H 'Content-Type: application/x-www-form-urlencoded' \
+       -X POST -d "kind=chore&milestone=v2&back=/t/$P4" "$BOARD_URL/t/$P4/plan"
+  check "the plan form sets what it has and clears what it leaves empty (the box unticked)" \
+    "$(api GET "/tasks/$P4")" '.kind == "chore" and .milestone == "v2" and .human == null and .after == null'
+  api POST '/tasks' "{\"project\":\"plan\",\"title\":\"after the webhook\",\"after\":[\"$P4\"],\"agent\":\"$PA\"}" >/dev/null
+  SP=$(curl -s -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status?project=plan")
+  grep -q "action='/tasks/new'" <<<"$SP" && ok "the owner's page offers the new-task form" || no "no new-task form on /status" ""
+  grep -q '>milestones<' <<<"$SP" && ok "the band shows milestone progress" || no "no milestone row" ""
+  grep -q '>after <a' <<<"$SP" && ok "a waiting task says what it waits for" || no "no after chip" ""
+  grep -q "<time [^>]*datetime='20" <<<"$SP" && ok "each row carries a readable timestamp" || no "no <time> on the rows" ""
+  grep -q '>last activity<' <<<"$(curl -s -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$P2")" \
+    && ok "the task page says when it was last touched" || no "no last activity on /t" ""
+  AP=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=plan")
+  grep -q "action='/tasks/new'" <<<"$AP" && no "an agent-token page offers the new-task form" "" \
+    || ok "an agent-token page does not offer the new-task form"
+fi
 # ---------------------------------------------------------------------------
 echo "== estimates: a relative size, and who gave it =="
 # `sizing` is the suite's own project, like zerobudget/rampproject above. It deliberately
