@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS questions (
   id TEXT PRIMARY KEY, project TEXT, task TEXT, asked_by TEXT, kind TEXT NOT NULL, card TEXT,
   text TEXT, options TEXT, default_answer TEXT, deadline TEXT, status TEXT,
-  answer TEXT, answered_by TEXT, answered TEXT, read INTEGER DEFAULT 0, created TEXT);
+  answer TEXT, answered_by TEXT, answered TEXT, read INTEGER DEFAULT 0, cmds TEXT,
+  created TEXT);
 CREATE TABLE IF NOT EXISTS roles (
   project TEXT, role TEXT, agent TEXT, source TEXT, pinned_by TEXT, since TEXT, lease_until TEXT,
   PRIMARY KEY (project, role, agent));
@@ -126,7 +127,8 @@ for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
                           ("tasks", "after", "TEXT"),
                           ("tasks", "human", "INTEGER"),
                           ("tasks", "kind", "TEXT"),
-                          ("tasks", "milestone", "TEXT")):
+                          ("tasks", "milestone", "TEXT"),
+                          ("questions", "cmds", "TEXT")):
 
     try:                                # database from before the column existed
         db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
@@ -1117,6 +1119,112 @@ def task_costs(project=None):
     return {tid: cost_of(dispatches_of(rows)) for tid, rows in per.items()}
 
 
+# A command the human is meant to run has to be ON the card, ready to paste — not
+# reconstructed from prose on a phone (T-500). Two sources, in this order:
+#   1. what an agent attached explicitly: `board ask --cmd`, `board task blocked --cmd`,
+#      `board task progress --cmd`.
+#   2. what it wrote in backticks in a note or a spec. That is where every command on
+#      the board sat before the flag existed, so without this every card written until
+#      now stays as unusable as it was — and that is nearly all of them.
+CMD_MAX, CMD_N = 1000, 10        # one limit, for --cmd and for fenced extraction alike
+CMD_FENCE = re.compile(r"(?ms)^[ \t]*(```+)[ \t]*([A-Za-z0-9_+-]*)[ \t]*\n(.*?)\n?^[ \t]*\1`*[ \t]*$")
+SH_LANGS = ("sh", "bash", "zsh", "shell", "console")
+
+
+def cmds_in(text):
+    """Fenced ```sh blocks in a piece of text, in order — each ONE (multi-line) command.
+
+    Only fences. Inline `backtick` spans were extracted too, and an agent describing what
+    it had DONE (`git push`) then got a "waiting on you" copy button on a card where
+    nothing waits: this surface must only show what the author marked as a thing to run."""
+    out = []
+    for m in CMD_FENCE.finditer((text or "").replace("\0", "")):
+        c = m.group(3).strip()
+        if m.group(2).lower() in SH_LANGS and c and len(c) <= CMD_MAX:
+            out.append(c)
+    return out[:CMD_N]
+
+
+def as_cmds(v):
+    """`cmds` off the wire: a list of strings, or one command per line in a single string.
+    Anything else is a 400 — call it BEFORE the first write, so a bad flag cannot leave a
+    half-applied transition behind."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = [c for c in v.replace("\0", "").splitlines() if c.strip()]
+    if not isinstance(v, list) or not all(isinstance(c, str) for c in v):
+        raise Err(400, "cmds must be a string or a list of strings")
+    out = [c.replace("\0", "").strip() for c in v]      # NUL is the code-block label's slot
+    if not all(out) or len(out) > CMD_N or any(len(c) > CMD_MAX for c in out):
+        raise Err(400, "cmds: at most %d non-empty commands of at most %d characters each — "
+                       "put a longer one in a ```sh block in the note" % (CMD_N, CMD_MAX))
+    return out
+
+
+def stored_cmds(v):
+    """Commands read back from a stored event/row: tolerant, they were validated on the way in."""
+    v = v if isinstance(v, list) else []
+    return [c.replace("\0", "").strip() for c in v if isinstance(c, str) and c.replace("\0", "").strip()]
+
+
+CMD_RESET = ("task.unblocked", "task.merge_verified", "task.done", "task.archived",
+             "task.released", "task.orphaned")
+
+
+def task_cmds(d, rows):
+    """The commands waiting on a human right now, deduplicated, each with who wrote it and
+    where. Nothing for a done or archived task. Three sources, all explicit:
+      - the open questions' own --cmd, and the ```sh blocks in their text;
+      - the --cmd on the task's LATEST progress/blocked event. A later note without --cmd
+        does not clear it (the owner still has not run it); an unblock, a merge, a release
+        or someone else claiming the task does;
+      - the ```sh blocks in the latest block note, while the task is blocked.
+    `rows` are the events task_show already loaded (chronological, with `body`)."""
+    if d["status"] in ("done", "archived"):
+        return []
+    out, seen = [], set()
+
+    def add(cmds, why, by):
+        for c in (cmds or [])[-CMD_N:]:
+            c = (c or "").strip()
+            if c and c not in seen:
+                seen.add(c)
+                out.append({"cmd": c, "why": why, "by": by})
+    for q in d.get("questions") or []:
+        add(stored_cmds(q.get("cmds")), q["id"], q.get("asked_by"))
+        add(cmds_in(q["text"]), q["id"] + " tekst", q.get("asked_by"))
+    last = next((i for i in range(len(rows) - 1, -1, -1)
+                 if rows[i]["type"] in ("task.progress", "task.blocked")
+                 and stored_cmds(rows[i]["body"].get("cmds"))), None)
+    if last is not None:
+        r = rows[last]
+        cleared = any(x["type"] in CMD_RESET or
+                      (x["type"] == "task.claimed" and x["actor"] != r["actor"])
+                      for x in rows[last + 1:])
+        if not cleared:
+            add(stored_cmds(r["body"]["cmds"]),
+                "blokkert-notat" if r["type"] == "task.blocked" else "fremdriftsnotat", r["actor"])
+    if d["status"] == "blocked":
+        r = next((x for x in reversed(rows) if x["type"] == "task.blocked"), None)
+        if r:
+            add(cmds_in(r["body"].get("note")), "blokkert-notat", r["actor"])
+    return out
+
+
+def task_questions(tid):
+    """The questions that are still waiting on a human for THIS task. They were only ever
+    reachable from /status, which lists every project's — so a card that had been blocked
+    on the same question for nine days said nothing about it (T-191)."""
+    return [{"id": r["id"], "kind": r["kind"], "status": r["status"], "text": r["text"],
+             "default_answer": r["default_answer"], "deadline": r["deadline"],
+             "answer": r["answer"], "asked_by": r["asked_by"],
+             "url": "%s/q/%s" % (BASE_URL, r["id"]),
+             "cmds": jl(r["cmds"], [])}
+            for r in db.execute("SELECT * FROM questions WHERE task=? AND "
+                                "status IN ('open','defaulted') ORDER BY id", (tid,))]
+
+
 def task_show(tid):
     """Everything another agent needs to take over, including the last progress note —
     reference/takeover.md asks for it, and before this it only lived in the event log."""
@@ -1150,16 +1258,18 @@ def task_show(tid):
     # `note`. So the one line on the page that is a PERSON'S own words was the one line
     # that lost them: "task.comment  knut" and nothing after it. The `progress` list
     # above has always read both, and says why in its own comment; this one never did.
-    d["events"] = [
-        {"ts": r["ts"], "type": r["type"], "actor": r["actor"],
-         "note": (lambda b: b.get("note") or b.get("text"))(jl(r["body"], {}))}
-        for r in db.execute(
-            # LIMIT: the whole request holds the global lock, so a task with
-            # thousands of events would stall every other agent's call while the
-            # page renders. The last 200 are what anyone actually reads.
-            "SELECT ts, type, actor, body FROM events WHERE stream=? AND type<>'agent.heartbeat' "
-            "ORDER BY id DESC LIMIT 200", ("task/" + tid,))][::-1]
+    rows = [dict(r, body=jl(r["body"], {})) for r in db.execute(
+        # LIMIT: the whole request holds the global lock, so a task with
+        # thousands of events would stall every other agent's call while the
+        # page renders. The last 200 are what anyone actually reads.
+        "SELECT ts, type, actor, body FROM events WHERE stream=? AND type<>'agent.heartbeat' "
+        "ORDER BY id DESC LIMIT 200", ("task/" + tid,))][::-1]
+    d["events"] = [{"ts": r["ts"], "type": r["type"], "actor": r["actor"],
+                    "note": r["body"].get("note") or r["body"].get("text")} for r in rows]
     d["waiting_on"] = waiting_on(t)
+    d["questions"] = task_questions(tid)
+    d["commands"] = task_cmds(d, rows)
+    d["url"] = "%s/t/%s" % (BASE_URL, tid)
     ost, oa = owner_view(t)
     d["owner_status"] = ost
     d["owner_agent"] = oa
@@ -1410,6 +1520,7 @@ def dispatch_of(b):
 
 
 def task_progress(tid, aid, b):
+    cmds = as_cmds(b.get("cmds"))          # before any write
     t = task(tid)
     # done/archived clear the owner, so owns() would 409 every late append — a
     # subagent archives, the coordinator's --tokens never lands, cost.complete
@@ -1426,7 +1537,8 @@ def task_progress(tid, aid, b):
                       % (", ".join(locked), t["status"]))
         dispatch = dispatch_of(b)
         ev(t["project"], "task/" + tid, "task.progress", aid, note=b.get("note"),
-           dispatch=dispatch, result=b.get("result"))
+           dispatch=dispatch, result=b.get("result"),
+           cmds=cmds or None)
         return {"ok": True}
     owns(t, aid)
     dispatch = dispatch_of(b)
@@ -1438,7 +1550,8 @@ def task_progress(tid, aid, b):
                 plus(LEASE_MIN), now(), tid))
     ev(t["project"], "task/" + tid, "task.progress", aid, note=b.get("note"),
        worktree=b.get("worktree"), branch=b.get("branch"), pr=b.get("pr"),
-       dispatch=dispatch, result=b.get("result"))
+       dispatch=dispatch, result=b.get("result"),
+       cmds=cmds or None)
     return {"ok": True}
 
 
@@ -1557,6 +1670,7 @@ def task_patch(tid, aid, b):
 
 
 def task_blocked(tid, aid, b):
+    cmds = as_cmds(b.get("cmds"))          # before any write
     t = task(tid)
     # Ownership, like every other state change (task_patch, task_progress, release,
     # gate_merge) — a task owned by someone else is refused via owns() below. But a task
@@ -1582,7 +1696,8 @@ def task_blocked(tid, aid, b):
     else:
         owns(t, aid)
         db.execute("UPDATE tasks SET status='blocked', updated=? WHERE id=?", (now(), tid))
-    ev(t["project"], "task/" + tid, "task.blocked", aid, note=b.get("note"))
+    ev(t["project"], "task/" + tid, "task.blocked", aid, note=b.get("note"),
+       cmds=cmds or None)
     ntfy("⛔ %s %s blocked" % (t["project"], tid), b.get("note") or t["title"],
          "%s/t/%s" % (BASE_URL, tid))
     return {"ok": True}
@@ -1909,11 +2024,13 @@ def question_create(b, actor):
         raise Err(400, "text is missing")
     if not isinstance(b["text"], str):
         raise Err(400, "text must be a string")
+    cmds = as_cmds(b.get("cmds"))          # before any write
     if actor not in ("board", HUMAN) and (m := junk_text(b["text"], "question")):
         raise Err(400, m)
     qid = next_id("Q-", "questions")
     db.execute("""INSERT INTO questions (id,project,task,asked_by,kind,text,options,
-                  default_answer,deadline,status,created) VALUES (?,?,?,?,?,?,?,?,?,'open',?)""",
+                  default_answer,deadline,status,cmds,created)
+                  VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)""",
                (qid, project, b.get("task"), actor, kind,
                 # Both spellings. The column, the status payload and `board status --json`
                 # all say `default_answer`; only the request field said `default`. Anyone
@@ -1922,7 +2039,7 @@ def question_create(b, actor):
                 # self-answers, so the agent blocks on it until a human appears.
                 b.get("text"), json.dumps(b.get("options", [])),
                 b.get("default") or b.get("default_answer"),
-                deadline_of(b.get("deadline")), now()))
+                deadline_of(b.get("deadline")), json.dumps(cmds), now()))
     ev(project, "question/" + qid, "question.asked", actor, kind=kind, task=b.get("task"),
        text=b.get("text"))
     ntfy("❓ %s %s" % (project, b.get("task") or ""), b.get("text", ""),
@@ -2452,7 +2569,7 @@ def md_list(lines, start):
     return "<%s>%s</%s>" % (tag, "".join("<li>%s</li>" % x for x in items), tag), i
 
 
-def md(text, inline=False, links=True):
+def md(text, inline=False, links=True, number=True):
     """Markdown, for text the board did not write.
 
     `inline=True` gives the marks only — for a title or a goal, which live inside a line
@@ -2474,10 +2591,7 @@ def md(text, inline=False, links=True):
             i += 1                                   # the closing fence, if there is one
             # One block, one Kopier button (see COPY_JS). `\0` is replaced below once we know
             # how many blocks there are, so "2/3" lets the owner paste them in order.
-            out.append("<div class='cb' data-lang='%s'><div class='cb-bar'><span>%s\0</span>"
-                       "<button type='button' class='btn btn-outline' data-copy>Kopier</button></div>"
-                       "<pre><code>%s</code></pre></div>" % (
-                           fence.group(1).lower(), fence.group(1).lower() or "kode", "\n".join(body)))
+            out.append(cb_block(fence.group(1).lower(), "\n".join(body)))
             continue
         if not line.strip():
             i += 1
@@ -2515,18 +2629,37 @@ def md(text, inline=False, links=True):
             para.append(lines[i].strip())
             i += 1
         out.append("<p>%s</p>" % md_inline("<br>".join(para)))
-    n = sum("\0" in o for o in out)
-    k = 0
-    for j, o in enumerate(out):
-        if "\0" in o:
-            k += 1
-            out[j] = o.replace("\0", " %d/%d" % (k, n) if n > 1 else "", 1)
-    return "".join(out)
+    return number_blocks("".join(out)) if number else "".join(out)
 
 
-def prose(text, cls=""):
+CB_SLOT = "\0%s\0" % secrets.token_hex(8)     # md() strips every NUL from its input, and the
+                                              # rest is unguessable, so text cannot forge it
+
+
+def cb_block(lang, escaped_body):
+    """One code block with its Kopier button. `escaped_body` is already HTML-escaped, and
+    is the ONLY thing the button copies. CB_SLOT is where "i/n" goes (number_blocks)."""
+    return ("<div class='cb' data-lang='%s'><div class='cb-bar'><span>%s%s</span>"
+            "<button type='button' class='btn btn-outline' data-copy>Kopier</button></div>"
+            "<pre><code>%s</code></pre></div>" % (lang, lang or "kode", CB_SLOT, escaped_body))
+
+
+def number_blocks(html):
+    """"sh 2/3" on every code block, so the owner can paste them in order. Run over a
+    whole page when several md() calls (spec, commands, notes) share it, so the labels
+    are unique and in reading order."""
+    n = html.count(CB_SLOT)
+    k = [0]
+
+    def lab(_):
+        k[0] += 1
+        return " %d/%d" % (k[0], n) if n > 1 else ""
+    return re.sub(re.escape(CB_SLOT), lab, html)
+
+
+def prose(text, cls="", number=True):
     """A block of somebody else's text, in a container the stylesheet can reach."""
-    body = md(text)
+    body = md(text, number=number)
     if not body:
         return ""
     return "<div class='%s'>%s</div>" % (("md " + cls).strip(), body)
@@ -3299,7 +3432,106 @@ def size_cell(t, human, back):
                 escape(t["id"]), escape(back), MONO, escape(t["id"]), opts, DIM, c))
 
 
-def q_card(q, answer=None):
+def cmd_list(cmds, number=True):
+    """The commands as code blocks, so they get the same highlight and per-block Kopier
+    button as a ```sh block in a spec — but built directly, never parsed as markdown, so
+    what is copied is exactly what is stored, even if it contains a ``` line. Each says who
+    wrote it and where: the owner is about to paste it into a terminal (T-500)."""
+    if not cmds:
+        return ""
+    h = "".join(
+        "<p class='%s mt-2 text-xs'>fra %s \u00b7 %s</p>%s" % (
+            DIM, escape(c.get("by") or "ukjent"), escape(c.get("why") or ""),
+            cb_block("sh", escape(c["cmd"])))
+        for c in cmds)
+    return "<div class='mt-3'>%s</div>" % (number_blocks(h) if number else h)
+
+
+def task_ok(tid, known=None):
+    """The task id if `tid` is one and the task exists, else None. A free-text `task` field
+    must never become an href, and a dead link is a dead end for the owner. `known` is a
+    set of ids from one batch lookup, so a page of cards does not query once per card."""
+    t = str(tid or "")
+    if not re.fullmatch(r"T-\d+", t):
+        return None
+    if known is not None:
+        return t if t in known else None
+    return t if db.execute("SELECT 1 FROM tasks WHERE id=?", (t,)).fetchone() else None
+
+
+def known_tasks(qs):
+    ids = sorted({q["task"] for q in qs if q["task"] and re.fullmatch(r"T-\d+", str(q["task"]))})
+    return {r["id"] for r in db.execute(
+        "SELECT id FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)} if ids else set()
+
+
+def task_ref(tid, known=None):
+    t = task_ok(tid, known)
+    return ("<a class='%s' href='/t/%s'>%s</a>" % (LINK, t, t)) if t else escape(str(tid or ""))
+
+
+def q_foot(q):
+    """What happens if nobody answers — one sentence, shared by the card and /q."""
+    if q["status"] == "defaulted":
+        return ("The deadline ran out \u2014 the board answered \u201c%s\u201d. If you answer "
+                "now, that overrides it." % (q["answer"] or ""))
+    if q["default_answer"]:
+        return ("If you do not answer before the deadline, the agent carries on with: %s"
+                % q["default_answer"])
+    return "agenten er blokkert til du svarer"
+
+
+def waiting_q(q):
+    """One open question, on the card of the task it blocks. The warning edge is the
+    board's mark for 'this is a human's job' — the same one q_card uses on /status."""
+    badge = ("<span class='badge badge-sm badge-warning'>board answered</span>"
+             if q["status"] == "defaulted" else
+             "<span class='badge badge-sm badge-ghost'>%s</span>" % escape(q["kind"] or ""))
+    foot = q_foot(q)
+    return ("<div class='mt-3 rounded-box border border-base-300 border-l-4 "
+            "border-l-warning bg-base-200 p-4'>"
+            "<h3 class='mb-2 text-base font-semibold'>"
+            "<a class='%s %s' href='/q/%s'>%s</a> %s</h3>"
+            "<p class='max-w-[68ch]'>%s</p>"
+            "<p class='%s mt-2 text-sm'>%s</p>"
+            "<a class='btn btn-outline mt-3 min-h-12' href='/q/%s'>Answer %s</a></div>" % (
+                LINK, MONO, escape(q["id"]), escape(q["id"]), badge,
+                escape(q["text"] or ""), DIM, escape(foot),
+                escape(q["id"]), escape(q["id"])))
+
+
+def waiting_block(d):
+    """Everything on this task that is waiting on a human, at the top of its own card:
+    the questions that block it, the note that blocked it, and the commands to run.
+
+    They all existed before — the question in a table nothing linked to from here, the
+    command in the middle of a paragraph — but the card said nothing, and T-191 stood
+    blocked on the same unanswered question six times over nine days without the one page
+    a human opens ever mentioning it (T-500)."""
+    qs, cmds = d.get("questions") or [], d.get("commands") or []
+    blocked = ""
+    if d.get("status") == "blocked":
+        note = next((e.get("note") for e in reversed(d.get("events") or [])
+                     if e["type"] == "task.blocked" and e.get("note")), "")
+        blocked = ("<div class='mt-3 rounded-box border border-base-300 border-l-4 "
+                   "border-l-error bg-base-200 p-4'>"
+                   "<h3 class='mb-2 text-base font-semibold'>blocked</h3>"
+                   "<p class='max-w-[68ch]'>%s</p></div>"
+                   % escape(note or d.get("title") or ""))
+    if not (qs or cmds or blocked):
+        return ""
+    body = "".join(waiting_q(q) for q in qs) + blocked
+    if cmds:
+        body += ("<div class='mt-3 rounded-box border border-base-300 border-l-4 "
+                 "border-l-warning bg-base-200 p-4'>"
+                 "<h3 class='mb-2 text-base font-semibold'>commands to run</h3>"
+                 "<p class='%s text-sm'>Press Kopier, paste into a terminal.</p>%s</div>"
+                 % (DIM, cmd_list(cmds, number=False)))
+    return "<p class='%s'>%s</p>%s" % (
+        LBL, "waiting on you" if (qs or blocked) else "commands", body)
+
+
+def q_card(q, answer=None, known=None):
     """The question card is the ONLY surface on the board that is a human's job, and that
     is why it is the only one that gets the accent edge. The edge carries the meaning; it
     is not decoration."""
@@ -3313,7 +3545,8 @@ def q_card(q, answer=None):
                 LINK, MONO, escape(q["id"]), escape(q["id"]),
                 " <span class='badge badge-sm badge-warning'>board answered</span>"
                 if answer is not None else "",
-                DIM, escape(q["kind"]), DIM, MONO, escape(q["task"] or "—"),
+                DIM, escape(q["kind"]), DIM, MONO,
+                task_ref(q["task"], known) if q["task"] else "—",
                 DIM, when(q.get("created")) or "—",
                 ("<dt class='%s'>board's answer<dd>%s" % (DIM, escape(answer)))
                 if answer is not None else "",
@@ -3915,13 +4148,14 @@ def html_status(project, token="", human=False, alldone=False):
         adrift = lambda q: not q.get("task") or q["task"] not in shown
         loose = [q for q in p["questions"] if adrift(q)]
         loose_d = [q for q in p["questions_defaulted"] if adrift(q)]
+        kt = known_tasks(loose + loose_d)      # one lookup for all this project's cards
         if loose:
             h.append("<p class='%s'>waiting for an answer from you</p>" % LBL)
-            h.append("<div class=qgrid>%s</div>" % "".join(q_card(q) for q in loose))
+            h.append("<div class=qgrid>%s</div>" % "".join(q_card(q, known=kt) for q in loose))
         if loose_d:
             h.append("<p class='%s'>the board answered itself — you can still override it</p>" % LBL)
             h.append("<div class=qgrid>%s</div>"
-                     % "".join(q_card(q, q["answer"] or "") for q in loose_d))
+                     % "".join(q_card(q, q["answer"] or "", kt) for q in loose_d))
         h.append("</div></section>")
     h.append(FOCUS)
     return page("board", "".join(h))
@@ -4096,7 +4330,7 @@ def html_task(tid, token="", human=False, project=""):
             "text-xs'>%s</code> <span class='%s'>%s</span>%s</span></li>" % (
                 MONO, DIM, escape(ts[11:19]), escape(e["type"]), MONO,
                 escape(e["actor"] or ""),
-                prose(e["note"], "md-note") if e.get("note") else ""))
+                prose(e["note"], "md-note", number=False) if e.get("note") else ""))
     tl = ("<ul class='trail mt-1 list-none border-b border-base-300 p-0 text-sm'>%s</ul>"
           % "".join(evs) if evs else
           "<p class='%s text-sm'>Nothing has happened here yet.</p>" % DIM)
@@ -4120,7 +4354,7 @@ def html_task(tid, token="", human=False, project=""):
                   MONO, DIM, escape(oa.get("last_seen") or "—")))
     else:
         ab = "<p class='%s text-sm'>Nobody holds this task.</p>" % DIM
-    return page(d["id"], """%s
+    return page(d["id"], number_blocks("""%s
         <h2 class='mt-5 max-w-[68ch] text-lg font-semibold leading-snug sm:text-2xl'>%s</h2>
         %s
         <dl class='mt-4 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 border-t
@@ -4138,19 +4372,23 @@ def html_task(tid, token="", human=False, project=""):
         head(d["id"], "<span class='badge badge-sm %s'>%s</span>" % (
             BADGE.get(st, "badge-ghost"), escape(st)) + owner_pos(d, human), human=human),
         md(d.get("title"), inline=True),
-        prose(d.get("spec"), "md-spec"),
+        prose(d.get("spec"), "md-spec", number=False),
         "".join("<dt class='%s'>%s<dd class='m-0 [overflow-wrap:anywhere]'>%s" % (DIM, k, v)
                 for k, v in facts),
-        task_controls(d, human, project) + plan_form(d, human),
-        LBL, cost_block(d), LBL, tl, LBL, ab, escape(d["id"]), LBL, FOCUS))
+        waiting_block(d) + task_controls(d, human, project) + plan_form(d, human),
+        LBL, cost_block(d), LBL, tl, LBL, ab, escape(d["id"]), LBL, FOCUS)))
 
 
 def html_question(qid, token="", human=False):
     q = db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     if not q:
         raise Err(404, "unknown question")
+    tid = task_ok(q["task"])                 # the validated id, never the raw field
+    back = task_ref(q["task"]) if q["task"] else ""
+    back_btn = ("<a class='btn btn-outline mt-4 min-h-12' href='/t/%s'>Task %s</a>"
+                % (tid, tid)) if tid else ""
     if q["status"] not in ("open", "defaulted"):
-        return page(qid, head(qid, human=human) + (
+        return page(qid, head(qid, back, human=human) + (
             "<div class='mt-5 max-w-[42rem] rounded-box border border-base-300 bg-base-200 p-4'>"
             "<p class='text-lg'>Answered: <b class='font-semibold'>%s</b></p>"
             "<p class='%s mt-1 text-sm'>%s</p></div>" % (
@@ -4163,12 +4401,9 @@ def html_question(qid, token="", human=False):
     # The deadline note is written in the future tense ("if you do not answer in time")
     # and is plainly wrong on a defaulted question: the deadline HAS passed, and the note
     # above already says what the board answered. The page must say one thing, not two.
-    foot = ("<p class='mt-3 text-sm text-warning'>The deadline ran out — the board "
-            "answered \u201c%s\u201d. If you answer now, that overrides it.</p>"
-            % escape(q["answer"] or "")) if defaulted else (
-        "<p class='%s mt-3 text-sm'>If you do not answer before the deadline, the agent "
-        "carries on with: %s</p>" % (DIM, escape(q["default_answer"] or "—")))
-    return page(qid, """%s
+    foot = "<p class='%s mt-3 text-sm'>%s</p>" % (
+        "text-warning" if defaulted else DIM, escape(q_foot(q)))
+    return page(qid, number_blocks("""%s
         <div class='mt-5 max-w-[42rem] rounded-box border border-base-300 border-l-4
           border-l-warning bg-base-200 p-4'>
           <div class='md md-lead'>%s</div>
@@ -4178,13 +4413,16 @@ def html_question(qid, token="", human=False):
             <input id=freetext class='input w-full' type=text name=answer
               placeholder='your answer'>
             <button class='btn btn-outline mt-3 min-h-12'>Send answer</button>
-          </form>%s</div>""" % (
+          </form>%s%s</div>%s%s""" % (
         # head() escapes on its own. This was the only call site that pre-escaped, and a
         # project name with & or < was then double-escaped and shown as "A&amp;amp;B" in
         # the browser. Project names are not validated, so it really can happen.
-        head(q["project"], "<span class='%s %s text-xs'>%s</span>" % (
-            MONO, DIM, escape(q["task"] or "")), human=human),
-        md(q["text"]), qid, opts, LBL, foot))
+        head(q["project"], "<span class='%s text-xs'>%s</span>" % (DIM, back), human=human),
+        md(q["text"], number=False), qid, opts, LBL, foot,
+        cmd_list([{"cmd": c, "why": qid, "by": q["asked_by"]}
+                  for c in stored_cmds(jl(q["cmds"], []))], number=False),
+        back_btn,
+        FOCUS)))
 
 
 # ---------- routes --------------------------------------------------------

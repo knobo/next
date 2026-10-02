@@ -12,7 +12,9 @@ for m in re.finditer(r"""class=(?:'([^']*)'|"([^"]*)"|([^\s>'"]+))""", html):
     used.update((m.group(1) or m.group(2) or m.group(3) or "").split())
 # Classes the board defines itself in @layer components, not Tailwind utilities.
 own = {"meter", "track", "k", "v", "tasks", "trail", "mark", "pj", "day", "qgrid", "pane",
-       "spine", "spine-stop", "spine-land", "over", "warn"}
+       "spine", "spine-stop", "spine-land", "over", "warn",
+       # fenced code blocks: styled by THEME_CSS in board.py (inline, CSP-hashed), not board.css
+       "cb", "cb-bar"}
 # NO prefix list, and no daisyUI names here. `startswith(("badge","btn","input","card"))`
 # skipped EVERYTHING beginning with them, and therefore also `input-bordered` — a daisyUI
 # 4 class that does not exist in daisyUI 5, and that sat dead in board.py while this very
