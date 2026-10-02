@@ -2525,13 +2525,11 @@ fi
 for X in $(api GET '/tasks?status=open' | jq -r '.tasks[]|select(.human==1)|.id'); do
   hum POST "/tasks/$X/archive" '{}' >/dev/null; done
 OA=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"co A\",\"human\":true,\"priority\":9}" | jq -r .id)
-sleep 1.1
 OB=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"co B\",\"human\":true,\"priority\":5,\"after\":[\"$OA\"]}" | jq -r .id)
-sleep 1.1
 OC=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"co C\",\"human\":true,\"priority\":5}" | jq -r .id)
 hget() { curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL$1"; }
 hco() { curl -si -H "Authorization: Bearer ${2:-$HUMAN_TOKEN}" -H 'Content-Type: application/x-www-form-urlencoded' \
-  -X POST -d go=1 "$BOARD_URL/t/$1/checkoff" | tr -d '\r'; }
+  -X POST -d "${3:-}" "$BOARD_URL/t/$1/checkoff" | tr -d '\r'; }
 PB=$(hget "/t/$OB")
 grep -q "data-autosubmit disabled" <<<"$PB" && grep -q "Venter på $OA" <<<"$PB" \
   && ok "a task held by after shows the checkbox disabled, with why" || no "held checkbox" "$(grep -o 'data-autosubmit[^>]*' <<<"$PB")"
@@ -2548,6 +2546,25 @@ R=$(hco "$OB"); L=$(grep -i '^location:' <<<"$R" | awk '{print $2}')
 R=$(hco "$OC"); L=$(grep -i '^location:' <<<"$R" | awk '{print $2}')
 [ "$L" = "/status?alldone=1" ] && grep -q "Alt gjort" <<<"$(hget "$L")" \
   && ok "done on the last task goes to /status with Alt gjort" || no "last task" "$L"
+
+# Same priority, created back to back: insertion order decides (A then C, no sleep).
+for X in $(api GET '/tasks?status=open' | jq -r '.tasks[]|select(.human==1)|.id'); do
+  hum POST "/tasks/$X/archive" '{}' >/dev/null; done
+TA=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"tie A\",\"human\":true,\"priority\":5}" | jq -r .id)
+TB=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"tie C\",\"human\":true,\"priority\":5}" | jq -r .id)
+L=$(grep -i '^location:' <<<"$(hco "$TA")" | awk '{print $2}')
+[ "$L" = "/t/$TB" ] && ok "tied priority and created: A goes to C by insertion order" || no "tie order" "$L"
+L=$(grep -i '^location:' <<<"$(hco "$TA")" | awk '{print $2}')
+[ "$L" = "/t/$TB" ] && ok "checkoff on an already-done task redirects on, no 409" || no "double submit" "$L"
+TD=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"row back\",\"human\":true,\"priority\":5}" | jq -r .id)
+L=$(grep -i '^location:' <<<"$(hco "$TD" "$HUMAN_TOKEN" 'back=/status%3Fproject%3Ddemo')" | awk '{print $2}')
+[ "$L" = "/status?project=demo" ] && ok "a checkoff from a /status row returns to /status" || no "row back" "$L"
+BH=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"blocked non-owner\"}" | jq -r .id)
+api POST "/tasks/$BH/claim" "{\"agent\":\"$AID\"}" >/dev/null
+api POST "/tasks/$BH/blocked" "{\"agent\":\"$AID\",\"note\":\"needs human\"}" >/dev/null
+! grep -q "Oppgave [0-9]" <<<"$(hget "/t/$BH")" && ok "a blocked human=0 task is not in the owner sequence" || no "blocked dead end" ""
+L=$(grep -i '^location:' <<<"$(hco "$TB")" | awk '{print $2}')
+[ "$L" = "/status?alldone=1" ] && ok "last owner task goes to /status?alldone=1" || no "alldone redirect" "$L"
 
 # Repo/project badges on /status rows, Til deg and the task header.
 RA=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"badge-web\",\"title\":\"badge A\",\"human\":true}" | jq -r .id)

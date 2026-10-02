@@ -2590,7 +2590,7 @@ document.addEventListener('click',function(e){
 document.addEventListener('DOMContentLoaded',function(){apply(get());});
 document.addEventListener('change',function(e){
   var el=e.target;
-  if(el&&el.matches&&el.matches('input[data-autosubmit]')&&el.form)el.form.submit();
+  if(el&&el.matches&&el.matches('input[data-autosubmit]')&&el.form){el.form.submit();el.disabled=true;}
 });
 })();
 """
@@ -2889,44 +2889,61 @@ def blocked_note(project, tid):
 
 
 def owner_list():
-    """The owner's tasks in the order an agent would take them: his own open tasks plus
-    those blocked on him, minus anything held back by `after`; priority DESC, created."""
+    """The tasks the owner can check off, in the order an agent would take them: his own
+    open tasks (human=1), minus anything held back by `after`; priority DESC, created, then
+    insertion order (rowid: ids are text, "T-10" sorts before "T-9")."""
     return [t for t in db.execute(
-        "SELECT * FROM tasks WHERE (human=1 AND status='open') OR status='blocked' "
-        "ORDER BY priority DESC, created")
-        if not waiting_on(t) and (t["status"] == "open"
-                                  or NEEDS_HUMAN.match(blocked_note(t["project"], t["id"])))]
+        "SELECT rowid AS rn, * FROM tasks WHERE human=1 AND status='open' "
+        "ORDER BY priority DESC, created, rowid") if not waiting_on(t)]
 
 
 def owner_key(t):
-    return (-(t["priority"] or 0), t["created"] or "")
+    return (-(t["priority"] or 0), t["created"] or "", t["rn"])
 
 
-def owner_next(done_row):
-    """The task after `done_row` in owner order, else the first one left, else None.
-    Called after the done is applied, so freed `after` dependents are already in."""
-    rest = owner_list()
-    k = owner_key(done_row)
-    return next((t for t in rest if owner_key(t) > k), rest[0] if rest else None)
+def multi_projects():
+    """Does the board have live tasks in more than one project? Then badges name it."""
+    return db.execute("SELECT COUNT(DISTINCT project) FROM tasks "
+                      "WHERE status NOT IN ('done','archived')").fetchone()[0] > 1
+
+
+def owner_done(m, b, q):
+    """Close the owner's task by hand. `/checkoff` is idempotent: a second press (double
+    tap, stale page) finds it already closed and just moves on."""
+    tid = m.group(1)
+    human_only(b, "closing a task")
+    t = task(tid)
+    if m.re.pattern.endswith("checkoff$") and t["status"] in ("done", "archived"):
+        return {"id": tid}
+    return dict(task_done(tid, HUMAN, {"_human": True}), id=tid)
 
 
 def after_checkoff(b, res):
-    t = db.execute("SELECT priority, created FROM tasks WHERE id=?", (res["id"],)).fetchone()
-    n = owner_next(t)
-    return "/t/" + urllib.parse.quote(n["id"]) if n else "/status?alldone=1"
+    """Back where the press came from (a row on /status), else the next task: the first one
+    after the done task in owner order (it is out of the list now, so compare keys), else
+    the first one left, else /status."""
+    back = back_to(b, "")
+    if back:
+        return back
+    t = db.execute("SELECT rowid AS rn, id, priority, created FROM tasks WHERE id=?", (res["id"],)).fetchone()
+    rest = owner_list()
+    k = owner_key(t)
+    n = next((x for x in rest if owner_key(x) > k), rest[0] if rest else None)
+    if n:
+        return "/t/" + urllib.parse.quote(n["id"])
+    p = (b or {}).get("project")
+    return "/status?alldone=1" + ("&project=" + urllib.parse.quote(p) if p else "")
 
 
-def for_you(s):
+def for_you(s, multi):
     """"Til deg": everything that is the owner's, in one block at the very top of /status —
     human tasks, tasks blocked on a human, open questions. Compact rows, links only."""
-    multi = len(s["projects"]) > 1
-    wb = lambda t: where_badges(dict(t, project=p["name"]), multi)
     sec = {"Oppgaver til deg": [], "Blokkert: trenger deg": [], "Spørsmål til deg": []}
     for p in s["projects"]:
-        sec["Oppgaver til deg"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/", wb(t))
+        sec["Oppgaver til deg"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/", where_badges(t, multi))
                                  for t in yours(p)]
         sec["Blokkert: trenger deg"] += [
-            (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/", wb(t))
+            (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/", where_badges(t, multi))
             for t in p["tasks"] if t["status"] == "blocked"
             and NEEDS_HUMAN.match(blocked_note(p["name"], t["id"]))]
         sec["Spørsmål til deg"] += [(q["id"], q.get("text") or q.get("task") or "",
@@ -3553,21 +3570,25 @@ def where_badges(t, multi):
     return "".join(out) + " " if out else ""
 
 
-def checkoff_form(t, small=False):
-    """A checkbox that marks the owner's task done and jumps to the next one. Submits on
-    change (THEME_JS); without script the <noscript> button does the same."""
-    held = waiting_on(t)
+def checkoff_form(t, small=False, back=""):
+    """A checkbox that marks the owner's task done. From the task page it jumps to the next
+    task; with `back` (a row on /status) it returns there. Submits on change (THEME_JS);
+    without script the <noscript> button does the same."""
+    held = t.get("waiting_on") or []
+    label = "Ferdig — gå til neste"
     why = ("<span class='text-sm text-warning'>Venter på %s</span>" % escape(" ".join(held))
            if held else "")
-    return ("<form method='POST' action='/t/%s/checkoff' class='m-0'>"
-            "<input type='hidden' name='go' value='1'>"
-            "<label class='flex min-h-11 cursor-pointer items-center gap-3%s'>"
-            "<input type='checkbox' class='checkbox checkbox-lg' data-autosubmit%s>"
-            "<span>Ferdig — gå til neste</span></label>%s"
-            "%s</form>" % (
-                escape(t["id"]), "" if small else " text-lg", " disabled" if held else "", why,
-                "" if held else "<noscript><button type='submit' class='btn btn-primary min-h-11'>"
-                                "Ferdig — gå til neste</button></noscript>"))
+    box = ("<input type='checkbox' class='checkbox%s' data-autosubmit%s%s>" % (
+        "" if small else " checkbox-lg", " disabled" if held else "",
+        " aria-label='Ferdig'" if small else ""))
+    return ("<form method='POST' action='/t/%s/checkoff' class='m-0'>%s"
+            "<label class='flex %scursor-pointer items-center gap-3%s'>%s%s</label>%s%s</form>" % (
+                escape(t["id"]),
+                "<input type='hidden' name='back' value='%s'>" % escape(back) if back else "",
+                "" if small else "min-h-11 ", "" if small else " text-lg", box,
+                "" if small else "<span>%s</span>" % label, why,
+                "" if held else "<noscript><button type='submit' class='btn btn-primary "
+                                "min-h-11'>%s</button></noscript>" % label))
 
 
 def done_button(t, human, back):
@@ -3575,7 +3596,7 @@ def done_button(t, human, back):
     if not (human and t.get("human") and t.get("status") not in ("done", "archived")
             and not t.get("merge_sha") and not t.get("pr")):
         return ""
-    return " <span class='inline-block align-middle'>%s</span>" % checkoff_form(t, small=True)
+    return " <span class='inline-block align-middle'>%s</span>" % checkoff_form(t, small=True, back=back)
 
 
 def queue(p, human, back):
@@ -3772,7 +3793,8 @@ def html_status(project, token="", human=False, alldone=False):
     s = status(project)
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
         MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")), (), human)]
-    if alldone:
+    if alldone and not owner_list() and not db.execute(
+            "SELECT 1 FROM questions WHERE status='open' LIMIT 1").fetchone():
         h.append("<div role='status' class='mt-4 rounded-box border border-l-4 border-base-300 "
                  "border-l-success bg-base-200 p-3 font-semibold'>Alt gjort ✓</div>")
     if s.get("ntfy_failures_since_success", 0) > 0:
@@ -3790,7 +3812,8 @@ def html_status(project, token="", human=False, alldone=False):
                  "in a project to put it here.</div>" % DIM)
         return page("board", "".join(h))
     h.append(watchline(s))
-    h.append(for_you(s))
+    multi = multi_projects()
+    h.append(for_you(s, multi))
     # The night and the quota on one row: what happened, and what is left to spend.
     h.append("<div class='topband'>%s%s</div>" % (
         night_band([e for p in s["projects"] for e in (p.get("ribbon") or [])]),
@@ -3812,7 +3835,7 @@ def html_status(project, token="", human=False, alldone=False):
                      % escape(p["budget"]["note"]))
         h.append(milestone_row(p))
         for t in p["tasks"]:
-            t["_multi"] = len(s["projects"]) > 1
+            t["_multi"] = multi
         rows_html, shown = queue(p, human, back)
         h.append(rows_html)
         h.append(new_task_form(p, human, back))
@@ -3947,7 +3970,7 @@ def plan_form(d, human):
 
 def owner_pos(d, human):
     """"Oppgave 2 av 7" and "Hopp over" for a task in the owner's list."""
-    if not (human and d.get("human") and d.get("status") in ("open", "blocked")):
+    if not (human and d.get("human") and d.get("status") == "open"):
         return ""
     ids = [t["id"] for t in owner_list()]
     if d["id"] not in ids:
@@ -3955,10 +3978,8 @@ def owner_pos(d, human):
     i = ids.index(d["id"])
     skip = ("<a class='%s text-sm' href='/t/%s'>Hopp over</a>" % (LINK, escape(ids[i + 1]))
             if i + 1 < len(ids) else "")
-    multi = db.execute("SELECT COUNT(DISTINCT project) FROM tasks WHERE status NOT IN "
-                       "('done','archived')").fetchone()[0] > 1
     return " %s<span class='%s text-sm'>Oppgave %d av %d</span> %s" % (
-        where_badges(d, multi), DIM, i + 1, len(ids), skip)
+        where_badges(d, multi_projects()), DIM, i + 1, len(ids), skip)
 
 
 def html_task(tid, token="", human=False):
@@ -4257,15 +4278,9 @@ UI_POST = [
      lambda m, b, q: (human_only(b, "planning a task"), task_patch(
          m.group(1), HUMAN, dict(b, **{k: b.get(k, "") for k in PLAN_FIELDS})))[1],
      lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
-    (r"/t/([^/]+)/done$",
-     lambda m, b, q: (human_only(b, "closing a task"),
-                      dict(task_done(m.group(1), HUMAN, {"_human": True}), id=m.group(1)))[1],
-     proj_back),
-    (r"/t/([^/]+)/checkoff$",
-     lambda m, b, q: (human_only(b, "closing a task"),
-                      dict(task_done(m.group(1), HUMAN, {"_human": True}), id=m.group(1)))[1],
-     after_checkoff),
-  (r"/t/([^/]+)/patch$",
+    (r"/t/([^/]+)/done$", owner_done, proj_back),
+    (r"/t/([^/]+)/checkoff$", owner_done, after_checkoff),
+    (r"/t/([^/]+)/patch$",
      lambda m, b, q: task_patch(m.group(1), actor_h(q, b), b),
      lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
     (r"/t/([^/]+)/release$",
