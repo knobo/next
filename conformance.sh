@@ -2521,6 +2521,7 @@ REAPPY
   [ -n "$R2" ] && ok "the reaper spawns a task for an overdue routine" || no "the reaper spawns a task for an overdue routine" "task not spawned"
 fi
 
+if [ "$OWN_SERVER" = 1 ]; then  # archives open human tasks: never against a real board
 # Owner checkoff: tick a human task, land on the next one in agent order.
 for X in $(api GET '/tasks?status=open' | jq -r '.tasks[]|select(.human==1)|.id'); do
   hum POST "/tasks/$X/archive" '{}' >/dev/null; done
@@ -2531,8 +2532,9 @@ hget() { curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL$1"; }
 hco() { curl -si -H "Authorization: Bearer ${2:-$HUMAN_TOKEN}" -H 'Content-Type: application/x-www-form-urlencoded' \
   -X POST -d "${3:-}" "$BOARD_URL/t/$1/checkoff" | tr -d '\r'; }
 PB=$(hget "/t/$OB")
-grep -q "data-autosubmit disabled" <<<"$PB" && grep -q "Venter på $OA" <<<"$PB" \
-  && ok "a task held by after shows the checkbox disabled, with why" || no "held checkbox" "$(grep -o 'data-autosubmit[^>]*' <<<"$PB")"
+grep -q "data-autosubmit>" <<<"$PB" && grep -q "Venter formelt på $OA" <<<"$PB" \
+  && ok "a task held by after still shows an enabled checkbox, with the note" || no "held checkbox" "$(grep -o 'data-autosubmit[^>]*' <<<"$PB")"
+grep -q "data-undo-note" <<<"$PB" && ok "task page has the Angre countdown note" || no "undo note" ""
 grep -q "Oppgave 1 av 2" <<<"$(hget "/t/$OA")" && grep -q "Hopp over" <<<"$(hget "/t/$OA")" \
   && ok "task page says Oppgave 1 av 2 with a skip link" || no "position header" ""
 grep -q "<noscript><button" <<<"$(hget "/t/$OA")" && ok "noscript fallback button present" || no "noscript button" ""
@@ -2573,6 +2575,16 @@ HS=$(hget /status)
 [ "$(grep -o "title='repo'>badge-web<" <<<"$HS" | wc -l)" -ge 2 ] && grep -q "title='repo'>badge-core<" <<<"$HS" \
   && ok "/status shows repo badges in Til deg and in the task rows" || no "repo badges" "$(grep -o "title='repo'>[^<]*" <<<"$HS" | sort | uniq -c)"
 grep -q "title='repo'>badge-web<" <<<"$(hget "/t/$RA")" && ok "task header shows the repo badge" || no "header repo badge" ""
+# A freed task of higher priority comes next: A5, B9 after A, C5 -> after A comes B.
+for X in $(api GET '/tasks?status=open' | jq -r '.tasks[]|select(.human==1)|.id'); do
+  hum POST "/tasks/$X/archive" '{}' >/dev/null; done
+FA=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"fr A\",\"human\":true,\"priority\":5}" | jq -r .id)
+FB=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"fr B\",\"human\":true,\"priority\":9,\"after\":[\"$FA\"]}" | jq -r .id)
+FC=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"fr C\",\"human\":true,\"priority\":5}" | jq -r .id)
+L=$(grep -i '^location:' <<<"$(hco "$FA")" | awk '{print $2}')
+[ "$L" = "/t/$FB" ] && ok "done(A) goes to the freed higher-priority B before C" || no "freed task next" "$L"
+grep -q "Alt gjort" <<<"$(hget '/status?alldone=1')" && no "banner shown with tasks left" "" || ok "no Alt gjort banner while tasks are left"
+fi
 
 echo
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
