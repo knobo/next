@@ -680,6 +680,38 @@ check "answer" "$(hum POST /questions/$QID/answer '{"answer":"A","by":"human"}')
 IN=$(api GET "/agents/$AID/inbox")
 check "the inbox delivers the answer" "$IN" 'any(.questions[]; .answer=="A")'
 check "the inbox empties after reading" "$(api GET "/agents/$AID/inbox")" '.questions|length==0'
+# Junk guard: `board ask show` once put a question "show" in front of the human (Q-303).
+check "a question that is just 'show' is refused" \
+  "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"show\"}")" '.error|test("no subcommands")'
+check "a non-string title is a 400, not a 500" \
+  "$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":5}")" '.error|test("string")'
+check "a short real question is accepted" \
+  "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"Merge it?\"}")" '.id'
+check "'show Q-1' is refused as a question" \
+  "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"show Q-1\"}")" '.error'
+check "a one-word task title is refused" \
+  "$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"list\"}")" '.error|test("mistyped")'
+check "a proper sentence is accepted as a question" \
+  "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"Should the junk guard also cover comments?\"}")" '.id'
+# Copyable code blocks: two fenced blocks -> two Kopier buttons, numbered, HTML escaped.
+CBT=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"two commands for the owner\",\"human\":true,\"spec\":\"Run:\\n\\n\`\`\`sh\\necho one <script>alert(1)</script>\\n\`\`\`\\n\\nthen:\\n\\n\`\`\`sh\\necho two\\n\`\`\`\"}" | jq -r .id)
+curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$CBT" > "$TMP/cb.html"
+python3 - "$TMP/cb.html" <<'PY' && ok "a spec with two fenced blocks renders two Kopier buttons, escaped" || no "two copy buttons, escaped"
+import sys; h = open(sys.argv[1]).read()
+assert h.count("data-copy>Kopier</button>") == 2 and "sh 1/2" in h and "sh 2/2" in h, h[:200]
+assert "<script>alert(1)" not in h and "&lt;script&gt;alert(1)" in h
+PY
+# A fence language named like an Object.prototype key must render, not throw.
+PXT=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"proto fence task\",\"spec\":\"\`\`\`__proto__\\nx\\n\`\`\`\"}" | jq -r .id)
+check "a __proto__ fence renders a code block" "$(curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$PXT" | jq -Rs '{h:.}')" '.h|test("data-lang=.__proto__.")'
+grep -q "hasOwnProperty.call(KW" board.py && ok "the highlighter guards KW lookups" || no "the highlighter guards KW lookups"
+# "Til deg": human tasks and open questions are the first thing on /status.
+api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"for-you human task\",\"human\":true}" >/dev/null
+curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=demo" > "$TMP/foryou.html"
+python3 - "$TMP/foryou.html" <<'PY' && ok "/status opens with a Til deg section" || no "/status opens with a Til deg section"
+import sys; h = open(sys.argv[1]).read(); i = h.find("id='for-you'")
+assert i > 0 and "Til deg" in h and "Oppgaver til deg (" in h and "for-you human task" in h[i:] and "Spørsmål til deg (" in h[i:], h[:300]
+PY
 check "message agent→agent" "$(api POST /messages "{\"agent\":\"$AID\",\"to\":\"$BID\",\"project\":\"demo\",\"text\":\"regenerer typer\"}")" '.ok'
 check "the message is in the recipient's inbox" "$(api GET "/agents/$BID/inbox")" '.messages[0].text=="regenerer typer"'
 fi

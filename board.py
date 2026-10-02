@@ -1011,6 +1011,10 @@ def task_create(b, actor):
     project = b.get("project")
     if not project or not b.get("title"):
         raise Err(400, "project and title are mandatory")
+    if not isinstance(b["title"], str):
+        raise Err(400, "title must be a string")
+    if actor not in ("board", HUMAN) and (m := junk_text(b["title"], "task title")):
+        raise Err(400, m)
     ensure_project(project)
     plan = plan_fields(b, project)
     # Only on what comes from outside. The board itself creates follow-up tasks that
@@ -1872,6 +1876,25 @@ def deadline_of(v):
     return v
 
 
+# An agent ran `board ask show` / `board ask list` and the human got a question "show"
+# (Q-303): `ask` has no subcommands, so the first positional became the text. Refuse what
+# is plainly a mistyped subcommand rather than put junk on the one list a person reads.
+CLI_WORDS = {"show", "list", "ls", "status", "inbox", "answer", "get", "help", "ask", "create"}
+
+
+def junk_text(text, what):
+    """None if `text` can be a question/task title; else the refusal message."""
+    words = (text or "").split()
+    first = words[0].lower().rstrip("?:.") if words else ""
+    # Refused: nothing, a lone command word, or a command word with next to nothing after it
+    # ("show", "show Q-1", "ask list"). Short real questions ("Merge it?") must pass.
+    if not words or (first in CLI_WORDS and len(words) < (2 if what == "task title" else 3)):
+        return ("%s %r looks like a mistyped command, not %s. `board ask` takes ONE full-sentence "
+                "question and has no subcommands (use `board status` / `board inbox`); `board "
+                "task create` takes a descriptive title." %
+                (what, " ".join(words), "a full sentence" if what == "question" else "a title"))
+
+
 def question_create(b, actor):
     project = b.get("project")
     kind = b.get("kind", "question")
@@ -1884,6 +1907,10 @@ def question_create(b, actor):
                        "code); the human tests in dev/prod after deploy")
     if not b.get("text"):
         raise Err(400, "text is missing")
+    if not isinstance(b["text"], str):
+        raise Err(400, "text must be a string")
+    if actor not in ("board", HUMAN) and (m := junk_text(b["text"], "question")):
+        raise Err(400, m)
     qid = next_id("Q-", "questions")
     db.execute("""INSERT INTO questions (id,project,task,asked_by,kind,text,options,
                   default_answer,deadline,status,created) VALUES (?,?,?,?,?,?,?,?,?,'open',?)""",
@@ -2432,7 +2459,7 @@ def md(text, inline=False, links=True):
     the page has already laid out and must not suddenly contain a heading."""
     if not text:
         return ""
-    esc = escape(str(text)).replace("\r\n", "\n").replace("\r", "\n")
+    esc = escape(str(text).replace("\0", "")).replace("\r\n", "\n").replace("\r", "\n")
     if inline:
         return md_inline(esc.replace("\n", " "), links)
     lines, out, i = esc.split("\n"), [], 0
@@ -2445,7 +2472,12 @@ def md(text, inline=False, links=True):
                 body.append(lines[i])
                 i += 1
             i += 1                                   # the closing fence, if there is one
-            out.append("<pre><code>%s</code></pre>" % "\n".join(body))
+            # One block, one Kopier button (see COPY_JS). `\0` is replaced below once we know
+            # how many blocks there are, so "2/3" lets the owner paste them in order.
+            out.append("<div class='cb' data-lang='%s'><div class='cb-bar'><span>%s\0</span>"
+                       "<button type='button' class='btn btn-outline' data-copy>Kopier</button></div>"
+                       "<pre><code>%s</code></pre></div>" % (
+                           fence.group(1).lower(), fence.group(1).lower() or "kode", "\n".join(body)))
             continue
         if not line.strip():
             i += 1
@@ -2483,6 +2515,12 @@ def md(text, inline=False, links=True):
             para.append(lines[i].strip())
             i += 1
         out.append("<p>%s</p>" % md_inline("<br>".join(para)))
+    n = sum("\0" in o for o in out)
+    k = 0
+    for j, o in enumerate(out):
+        if "\0" in o:
+            k += 1
+            out[j] = o.replace("\0", " %d/%d" % (k, n) if n > 1 else "", 1)
     return "".join(out)
 
 
@@ -2552,9 +2590,61 @@ document.addEventListener('click',function(e){
 document.addEventListener('DOMContentLoaded',function(){apply(get());});
 })();
 """
+COPY_JS = r"""
+(function(){
+var KW={sh:'if then else elif fi for while do done case esac in function export cd echo git kubectl docker sudo curl board gradle npm make',
+ yaml:'true false null yes no',json:'true false null',
+ sql:'select from where insert into values update set delete create table alter drop join left right on and or not null order by group limit as',
+ kotlin:'fun val var class object if else when for while return import package null true false is in override private'};
+KW.bash=KW.sh;KW.zsh=KW.sh;KW.yml=KW.yaml;KW.kt=KW.kotlin;
+function esc(s){return s.replace(/[.*+?^${}()|[\]\\\/]/g,'\\$&');}
+function hl(code,lang){
+  if(!Object.prototype.hasOwnProperty.call(KW,lang))return;var kw=KW[lang];
+  var com=(lang==='sql')?'--.*':(lang==='kotlin'||lang==='kt')?'\\/\\/.*':(lang==='json')?'(?!)':'(?:^|\\s)#.*';
+  var re=new RegExp('('+com+')|("(?:\\\\.|[^"\\\\\\n])*"|\'[^\'\\n]*\')|(\\$\\{?\\w+\\}?)|(\\b(?:'+kw.split(' ').map(esc).join('|')+')\\b)|(\\b\\d+\\b)|((?:^|\\s)--?[a-zA-Z][\\w-]*)',
+    lang==='sql'?'gim':'gm');
+  var t=code.textContent,out=document.createDocumentFragment(),last=0,m,cls=['c','s','v','k','n','f'];
+  while((m=re.exec(t))){
+    if(!m[0])break;
+    for(var i=1;i<7;i++)if(m[i]!==undefined)break;
+    if(m.index>last)out.appendChild(document.createTextNode(t.slice(last,m.index)));
+    var sp=document.createElement('span');sp.className='tk-'+cls[i-1];sp.textContent=m[0];out.appendChild(sp);
+    last=m.index+m[0].length;
+  }
+  out.appendChild(document.createTextNode(t.slice(last)));
+  code.textContent='';code.appendChild(out);
+}
+function init(){
+  var b=document.querySelectorAll('.cb');
+  for(var i=0;i<b.length;i++)hl(b[i].querySelector('code'),b[i].getAttribute('data-lang'));
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
+document.addEventListener('click',function(e){
+  var b=e.target.closest?e.target.closest('[data-copy]'):null;
+  if(!b)return;
+  var t=b.closest('.cb').querySelector('code').textContent;
+  function done(){var o=b.textContent;b.textContent='Kopiert \u2713';setTimeout(function(){b.textContent='Kopier';},1500);}
+  function fail(){b.textContent='Kopiering feilet';setTimeout(function(){b.textContent='Kopier';},1500);}
+  function old(){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';
+    document.body.appendChild(a);a.select();var ok=false;try{ok=document.execCommand('copy');}catch(x){}ok?done():fail();document.body.removeChild(a);}
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(done,old);else old();
+});
+})();
+"""
+THEME_JS += COPY_JS
+THEME_CSS = """<style>
+.cb{margin:.65rem 0;border:1px solid var(--color-base-300);border-radius:.5rem;overflow:hidden}
+.cb-bar{display:flex;justify-content:space-between;align-items:center;padding:.15rem .5rem;
+  background:var(--color-base-200);font-size:.75rem;opacity:.9}
+.cb-bar .btn{min-height:1.5rem;height:1.5rem;padding:0 .5rem;font-size:.75rem}
+.cb pre{margin:0!important;border:0!important;border-radius:0!important}
+.tk-c{color:var(--color-base-content);opacity:.55;font-style:italic}.tk-s{color:var(--color-success)}
+.tk-v{color:var(--color-info)}.tk-k{color:var(--color-secondary);font-weight:600}
+.tk-n{color:var(--color-warning)}.tk-f{color:var(--color-accent)}
+</style>"""
 THEME_SHA = "'sha256-%s'" % base64.b64encode(
     hashlib.sha256(THEME_JS.encode()).digest()).decode()
-THEME = "<script>%s</script>" % THEME_JS
+THEME = THEME_CSS + "<script>%s</script>" % THEME_JS
 
 
 def theme_toggle():
@@ -2782,6 +2872,41 @@ def watchline(s):
         parts.append("<span class='%s'>Nothing is waiting on you.</span>" % DIM)
     return ("<p class='mt-5 flex flex-wrap gap-x-3 gap-y-1 text-lg leading-snug "
             "sm:text-2xl'>%s</p>" % "".join(parts))
+
+
+def for_you(s):
+    """"Til deg": everything that is the owner's, in one block at the very top of /status —
+    human tasks, tasks blocked on a human, open questions. Compact rows, links only."""
+    def blocked_note(project, tid):
+        # project=? so this hits the events_stream(project, stream, id) index.
+        r = db.execute("SELECT body FROM events WHERE project=? AND stream=? AND type='task.blocked' "
+                       "ORDER BY id DESC LIMIT 1", (project, "task/" + tid)).fetchone()
+        return (jl(r["body"], {}).get("note") or "") if r else ""
+    sec = {"Oppgaver til deg": [], "Blokkert: trenger deg": [], "Spørsmål til deg": []}
+    for p in s["projects"]:
+        sec["Oppgaver til deg"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/")
+                                 for t in yours(p)]
+        sec["Blokkert: trenger deg"] += [
+            (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/")
+            for t in p["tasks"] if t["status"] == "blocked"
+            and re.match(r"\s*(needs (a )?human|human needed|waiting for human)", blocked_note(p["name"], t["id"]), re.I)]
+        sec["Spørsmål til deg"] += [(q["id"], q.get("text") or q.get("task") or "",
+                                           q.get("created"), q.get("kind") or "question", "/q/")
+                                          for q in p["questions"]]
+    out = []
+    for name, rows in sec.items():
+        if rows:
+            out.append("<h3 class='mt-3 text-sm font-semibold'>%s (%d)</h3><ul class='text-sm'>%s</ul>" % (
+                escape(name), len(rows), "".join(
+                    "<li class='flex gap-2'><a class='%s underline' href='%s%s'>%s</a><span>%s</span>%s"
+                    "<span class='%s text-xs'>%s</span></li>" % (
+                        MONO, base, escape(i), escape(i), md(title[:100], inline=True, links=False), when(ts), DIM, escape(kind))
+                    for i, title, ts, kind, base in rows)))
+    if not out:
+        return ""
+    return ("<section id='for-you' class='mt-4 rounded-box border border-l-4 border-base-300 "
+            "border-l-warning bg-base-200 p-3'><h2 class='font-semibold'>Til deg</h2>%s</section>"
+            % "".join(out))
 
 
 def fleet_runway(s):
@@ -3598,6 +3723,7 @@ def html_status(project, token="", human=False):
                  "in a project to put it here.</div>" % DIM)
         return page("board", "".join(h))
     h.append(watchline(s))
+    h.append(for_you(s))
     # The night and the quota on one row: what happened, and what is left to spend.
     h.append("<div class='topband'>%s%s</div>" % (
         night_band([e for p in s["projects"] for e in (p.get("ribbon") or [])]),
