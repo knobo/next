@@ -916,6 +916,14 @@ gate)
 
 ask)
   parse "$@"
+  # One quoted question. A second word, or a subcommand word first, is a misplaced command
+  # that would otherwise be filed as a question (Q-303).
+  case "${POS[0]:-}" in
+    ask|answer|task|tasks|status|register|heartbeat|finished|inbox|message|routine|routines|\
+    role|ceiling|pause|resume|gate|project|agent|agents|tail|open|help)
+      echo 'usage: board ask "your question" [--task T-1] [--default ...]' >&2; exit 1 ;;
+  esac
+  [ -z "${POS[1]:-}" ] || { echo 'usage: board ask "your question" (quote the whole question)' >&2; exit 1; }
   b=$(body text "${POS[0]:-}")
   req POST /questions "$(with_agent "$(with_project "$b")")" ;;
 

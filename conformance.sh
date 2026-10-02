@@ -1591,6 +1591,8 @@ check "task patch lets a known repo through" \
   "$(api PATCH /tasks/$RPT "{\"agent\":\"$CLIID\",\"repo\":\"web\"}")" '.repo=="web"' 
 if [ "$OWN_SERVER" = 1 ]; then
 check "ask without --project" "$(cli ask --default B --deadline 8h "A or B?")" '.id'
+cli ask show >/dev/null; R1=$?; cli ask Merge it now >/dev/null; R2=$?
+[ "$R1" = 1 ] && [ "$R2" = 1 ] && ok "board ask refuses a subcommand word and an unquoted multi-word question" || no "CLI ask guard" "rc $R1 $R2"
 
 # An empty or unreadable --spec-file used to produce a task with an empty spec and exit 0.
 BEFORE=$(api GET '/tasks?project=demo' | jq '.tasks|length')
@@ -2532,7 +2534,7 @@ hget() { curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL$1"; }
 hco() { curl -si -H "Authorization: Bearer ${2:-$HUMAN_TOKEN}" -H 'Content-Type: application/x-www-form-urlencoded' \
   -X POST -d "${3:-}" "$BOARD_URL/t/$1/checkoff" | tr -d '\r'; }
 PB=$(hget "/t/$OB")
-grep -q "data-autosubmit>" <<<"$PB" && grep -q "Venter formelt på $OA" <<<"$PB" \
+grep -q "data-autosubmit autocomplete=.off.>" <<<"$PB" && grep -q "Venter formelt på $OA" <<<"$PB" \
   && ok "a task held by after still shows an enabled checkbox, with the note" || no "held checkbox" "$(grep -o 'data-autosubmit[^>]*' <<<"$PB")"
 grep -q "data-undo-note" <<<"$PB" && ok "task page has the Angre countdown note" || no "undo note" ""
 grep -q "Oppgave 1 av 2" <<<"$(hget "/t/$OA")" && grep -q "Hopp over" <<<"$(hget "/t/$OA")" \
