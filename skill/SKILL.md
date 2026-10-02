@@ -58,6 +58,7 @@ Role ≠ coordinator → read `reference/roles.md`; the loop is the same, only w
 
 ## Never stop
 
+- Anything the owner must RUN: one fenced ```sh block per step, in order — the board gives each its own Kopier button.
 - Product choice → `board ask --task $T --default "<best guess>" --deadline 8h "<q>"`, implement the default, mark the PR "assumes X (Q-n)". risk=high never merges on a default.
 - Only a human can do it → `board task blocked $T --note "needs human: …"` → next task. A whole task that is the owner's (create a key, register a webhook, test on the phone) → `board task patch $T --human` instead: it leaves the fleet's queue for the owner's "for you" list, and the work that needs it waits with `--after $T`.
 - Found a bug outside your task → `board task create --kind bug` (prod down: `--kind incident`, it goes to the front and pushes). Do not widen your own task.

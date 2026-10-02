@@ -106,6 +106,8 @@ board task create --title "..." --spec-file spec.md    # the spec now has a page
 board ask --default "yes" --deadline 8h "$(cat question.md)"
 ```
 
+`board ask` takes one full-sentence question and has no subcommands (`board ask show` is refused). When a question, spec or note asks the owner to RUN something, put each run step in its own fenced ```sh block, in order: the board renders every block with its own Kopier button, numbered 1/n.
+
 The text is escaped before any of it is read as markup, so nothing written into a spec
 can become an element on the page. A link survives only if it points at `http(s)://` or
 at a path on the board itself — and a path is checked for more than a leading slash,
