@@ -127,7 +127,8 @@ parse() {
       # --cmd is the one flag that may be given several times. A card often carries more
       # than one command for the human, and jq --arg silently keeps only the last of two
       # with the same name — the first would have vanished without a word (T-500).
-      --cmd) if [ $# -ge 2 ]; then CMDS+=("$2"); shift 2; else shift; fi ;;
+      --cmd) if [ $# -ge 2 ] && [[ "${2:-}" != --* ]]; then CMDS+=("$2"); shift 2
+             else echo "board: --cmd needs a command" >&2; exit 1; fi ;;
       --*) k="${1#--}"; k="${k//-/_}"
            if [ $# -ge 2 ] && [[ "${2:-}" != --* ]]; then JQARGS+=(--arg "$k" "$2"); shift 2
            else JQARGS+=(--argjson "$k" true); shift; fi ;;

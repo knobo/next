@@ -1126,34 +1126,23 @@ def task_costs(project=None):
 #   2. what it wrote in backticks in a note or a spec. That is where every command on
 #      the board sat before the flag existed, so without this every card written until
 #      now stays as unusable as it was — and that is nearly all of them.
-CMD_HEADS = ("board ", "git ", "gh ", "tea ", "./", "bash ", "sh ", "npm ", "npx ",
-             "pnpm ", "cd ", "curl ", "kubectl ", "docker ", "python3 ", "python ",
-             "make ", "cargo ", "pytest ", "playwright ", "flutter ", "gradle ")
-
-
-CMD_FENCE = re.compile(r"(?ms)^[ \t]*(```+)[ \t]*([A-Za-z0-9_+-]*)[ \t]*\n(.*?)\n?^[ \t]*\1`*[ \t]*$"
-                       r"|`+([^`\n]+)`+")
+CMD_MAX, CMD_N = 1000, 10        # one limit, for --cmd and for fenced extraction alike
+CMD_FENCE = re.compile(r"(?ms)^[ \t]*(```+)[ \t]*([A-Za-z0-9_+-]*)[ \t]*\n(.*?)\n?^[ \t]*\1`*[ \t]*$")
 SH_LANGS = ("sh", "bash", "zsh", "shell", "console")
 
 
 def cmds_in(text):
-    """Commands in a piece of text, in the order they appear: a fenced ```sh block is ONE
-    (multi-line) command, a backtick span that starts with a known command head is one.
+    """Fenced ```sh blocks in a piece of text, in order — each ONE (multi-line) command.
 
-    The head list is deliberately a whitelist: `T-191`, `awaiting_human` and
-    `total_input_tokens` are all backticked on this board too, and a copy button on
-    those is noise on the one surface that must only show what is actually waiting."""
+    Only fences. Inline `backtick` spans were extracted too, and an agent describing what
+    it had DONE (`git push`) then got a "waiting on you" copy button on a card where
+    nothing waits: this surface must only show what the author marked as a thing to run."""
     out = []
-    for m in CMD_FENCE.finditer(text or ""):
-        if m.group(1):                       # a fence; other languages are not commands
-            c = m.group(3).strip()
-            if m.group(2).lower() in SH_LANGS and c and len(c) <= 1000:
-                out.append(c)
-        else:
-            c = m.group(4).strip()
-            if c.startswith(CMD_HEADS) and len(c) <= 300:
-                out.append(c)
-    return out
+    for m in CMD_FENCE.finditer((text or "").replace("\0", "")):
+        c = m.group(3).strip()
+        if m.group(2).lower() in SH_LANGS and c and len(c) <= CMD_MAX:
+            out.append(c)
+    return out[:CMD_N]
 
 
 def as_cmds(v):
@@ -1163,54 +1152,63 @@ def as_cmds(v):
     if v is None:
         return []
     if isinstance(v, str):
-        v = [c for c in v.splitlines() if c.strip()]
+        v = [c for c in v.replace("\0", "").splitlines() if c.strip()]
     if not isinstance(v, list) or not all(isinstance(c, str) for c in v):
         raise Err(400, "cmds must be a string or a list of strings")
-    out = [c.strip() for c in v]
-    if not all(out) or len(out) > 10 or any(len(c) > 300 for c in out):
-        raise Err(400, "cmds: at most 10 non-empty commands of at most 300 characters each")
+    out = [c.replace("\0", "").strip() for c in v]      # NUL is the code-block label's slot
+    if not all(out) or len(out) > CMD_N or any(len(c) > CMD_MAX for c in out):
+        raise Err(400, "cmds: at most %d non-empty commands of at most %d characters each — "
+                       "put a longer one in a ```sh block in the note" % (CMD_N, CMD_MAX))
     return out
 
 
 def stored_cmds(v):
     """Commands read back from a stored event/row: tolerant, they were validated on the way in."""
     v = v if isinstance(v, list) else []
-    return [c.strip() for c in v if isinstance(c, str) and c.strip()]
+    return [c.replace("\0", "").strip() for c in v if isinstance(c, str) and c.replace("\0", "").strip()]
+
+
+CMD_RESET = ("task.unblocked", "task.merge_verified", "task.done", "task.archived",
+             "task.released", "task.orphaned")
 
 
 def task_cmds(d, rows):
-    """The commands that are waiting on a human RIGHT NOW, newest first within a source,
-    deduplicated, each with who wrote it and where. Nothing for a task that is not
-    waiting, and nothing for a block or a question that has been settled: an old command
-    on a card is an instruction to do something nobody needs done. `rows` are the events
-    task_show already loaded (chronological, with `body`)."""
-    st, qs = d["status"], d.get("questions") or []
-    if st in ("done", "archived") or not (qs or st == "blocked" or d.get("human")):
+    """The commands waiting on a human right now, deduplicated, each with who wrote it and
+    where. Nothing for a done or archived task. Three sources, all explicit:
+      - the open questions' own --cmd, and the ```sh blocks in their text;
+      - the --cmd on the task's LATEST progress/blocked event. A later note without --cmd
+        does not clear it (the owner still has not run it); an unblock, a merge, a release
+        or someone else claiming the task does;
+      - the ```sh blocks in the latest block note, while the task is blocked.
+    `rows` are the events task_show already loaded (chronological, with `body`)."""
+    if d["status"] in ("done", "archived"):
         return []
     out, seen = [], set()
 
-    def add(cmds, why, by, cap=5):
-        for c in (cmds or [])[-cap:]:
+    def add(cmds, why, by):
+        for c in (cmds or [])[-CMD_N:]:
             c = (c or "").strip()
             if c and c not in seen:
                 seen.add(c)
                 out.append({"cmd": c, "why": why, "by": by})
-    for q in qs:
-        add(q.get("cmds"), q["id"], q.get("asked_by"))
+    for q in d.get("questions") or []:
+        add(stored_cmds(q.get("cmds")), q["id"], q.get("asked_by"))
         add(cmds_in(q["text"]), q["id"] + " tekst", q.get("asked_by"))
-    bi = max((i for i, r in enumerate(rows) if r["type"] == "task.blocked"), default=None)
-    if st == "blocked" and bi is not None:
-        for r in reversed(rows[bi + 1:]):
-            if r["type"] == "task.progress":
-                add(stored_cmds(r["body"].get("cmds")), "fremdriftsnotat", r["actor"])
-        r = rows[bi]
-        add(stored_cmds(r["body"].get("cmds")), "blokkert-notat", r["actor"])
-        add(cmds_in(r["body"].get("note")), "blokkert-notat", r["actor"])
-    elif st == "open" and d.get("human"):
-        for r in reversed(rows):
-            if r["type"] == "task.progress" and r["body"].get("cmds"):
-                add(stored_cmds(r["body"]["cmds"]), "fremdriftsnotat", r["actor"])
-                break
+    last = next((i for i in range(len(rows) - 1, -1, -1)
+                 if rows[i]["type"] in ("task.progress", "task.blocked")
+                 and stored_cmds(rows[i]["body"].get("cmds"))), None)
+    if last is not None:
+        r = rows[last]
+        cleared = any(x["type"] in CMD_RESET or
+                      (x["type"] == "task.claimed" and x["actor"] != r["actor"])
+                      for x in rows[last + 1:])
+        if not cleared:
+            add(stored_cmds(r["body"]["cmds"]),
+                "blokkert-notat" if r["type"] == "task.blocked" else "fremdriftsnotat", r["actor"])
+    if d["status"] == "blocked":
+        r = next((x for x in reversed(rows) if x["type"] == "task.blocked"), None)
+        if r:
+            add(cmds_in(r["body"].get("note")), "blokkert-notat", r["actor"])
     return out
 
 
@@ -2634,25 +2632,29 @@ def md(text, inline=False, links=True, number=True):
     return number_blocks("".join(out)) if number else "".join(out)
 
 
+CB_SLOT = "\0%s\0" % secrets.token_hex(8)     # md() strips every NUL from its input, and the
+                                              # rest is unguessable, so text cannot forge it
+
+
 def cb_block(lang, escaped_body):
     """One code block with its Kopier button. `escaped_body` is already HTML-escaped, and
-    is the ONLY thing the button copies. The `\0` is the slot for "i/n" (number_blocks)."""
-    return ("<div class='cb' data-lang='%s'><div class='cb-bar'><span>%s\0</span>"
+    is the ONLY thing the button copies. CB_SLOT is where "i/n" goes (number_blocks)."""
+    return ("<div class='cb' data-lang='%s'><div class='cb-bar'><span>%s%s</span>"
             "<button type='button' class='btn btn-outline' data-copy>Kopier</button></div>"
-            "<pre><code>%s</code></pre></div>" % (lang, lang or "kode", escaped_body))
+            "<pre><code>%s</code></pre></div>" % (lang, lang or "kode", CB_SLOT, escaped_body))
 
 
 def number_blocks(html):
     """"sh 2/3" on every code block, so the owner can paste them in order. Run over a
     whole page when several md() calls (spec, commands, notes) share it, so the labels
     are unique and in reading order."""
-    n = html.count("\0")
+    n = html.count(CB_SLOT)
     k = [0]
 
     def lab(_):
         k[0] += 1
         return " %d/%d" % (k[0], n) if n > 1 else ""
-    return re.sub("\0", lab, html)
+    return re.sub(re.escape(CB_SLOT), lab, html)
 
 
 def prose(text, cls="", number=True):
@@ -3445,13 +3447,38 @@ def cmd_list(cmds, number=True):
     return "<div class='mt-3'>%s</div>" % (number_blocks(h) if number else h)
 
 
-def task_ref(tid):
-    """A link to a task, but only for something that is one: a free-text `task` field must
-    not become an href, and a dead link on a card is a dead end for the owner."""
+def task_ok(tid, known=None):
+    """The task id if `tid` is one and the task exists, else None. A free-text `task` field
+    must never become an href, and a dead link is a dead end for the owner. `known` is a
+    set of ids from one batch lookup, so a page of cards does not query once per card."""
     t = str(tid or "")
-    if re.fullmatch(r"T-\d+", t) and db.execute("SELECT 1 FROM tasks WHERE id=?", (t,)).fetchone():
-        return "<a class='%s' href='/t/%s'>%s</a>" % (LINK, t, t)
-    return escape(t)
+    if not re.fullmatch(r"T-\d+", t):
+        return None
+    if known is not None:
+        return t if t in known else None
+    return t if db.execute("SELECT 1 FROM tasks WHERE id=?", (t,)).fetchone() else None
+
+
+def known_tasks(qs):
+    ids = sorted({q["task"] for q in qs if q["task"] and re.fullmatch(r"T-\d+", str(q["task"]))})
+    return {r["id"] for r in db.execute(
+        "SELECT id FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)} if ids else set()
+
+
+def task_ref(tid, known=None):
+    t = task_ok(tid, known)
+    return ("<a class='%s' href='/t/%s'>%s</a>" % (LINK, t, t)) if t else escape(str(tid or ""))
+
+
+def q_foot(q):
+    """What happens if nobody answers — one sentence, shared by the card and /q."""
+    if q["status"] == "defaulted":
+        return ("The deadline ran out \u2014 the board answered \u201c%s\u201d. If you answer "
+                "now, that overrides it." % (q["answer"] or ""))
+    if q["default_answer"]:
+        return ("If you do not answer before the deadline, the agent carries on with: %s"
+                % q["default_answer"])
+    return "agenten er blokkert til du svarer"
 
 
 def waiting_q(q):
@@ -3460,10 +3487,7 @@ def waiting_q(q):
     badge = ("<span class='badge badge-sm badge-warning'>board answered</span>"
              if q["status"] == "defaulted" else
              "<span class='badge badge-sm badge-ghost'>%s</span>" % escape(q["kind"] or ""))
-    foot = (("the board answered \u201c%s\u201d — answering now overrides it"
-             % (q["answer"] or "")) if q["status"] == "defaulted" else
-            ("nobody has answered; the agent carries on with: %s" % q["default_answer"]
-             if q["default_answer"] else "agenten er blokkert til du svarer"))
+    foot = q_foot(q)
     return ("<div class='mt-3 rounded-box border border-base-300 border-l-4 "
             "border-l-warning bg-base-200 p-4'>"
             "<h3 class='mb-2 text-base font-semibold'>"
@@ -3507,7 +3531,7 @@ def waiting_block(d):
         LBL, "waiting on you" if (qs or blocked) else "commands", body)
 
 
-def q_card(q, answer=None):
+def q_card(q, answer=None, known=None):
     """The question card is the ONLY surface on the board that is a human's job, and that
     is why it is the only one that gets the accent edge. The edge carries the meaning; it
     is not decoration."""
@@ -3522,7 +3546,7 @@ def q_card(q, answer=None):
                 " <span class='badge badge-sm badge-warning'>board answered</span>"
                 if answer is not None else "",
                 DIM, escape(q["kind"]), DIM, MONO,
-                task_ref(q["task"]) if q["task"] else "—",
+                task_ref(q["task"], known) if q["task"] else "—",
                 DIM, when(q.get("created")) or "—",
                 ("<dt class='%s'>board's answer<dd>%s" % (DIM, escape(answer)))
                 if answer is not None else "",
@@ -4124,13 +4148,14 @@ def html_status(project, token="", human=False, alldone=False):
         adrift = lambda q: not q.get("task") or q["task"] not in shown
         loose = [q for q in p["questions"] if adrift(q)]
         loose_d = [q for q in p["questions_defaulted"] if adrift(q)]
+        kt = known_tasks(loose + loose_d)      # one lookup for all this project's cards
         if loose:
             h.append("<p class='%s'>waiting for an answer from you</p>" % LBL)
-            h.append("<div class=qgrid>%s</div>" % "".join(q_card(q) for q in loose))
+            h.append("<div class=qgrid>%s</div>" % "".join(q_card(q, known=kt) for q in loose))
         if loose_d:
             h.append("<p class='%s'>the board answered itself — you can still override it</p>" % LBL)
             h.append("<div class=qgrid>%s</div>"
-                     % "".join(q_card(q, q["answer"] or "") for q in loose_d))
+                     % "".join(q_card(q, q["answer"] or "", kt) for q in loose_d))
         h.append("</div></section>")
     h.append(FOCUS)
     return page("board", "".join(h))
@@ -4358,9 +4383,10 @@ def html_question(qid, token="", human=False):
     q = db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
     if not q:
         raise Err(404, "unknown question")
+    tid = task_ok(q["task"])                 # the validated id, never the raw field
     back = task_ref(q["task"]) if q["task"] else ""
     back_btn = ("<a class='btn btn-outline mt-4 min-h-12' href='/t/%s'>Task %s</a>"
-                % (q["task"], q["task"])) if "href=" in back else ""
+                % (tid, tid)) if tid else ""
     if q["status"] not in ("open", "defaulted"):
         return page(qid, head(qid, back, human=human) + (
             "<div class='mt-5 max-w-[42rem] rounded-box border border-base-300 bg-base-200 p-4'>"
@@ -4375,13 +4401,9 @@ def html_question(qid, token="", human=False):
     # The deadline note is written in the future tense ("if you do not answer in time")
     # and is plainly wrong on a defaulted question: the deadline HAS passed, and the note
     # above already says what the board answered. The page must say one thing, not two.
-    foot = ("<p class='mt-3 text-sm text-warning'>The deadline ran out — the board "
-            "answered \u201c%s\u201d. If you answer now, that overrides it.</p>"
-            % escape(q["answer"] or "")) if defaulted else (
-        "<p class='%s mt-3 text-sm'>If you do not answer before the deadline, the agent "
-        "carries on with: %s</p>" % (DIM, escape(q["default_answer"])) if q["default_answer"] else
-        "<p class='%s mt-3 text-sm'>agenten er blokkert til du svarer</p>" % DIM)
-    return page(qid, """%s
+    foot = "<p class='%s mt-3 text-sm'>%s</p>" % (
+        "text-warning" if defaulted else DIM, escape(q_foot(q)))
+    return page(qid, number_blocks("""%s
         <div class='mt-5 max-w-[42rem] rounded-box border border-base-300 border-l-4
           border-l-warning bg-base-200 p-4'>
           <div class='md md-lead'>%s</div>
@@ -4396,11 +4418,11 @@ def html_question(qid, token="", human=False):
         # project name with & or < was then double-escaped and shown as "A&amp;amp;B" in
         # the browser. Project names are not validated, so it really can happen.
         head(q["project"], "<span class='%s text-xs'>%s</span>" % (DIM, back), human=human),
-        md(q["text"]), qid, opts, LBL, foot,
+        md(q["text"], number=False), qid, opts, LBL, foot,
         cmd_list([{"cmd": c, "why": qid, "by": q["asked_by"]}
-                  for c in stored_cmds(jl(q["cmds"], []))]),
+                  for c in stored_cmds(jl(q["cmds"], []))], number=False),
         back_btn,
-        FOCUS))
+        FOCUS)))
 
 
 # ---------- routes --------------------------------------------------------

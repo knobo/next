@@ -2607,8 +2607,8 @@ check "the question's --cmd is on the task" "$WS" \
   '[.commands[].cmd] | any(test("^board answer"))'
 check "the blocked note's --cmd is on the task" "$WS" \
   '[.commands[].cmd] | any(. == "cd ui && ./verify.sh")'
-check "a command in backticks in the LATEST block note is picked up" "$WS" \
-  '[.commands[].cmd] | any(. == "./conformance.sh")'
+check "an inline `backtick` command in a note is NOT picked up (only --cmd and sh fences)" "$WS" \
+  '[.commands[].cmd] | any(. == "./conformance.sh") | not'
 check "a fenced sh block in the block note is ONE multi-line command" "$WS" \
   '[.commands[].cmd] | any(. == "kubectl get pods\nkubectl get svc")'
 check "the spec is not a source of commands" "$WS" '[.commands[].cmd] | any(. == "./spec-only.sh") | not'
@@ -2640,7 +2640,7 @@ BAD=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $
   -d "{\"agent\":\"$WAID\",\"note\":\"half\",\"cmds\":[{\"x\":1}]}" "$BOARD_URL/api/v1/tasks/$CT/blocked")
 [ "$BAD" = 400 ] && [ "$(api GET /tasks/$CT | jq -r .status)" = claimed ] \
   && ok "a malformed --cmd is a 400 and leaves the task untouched" || no "bad cmds" "code=$BAD"
-for BC in '[\"\"]' "[\"$(printf 'x%.0s' $(seq 301))\"]"; do
+for BC in '[\"\"]' "[\"$(printf 'x%.0s' $(seq 1001))\"]"; do
   C=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     -d "{\"agent\":\"$WAID\",\"note\":\"x\",\"cmds\":$BC}" "$BOARD_URL/api/v1/tasks/$CT/progress")
   [ "$C" = 400 ] && ok "an empty or over-long command is refused" || no "cmds limits" "code=$C"; done
@@ -2651,14 +2651,43 @@ grep -q "<pre><code>echo &#x27;&lt;b&gt;x&lt;/b&gt;&#x27;" <<<"$CP" && grep -q "
 grep -q "fra $WAID · blokkert-notat" <<<"$CP" && ok "each command says who wrote it" || no "provenance caption" ""
 NUMS=$(grep -o "<span>[a-z]* [0-9]*/[0-9]*</span>" <<<"$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/t/$WT")" | sed 's/<[^>]*>//g;s/^[a-z]* //')
 [ "$(echo "$NUMS" | sort | uniq -d | wc -l)" = 0 ] && ok "code-block labels are unique across the page" || no "block numbering" "$NUMS"
-api POST /tasks/$CT/progress "{\"agent\":\"$WAID\",\"note\":\"back on it\"}" >/dev/null
-api POST /tasks/$CT/claim "{\"agent\":\"$WAID\"}" >/dev/null 2>&1
-api POST /tasks/$CT/review "{\"agent\":\"$WAID\"}" >/dev/null 2>&1
-check "a task that is no longer blocked shows no commands" "$(api GET /tasks/$CT)" '(.status!="blocked") and (.commands|length)==0'
+hum POST /tasks/$CT/comment '{"text":"did it, go on"}' >/dev/null
+check "a task the owner unblocked shows no commands" "$(api GET /tasks/$CT)" '(.status!="blocked") and (.commands|length)==0'
 QN=$(api POST /questions "{\"agent\":\"$WAID\",\"project\":\"demo\",\"task\":\"nope; <i>\",\"text\":\"valg uten default?\"}" | jq -r .id)
 QP=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/q/$QN")
 grep -q "agenten er blokkert til du svarer" <<<"$QP" && ! grep -q "href='/t/nope" <<<"$QP" && ! grep -q "<i>" <<<"$QP" \
   && ok "no default says blocked until you answer; a bogus task id is plain text, not a link" || no "q wording/link" ""
+
+# ---- round 2 ----
+# progress --cmd on a claimed task is shown, and a later note without --cmd does not clear it
+PT=$(api POST /tasks "{\"agent\":\"$WAID\",\"project\":\"demo\",\"title\":\"progress cmd\"}" | jq -r .id)
+api POST /tasks/$PT/claim "{\"agent\":\"$WAID\"}" >/dev/null
+api POST /tasks/$PT/progress "{\"agent\":\"$WAID\",\"note\":\"try it\",\"cmds\":[\"a\\u0000b --run\"]}" >/dev/null
+api POST /tasks/$PT/progress "{\"agent\":\"$WAID\",\"note\":\"more\"}" >/dev/null
+check "a progress --cmd on a claimed task is on the card, NUL stripped" "$(api GET /tasks/$PT)" '[.commands[].cmd]==["ab --run"]'
+curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/t/$PT" > "$TMP/ppg.html"
+grep -q "<pre><code>ab --run</code></pre>" "$TMP/ppg.html" && [ "$(tr -cd '\000' < "$TMP/ppg.html" | wc -c)" = 0 ] && ok "/t shows it, with no NUL in the page" || no "progress cmd page" ""
+api POST /tasks/$PT/release "{\"agent\":\"$WAID\"}" >/dev/null 2>&1
+check "releasing the task clears its commands" "$(api GET /tasks/$PT)" '.commands|length==0'
+# a command of exactly the shared limit is fine, one over is a 400
+BIG=$(printf 'y%.0s' $(seq 1000))
+OKC=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"agent\":\"$WAID\",\"project\":\"demo\",\"text\":\"long cmd?\",\"cmds\":[\"$BIG\"]}" "$BOARD_URL/api/v1/questions")
+[ "$OKC" = 200 ] && ok "a 1000-char --cmd is accepted (shared limit)" || no "1000 chars" "code=$OKC"
+# /q numbers its blocks page-wide
+NQ=$(api POST /questions "{\"agent\":\"$WAID\",\"project\":\"demo\",\"text\":\"kjør \\n\`\`\`sh\\nls\\n\`\`\`\",\"cmds\":[\"pwd\"],\"default\":\"x\"}" | jq -r .id)
+NN=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/q/$NQ" | grep -o "<span>sh [0-9]/[0-9]</span>" | tr '\n' ' ')
+[ "$NN" = "<span>sh 1/2</span> <span>sh 2/2</span> " ] && ok "/q labels its blocks 1/2 and 2/2" || no "/q numbering" "$NN"
+# the task field is free text: never an href, never raw
+for TV in 'x href=y' '"><script>alert(1)</script>'; do
+  XQ=$(api POST /questions "$(jq -nc --arg a "$WAID" --arg t "$TV" '{agent:$a,project:"demo",task:$t,text:"inj?"}')" | jq -r .id)
+  XP=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/q/$XQ")$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status")
+  ! grep -q "<script>alert" <<<"$XP" && ! grep -qE "<[^<>]* href=y" <<<"$XP" && ! grep -q "href='/t/x" <<<"$XP" \
+    && ok "task value [$TV] is rendered escaped, no injected tag or link" || no "task injection [$TV]" ""
+done
+# the CLI refuses a --cmd with no command
+CE=$(bash -c "$(sed -n '/^parse() {/,/^}/p' bin/board); POS=(); JQARGS=(); CMDS=(); LIST_KEYS='[]'; parse blocked --cmd --note x" 2>&1; echo "rc=$?")
+grep -q "board: --cmd needs a command" <<<"$CE" && grep -q "rc=1" <<<"$CE" && ok "bin/board: --cmd without a command is an error, exit 1" || no "cli --cmd" "$CE"
 
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
