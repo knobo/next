@@ -1886,11 +1886,9 @@ def junk_text(text, what):
     """None if `text` can be a question/task title; else the refusal message."""
     words = (text or "").split()
     first = words[0].lower().rstrip("?:.") if words else ""
-    # A task title only fails when it IS a command word; a question also fails when it is
-    # one word, a few characters, or a command word with next to nothing after it.
-    if (what == "task title" and (len(words) == 1 and first in CLI_WORDS or len(words) < 1)) or \
-       (what == "question" and (len(words) < 2 or (len(" ".join(words)) < 12 and len(words) < 3)
-                                or (first in CLI_WORDS and len(words) < 4))):
+    # Refused: nothing, a lone command word, or a command word with next to nothing after it
+    # ("show", "show Q-1", "ask list"). Short real questions ("Merge it?") must pass.
+    if not words or (first in CLI_WORDS and len(words) < (2 if what == "task title" else 3)):
         return ("%s %r looks like a mistyped command, not %s. `board ask` takes ONE full-sentence "
                 "question and has no subcommands (use `board status` / `board inbox`); `board "
                 "task create` takes a descriptive title." %
@@ -2601,7 +2599,7 @@ var KW={sh:'if then else elif fi for while do done case esac in function export 
 KW.bash=KW.sh;KW.zsh=KW.sh;KW.yml=KW.yaml;KW.kt=KW.kotlin;
 function esc(s){return s.replace(/[.*+?^${}()|[\]\\\/]/g,'\\$&');}
 function hl(code,lang){
-  var kw=KW[lang]; if(!kw)return;
+  if(!Object.prototype.hasOwnProperty.call(KW,lang))return;var kw=KW[lang];
   var com=(lang==='sql')?'--.*':(lang==='kotlin'||lang==='kt')?'\\/\\/.*':(lang==='json')?'(?!)':'(?:^|\\s)#.*';
   var re=new RegExp('('+com+')|("(?:\\\\.|[^"\\\\\\n])*"|\'[^\'\\n]*\')|(\\$\\{?\\w+\\}?)|(\\b(?:'+kw.split(' ').map(esc).join('|')+')\\b)|(\\b\\d+\\b)|((?:^|\\s)--?[a-zA-Z][\\w-]*)',
     lang==='sql'?'gim':'gm');
@@ -2884,15 +2882,15 @@ def for_you(s):
         r = db.execute("SELECT body FROM events WHERE project=? AND stream=? AND type='task.blocked' "
                        "ORDER BY id DESC LIMIT 1", (project, "task/" + tid)).fetchone()
         return (jl(r["body"], {}).get("note") or "") if r else ""
-    sec = {"Tasks for you": [], "Blocked: needs human": [], "Questions awaiting you": []}
+    sec = {"Oppgaver til deg": [], "Blokkert: trenger deg": [], "Spørsmål til deg": []}
     for p in s["projects"]:
-        sec["Tasks for you"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/")
+        sec["Oppgaver til deg"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/")
                                  for t in yours(p)]
-        sec["Blocked: needs human"] += [
+        sec["Blokkert: trenger deg"] += [
             (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/")
             for t in p["tasks"] if t["status"] == "blocked"
-            and re.match(r"\s*(needs (a )?human|human needed)", blocked_note(p["name"], t["id"]), re.I)]
-        sec["Questions awaiting you"] += [(q["id"], q.get("text") or q.get("task") or "",
+            and re.match(r"\s*(needs (a )?human|human needed|waiting for human)", blocked_note(p["name"], t["id"]), re.I)]
+        sec["Spørsmål til deg"] += [(q["id"], q.get("text") or q.get("task") or "",
                                            q.get("created"), q.get("kind") or "question", "/q/")
                                           for q in p["questions"]]
     out = []
@@ -2902,7 +2900,7 @@ def for_you(s):
                 escape(name), len(rows), "".join(
                     "<li class='flex gap-2'><a class='%s underline' href='%s%s'>%s</a><span>%s</span>%s"
                     "<span class='%s text-xs'>%s</span></li>" % (
-                        MONO, base, escape(i), escape(i), escape(title[:100]), when(ts), DIM, escape(kind))
+                        MONO, base, escape(i), escape(i), md(title[:100], inline=True, links=False), when(ts), DIM, escape(kind))
                     for i, title, ts, kind, base in rows)))
     if not out:
         return ""

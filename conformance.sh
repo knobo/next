@@ -685,6 +685,10 @@ check "a question that is just 'show' is refused" \
   "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"show\"}")" '.error|test("no subcommands")'
 check "a non-string title is a 400, not a 500" \
   "$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":5}")" '.error|test("string")'
+check "a short real question is accepted" \
+  "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"Merge it?\"}")" '.id'
+check "'show Q-1' is refused as a question" \
+  "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"show Q-1\"}")" '.error'
 check "a one-word task title is refused" \
   "$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"list\"}")" '.error|test("mistyped")'
 check "a proper sentence is accepted as a question" \
@@ -697,12 +701,16 @@ import sys; h = open(sys.argv[1]).read()
 assert h.count("data-copy>Kopier</button>") == 2 and "sh 1/2" in h and "sh 2/2" in h, h[:200]
 assert "<script>alert(1)" not in h and "&lt;script&gt;alert(1)" in h
 PY
+# A fence language named like an Object.prototype key must render, not throw.
+PXT=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"proto fence task\",\"spec\":\"\`\`\`__proto__\\nx\\n\`\`\`\"}" | jq -r .id)
+check "a __proto__ fence renders a code block" "$(curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/t/$PXT" | jq -Rs '{h:.}')" '.h|test("data-lang=.__proto__.")'
+grep -q "hasOwnProperty.call(KW" board.py && ok "the highlighter guards KW lookups" || no "the highlighter guards KW lookups"
 # "Til deg": human tasks and open questions are the first thing on /status.
 api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"for-you human task\",\"human\":true}" >/dev/null
 curl -sL -H "Authorization: Bearer $TOKEN" "$BOARD_URL/status?project=demo" > "$TMP/foryou.html"
 python3 - "$TMP/foryou.html" <<'PY' && ok "/status opens with a Til deg section" || no "/status opens with a Til deg section"
 import sys; h = open(sys.argv[1]).read(); i = h.find("id='for-you'")
-assert i > 0 and "Til deg" in h and "for-you human task" in h[i:] and "Questions awaiting you (" in h[i:], h[:300]
+assert i > 0 and "Til deg" in h and "Oppgaver til deg (" in h and "for-you human task" in h[i:] and "Spørsmål til deg (" in h[i:], h[:300]
 PY
 check "message agent→agent" "$(api POST /messages "{\"agent\":\"$AID\",\"to\":\"$BID\",\"project\":\"demo\",\"text\":\"regenerer typer\"}")" '.ok'
 check "the message is in the recipient's inbox" "$(api GET "/agents/$BID/inbox")" '.messages[0].text=="regenerer typer"'
@@ -757,7 +765,7 @@ QDID=$(jq -r .id <<<"$QD")
 # finish on the default, one on a task with a living owner. They default in the same reap cycle.
 DT=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"built on the guess\"}" | jq -r .id)
 api POST /tasks/$DT/claim "{\"agent\":\"$AID\"}" >/dev/null
-QT=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"task\":\"$DT\",\"text\":\"is the limit unlimited?\",\"default\":\"no\",\"deadline\":\"2020-01-01T00:00:00Z\"}" | jq -r .id)
+QT=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"task\":\"$DT\",\"text\":\"unlimited?\",\"default\":\"no\",\"deadline\":\"2020-01-01T00:00:00Z\"}" | jq -r .id)
 api POST /tasks/$DT/done "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
 LT=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"still alive\"}" | jq -r .id)
 api POST /tasks/$LT/claim "{\"agent\":\"$AID\"}" >/dev/null
@@ -828,7 +836,7 @@ check "an answer that confirms the default creates no follow-up task" \
 # overriding it.
 CT2=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"confirmed default\"}" | jq -r .id)
 api POST /tasks/$CT2/claim "{\"agent\":\"$AID\"}" >/dev/null
-QC=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"task\":\"$CT2\",\"text\":\"is it the same as before?\",\"default\":\"yes\",\"deadline\":\"2020-01-01T00:00:00Z\"}" | jq -r .id)
+QC=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"task\":\"$CT2\",\"text\":\"same?\",\"default\":\"yes\",\"deadline\":\"2020-01-01T00:00:00Z\"}" | jq -r .id)
 api POST /tasks/$CT2/done "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/null
 poll_until 75 1 event_seen "question/$QC" question.defaulted
 hum POST /questions/$QC/answer '{"answer":"Yes ","by":"human"}' >/dev/null
@@ -1174,15 +1182,15 @@ check "an agent token can NOT revoke permissions" \
   "$(hapi DELETE "/agents/$HA/grants/merge?project=p" "$TOKEN")" '.needs_human_token==true'
 check "the human token can revoke permissions" \
   "$(hapi DELETE "/agents/$HA/grants/merge?project=p" "$HT")" '(.grants|index("merge"))|not'
-HQ=$(hapi POST /questions "$TOKEN" "{\"agent\":\"$HA\",\"project\":\"p\",\"text\":\"is this fine to merge?\"}" | jq -r .id)
+HQ=$(hapi POST /questions "$TOKEN" "{\"agent\":\"$HA\",\"project\":\"p\",\"text\":\"ok?\"}" | jq -r .id)
 check "an agent cannot answer AS the human" \
   "$(hapi POST "/questions/$HQ/answer" "$TOKEN" '{"answer":"yes","by":"human"}')" '.needs_human_token==true'
 check "an agent can answer under its own id" \
   "$(hapi POST "/questions/$HQ/answer" "$TOKEN" "{\"answer\":\"yes\",\"by\":\"$HA\"}")" '.answer=="yes"'
-HQ2=$(hapi POST /questions "$TOKEN" "{\"agent\":\"$HA\",\"project\":\"p\",\"text\":\"and what about the rest?\"}" | jq -r .id)
+HQ2=$(hapi POST /questions "$TOKEN" "{\"agent\":\"$HA\",\"project\":\"p\",\"text\":\"and?\"}" | jq -r .id)
 check "the human token can answer as the human" \
   "$(hapi POST "/questions/$HQ2/answer" "$HT" '{"answer":"yes","by":"human"}')" '.answer=="yes"'
-HQ3=$(hapi POST /questions "$TOKEN" "{\"agent\":\"$HA\",\"project\":\"p\",\"text\":\"should this open in a browser?\"}" | jq -r .id)
+HQ3=$(hapi POST /questions "$TOKEN" "{\"agent\":\"$HA\",\"project\":\"p\",\"text\":\"browser?\"}" | jq -r .id)
 HC=$(curl -si -H "Cookie: board_token=$TOKEN" "http://localhost:$HPORT/status?t=$HT" \
      | sed -n 's/^Set-Cookie: \([^;]*\).*/\1/p' | tr -d '\r')
 check "browser login swaps an old agent cookie for the human token" \
@@ -1223,7 +1231,7 @@ if [ "$OWN_SERVER" = 1 ]; then
   echo "== ntfy push =="
   # The proof has to be that the push ARRIVES at an HTTP receiver. Everything else (that the
   # call does not throw, that the thread starts) was true for the entire day the push was dead.
-  api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"ntfy canary: does the push arrive?\",\"default\":\"no\",\"deadline\":\"2026-09-08T08:00:00Z\"}" >/dev/null
+  api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"ntfy canary\",\"default\":\"no\",\"deadline\":\"2026-09-08T08:00:00Z\"}" >/dev/null
   for _ in $(seq 50); do [ -s "$TMP/ntfy" ] && break; sleep .1; done
   N=$(cat "$TMP/ntfy" 2>/dev/null || true)
   grep -q "ntfy canary" <<<"$N" && ok "the push arrives at the receiver" \
@@ -1303,7 +1311,7 @@ grep -q '>agent<' <<<"$AGP" \
   && ok "an agent-token page says it is signed in as an agent" \
   || no "the agent-token page does not say which identity it carries" "$(grep -o 'badge-[a-z]*' <<<"$AGP" | sort -u | tr '\n' ' ')"
 if [ "$OWN_SERVER" = 1 ]; then
-  AQ=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"hvilken identitet gjelder?\"}" | jq -r .id)
+  AQ=$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"identitet?\"}" | jq -r .id)
   FORM=$(curl -s -o "$TMP/refused" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
          -H 'Content-Type: application/x-www-form-urlencoded' \
          -X POST -d 'answer=yes' "$BOARD_URL/q/$AQ/answer")
