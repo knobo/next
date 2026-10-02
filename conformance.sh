@@ -2595,10 +2595,10 @@ echo "== what is waiting on a human, on the task's own card (T-500) =="
 # command the human was meant to run lived in the middle of a note. T-191 stood blocked
 # on the same unanswered question six times over nine days without its card saying so.
 WAID=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"host-w","model":"m","session":"sw"}' | jq -r .id)
-WT=$(api POST /tasks "{\"agent\":\"$WAID\",\"project\":\"demo\",\"title\":\"blocked on a human\",\"spec\":\"kjør \`./conformance.sh\` etterpaa, og se paa \`awaiting_human\`\"}" | jq -r .id)
+WT=$(api POST /tasks "{\"agent\":\"$WAID\",\"project\":\"demo\",\"title\":\"blocked on a human\",\"spec\":\"kjør \`./spec-only.sh\` først\"}" | jq -r .id)
 api POST /tasks/$WT/claim "{\"agent\":\"$WAID\"}" >/dev/null
 WQ=$(api POST /questions "{\"agent\":\"$WAID\",\"project\":\"demo\",\"task\":\"$WT\",\"text\":\"USD eller tokens?\",\"default\":\"tokens\",\"deadline\":\"8h\",\"cmds\":[\"board answer Q-x --answer \\\"tokens\\\"\"]}" | jq -r .id)
-api POST /tasks/$WT/blocked "{\"agent\":\"$WAID\",\"note\":\"needs human\",\"cmds\":[\"cd ui && ./verify.sh\"]}" >/dev/null
+api POST /tasks/$WT/blocked "{\"agent\":\"$WAID\",\"note\":\"needs human: kjør \`./conformance.sh\` etterpaa, og se paa \`awaiting_human\`\\n\\n\`\`\`sh\\nkubectl get pods\\nkubectl get svc\\n\`\`\`\",\"cmds\":[\"cd ui && ./verify.sh\"]}" >/dev/null
 WS=$(api GET /tasks/$WT)
 check "the task carries the question that blocks it" "$WS" "any(.questions[]; .id==\"$WQ\")"
 check "the question carries its url, so the card can link to it" "$WS" \
@@ -2607,8 +2607,12 @@ check "the question's --cmd is on the task" "$WS" \
   '[.commands[].cmd] | any(test("^board answer"))'
 check "the blocked note's --cmd is on the task" "$WS" \
   '[.commands[].cmd] | any(. == "cd ui && ./verify.sh")'
-check "a command written in backticks in the spec is picked up too" "$WS" \
+check "a command in backticks in the LATEST block note is picked up" "$WS" \
   '[.commands[].cmd] | any(. == "./conformance.sh")'
+check "a fenced sh block in the block note is ONE multi-line command" "$WS" \
+  '[.commands[].cmd] | any(. == "kubectl get pods\nkubectl get svc")'
+check "the spec is not a source of commands" "$WS" '[.commands[].cmd] | any(. == "./spec-only.sh") | not'
+check "every command names who wrote it" "$WS" 'all(.commands[]; .by != null)'
 check "a backticked word that is not a command is left alone" "$WS" \
   '[.commands[].cmd] | any(. == "awaiting_human") | not'
 check "every command says where it came from" "$WS" 'all(.commands[]; .why != null and .why != "")'
@@ -2628,6 +2632,34 @@ hum POST /questions/$WQ/answer '{"answer":"tokens","by":"human"}' >/dev/null
 check "an answered question leaves the card" "$(api GET /tasks/$WT)" '.questions|length==0'
 
 echo
+
+# ---- review items: freshness, validation, rendering ----
+CT=$(api POST /tasks "{\"agent\":\"$WAID\",\"project\":\"demo\",\"title\":\"cmd render\"}" | jq -r .id)
+api POST /tasks/$CT/claim "{\"agent\":\"$WAID\"}" >/dev/null
+BAD=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"agent\":\"$WAID\",\"note\":\"half\",\"cmds\":[{\"x\":1}]}" "$BOARD_URL/api/v1/tasks/$CT/blocked")
+[ "$BAD" = 400 ] && [ "$(api GET /tasks/$CT | jq -r .status)" = claimed ] \
+  && ok "a malformed --cmd is a 400 and leaves the task untouched" || no "bad cmds" "code=$BAD"
+for BC in '[\"\"]' "[\"$(printf 'x%.0s' $(seq 301))\"]"; do
+  C=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"agent\":\"$WAID\",\"note\":\"x\",\"cmds\":$BC}" "$BOARD_URL/api/v1/tasks/$CT/progress")
+  [ "$C" = 400 ] && ok "an empty or over-long command is refused" || no "cmds limits" "code=$C"; done
+api POST /tasks/$CT/blocked "{\"agent\":\"$WAID\",\"note\":\"n\",\"cmds\":[\"echo '<b>x</b>'\\n\`\`\` \\necho y\"]}" >/dev/null
+CP=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/t/$CT")
+grep -q "<pre><code>echo &#x27;&lt;b&gt;x&lt;/b&gt;&#x27;" <<<"$CP" && grep -q "^\`\`\` *$" <<<"$CP" && ! grep -q $'\xe2\x80\x8b' <<<"$CP" \
+  && ok "a command with <b> and a \`\`\` line is shown verbatim, no zero-width space" || no "verbatim cmd" ""
+grep -q "fra $WAID · blokkert-notat" <<<"$CP" && ok "each command says who wrote it" || no "provenance caption" ""
+NUMS=$(grep -o "<span>[a-z]* [0-9]*/[0-9]*</span>" <<<"$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/t/$WT")" | sed 's/<[^>]*>//g;s/^[a-z]* //')
+[ "$(echo "$NUMS" | sort | uniq -d | wc -l)" = 0 ] && ok "code-block labels are unique across the page" || no "block numbering" "$NUMS"
+api POST /tasks/$CT/progress "{\"agent\":\"$WAID\",\"note\":\"back on it\"}" >/dev/null
+api POST /tasks/$CT/claim "{\"agent\":\"$WAID\"}" >/dev/null 2>&1
+api POST /tasks/$CT/review "{\"agent\":\"$WAID\"}" >/dev/null 2>&1
+check "a task that is no longer blocked shows no commands" "$(api GET /tasks/$CT)" '(.status!="blocked") and (.commands|length)==0'
+QN=$(api POST /questions "{\"agent\":\"$WAID\",\"project\":\"demo\",\"task\":\"nope; <i>\",\"text\":\"valg uten default?\"}" | jq -r .id)
+QP=$(curl -s -H "Authorization: Bearer $TOKEN" "$BOARD_URL/q/$QN")
+grep -q "agenten er blokkert til du svarer" <<<"$QP" && ! grep -q "href='/t/nope" <<<"$QP" && ! grep -q "<i>" <<<"$QP" \
+  && ok "no default says blocked until you answer; a bogus task id is plain text, not a link" || no "q wording/link" ""
+
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
 exit $((FAIL > 0))
