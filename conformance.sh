@@ -683,6 +683,8 @@ check "the inbox empties after reading" "$(api GET "/agents/$AID/inbox")" '.ques
 # Junk guard: `board ask show` once put a question "show" in front of the human (Q-303).
 check "a question that is just 'show' is refused" \
   "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"show\"}")" '.error|test("no subcommands")'
+check "a non-string title is a 400, not a 500" \
+  "$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":5}")" '.error|test("string")'
 check "a one-word task title is refused" \
   "$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"list\"}")" '.error|test("mistyped")'
 check "a proper sentence is accepted as a question" \

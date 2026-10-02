@@ -1011,7 +1011,9 @@ def task_create(b, actor):
     project = b.get("project")
     if not project or not b.get("title"):
         raise Err(400, "project and title are mandatory")
-    if actor != "board" and (m := junk_text(b["title"], "task title")):
+    if not isinstance(b["title"], str):
+        raise Err(400, "title must be a string")
+    if actor not in ("board", HUMAN) and (m := junk_text(b["title"], "task title")):
         raise Err(400, m)
     ensure_project(project)
     plan = plan_fields(b, project)
@@ -1907,7 +1909,9 @@ def question_create(b, actor):
                        "code); the human tests in dev/prod after deploy")
     if not b.get("text"):
         raise Err(400, "text is missing")
-    if actor != "board" and (m := junk_text(b["text"], "question")):
+    if not isinstance(b["text"], str):
+        raise Err(400, "text must be a string")
+    if actor not in ("board", HUMAN) and (m := junk_text(b["text"], "question")):
         raise Err(400, m)
     qid = next_id("Q-", "questions")
     db.execute("""INSERT INTO questions (id,project,task,asked_by,kind,text,options,
@@ -2457,7 +2461,7 @@ def md(text, inline=False, links=True):
     the page has already laid out and must not suddenly contain a heading."""
     if not text:
         return ""
-    esc = escape(str(text)).replace("\r\n", "\n").replace("\r", "\n")
+    esc = escape(str(text).replace("\0", "")).replace("\r\n", "\n").replace("\r", "\n")
     if inline:
         return md_inline(esc.replace("\n", " "), links)
     lines, out, i = esc.split("\n"), [], 0
@@ -2473,7 +2477,7 @@ def md(text, inline=False, links=True):
             # One block, one Kopier button (see COPY_JS). `\0` is replaced below once we know
             # how many blocks there are, so "2/3" lets the owner paste them in order.
             out.append("<div class='cb' data-lang='%s'><div class='cb-bar'><span>%s\0</span>"
-                       "<button type='button' class='btn btn-xs' data-copy>Kopier</button></div>"
+                       "<button type='button' class='btn btn-outline' data-copy>Kopier</button></div>"
                        "<pre><code>%s</code></pre></div>" % (
                            fence.group(1).lower(), fence.group(1).lower() or "kode", "\n".join(body)))
             continue
@@ -2590,7 +2594,7 @@ document.addEventListener('DOMContentLoaded',function(){apply(get());});
 """
 COPY_JS = r"""
 (function(){
-var KW={sh:'if then else elif fi for while do done case esac in function export cd echo git kubectl docker sudo curl ./conformance.sh board gradle npm make',
+var KW={sh:'if then else elif fi for while do done case esac in function export cd echo git kubectl docker sudo curl board gradle npm make',
  yaml:'true false null yes no',json:'true false null',
  sql:'select from where insert into values update set delete create table alter drop join left right on and or not null order by group limit as',
  kotlin:'fun val var class object if else when for while return import package null true false is in override private'};
@@ -2622,8 +2626,9 @@ document.addEventListener('click',function(e){
   if(!b)return;
   var t=b.closest('.cb').querySelector('code').textContent;
   function done(){var o=b.textContent;b.textContent='Kopiert \u2713';setTimeout(function(){b.textContent='Kopier';},1500);}
+  function fail(){b.textContent='Kopiering feilet';setTimeout(function(){b.textContent='Kopier';},1500);}
   function old(){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';
-    document.body.appendChild(a);a.select();try{document.execCommand('copy');done();}catch(x){}document.body.removeChild(a);}
+    document.body.appendChild(a);a.select();var ok=false;try{ok=document.execCommand('copy');}catch(x){}ok?done():fail();document.body.removeChild(a);}
   if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(done,old);else old();
 });
 })();
@@ -2633,6 +2638,7 @@ THEME_CSS = """<style>
 .cb{margin:.65rem 0;border:1px solid var(--color-base-300);border-radius:.5rem;overflow:hidden}
 .cb-bar{display:flex;justify-content:space-between;align-items:center;padding:.15rem .5rem;
   background:var(--color-base-200);font-size:.75rem;opacity:.9}
+.cb-bar .btn{min-height:1.5rem;height:1.5rem;padding:0 .5rem;font-size:.75rem}
 .cb pre{margin:0!important;border:0!important;border-radius:0!important}
 .tk-c{color:var(--color-base-content);opacity:.55;font-style:italic}.tk-s{color:var(--color-success)}
 .tk-v{color:var(--color-info)}.tk-k{color:var(--color-secondary);font-weight:600}
@@ -2873,9 +2879,10 @@ def watchline(s):
 def for_you(s):
     """"Til deg": everything that is the owner's, in one block at the very top of /status —
     human tasks, tasks blocked on a human, open questions. Compact rows, links only."""
-    def blocked_note(tid):
-        r = db.execute("SELECT body FROM events WHERE stream=? AND type='task.blocked' "
-                       "ORDER BY id DESC LIMIT 1", ("task/" + tid,)).fetchone()
+    def blocked_note(project, tid):
+        # project=? so this hits the events_stream(project, stream, id) index.
+        r = db.execute("SELECT body FROM events WHERE project=? AND stream=? AND type='task.blocked' "
+                       "ORDER BY id DESC LIMIT 1", (project, "task/" + tid)).fetchone()
         return (jl(r["body"], {}).get("note") or "") if r else ""
     sec = {"Tasks for you": [], "Blocked: needs human": [], "Questions awaiting you": []}
     for p in s["projects"]:
@@ -2884,7 +2891,7 @@ def for_you(s):
         sec["Blocked: needs human"] += [
             (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/")
             for t in p["tasks"] if t["status"] == "blocked"
-            and blocked_note(t["id"]).lstrip().lower().startswith("needs human")]
+            and re.match(r"\s*(needs (a )?human|human needed)", blocked_note(p["name"], t["id"]), re.I)]
         sec["Questions awaiting you"] += [(q["id"], q.get("text") or q.get("task") or "",
                                            q.get("created"), q.get("kind") or "question", "/q/")
                                           for q in p["questions"]]

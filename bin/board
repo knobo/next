@@ -84,18 +84,6 @@ mkdir -p "$CACHE/cache"
 
 die() { echo "board: $*" >&2; exit 2; }
 
-# Same check as the server's junk_text (board.py): `board ask show` must not put a question
-# "show" in front of the human. junk <question|title> <text>; dies with the server's message.
-junk() {
-  local w=($2) first; first=$(tr 'A-Z' 'a-z' <<<"${w[0]:-}"); first=${first%%[?:.]}
-  local n=${#w[@]} len=${#2} cmd=0
-  [[ " show list ls status inbox answer get help ask create " == *" $first "* ]] && cmd=1
-  if { [ "$1" = title ] && { [ "$n" -lt 1 ] || { [ "$n" -eq 1 ] && [ $cmd = 1 ]; }; }; } || \
-     { [ "$1" = question ] && { [ "$n" -lt 2 ] || { [ "$len" -lt 12 ] && [ "$n" -lt 3 ]; } || { [ $cmd = 1 ] && [ "$n" -lt 4 ]; }; }; }; then
-    die "$1 '$2' looks like a mistyped command. \`board ask\` takes ONE full-sentence question and has no subcommands (use \`board status\` / \`board inbox\`); \`board task create\` takes a descriptive title."
-  fi
-}
-
 # Reads the file argument of --spec-file. `-` means stdin, and it MUST be
 # read into a variable first: otherwise jq shares fd 0 with the here-string that is the
 # JSON input, and both come out empty. An empty file is worse than no file — we get a
@@ -565,7 +553,7 @@ task|tasks)
   t="${POS[0]:-}"
   case "$sub" in
     simplify) python3 "$(dirname "$(readlink -f "$0")")/simplify.py" "$@" ;;
-    create) b=$(body); junk title "$(jq -r '.title // empty' <<<"$b")"; f=$(jq -r '.spec_file // empty' <<<"$b")
+    create) b=$(body); f=$(jq -r '.spec_file // empty' <<<"$b")
             if [ -n "$f" ]; then
               spec=$(slurp "$f") || exit 2
               b=$(jq -c --arg s "$spec" '.spec=$s|del(.spec_file)' <<<"$b")
@@ -928,7 +916,6 @@ gate)
 
 ask)
   parse "$@"
-  [ -z "${POS[0]:-}" ] || junk question "${POS[0]}"
   b=$(body text "${POS[0]:-}")
   req POST /questions "$(with_agent "$(with_project "$b")")" ;;
 
