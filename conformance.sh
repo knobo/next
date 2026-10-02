@@ -2521,6 +2521,34 @@ REAPPY
   [ -n "$R2" ] && ok "the reaper spawns a task for an overdue routine" || no "the reaper spawns a task for an overdue routine" "task not spawned"
 fi
 
+# Owner checkoff: tick a human task, land on the next one in agent order.
+for X in $(api GET '/tasks?status=open' | jq -r '.tasks[]|select(.human==1)|.id'); do
+  hum POST "/tasks/$X/archive" '{}' >/dev/null; done
+OA=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"co A\",\"human\":true,\"priority\":9}" | jq -r .id)
+sleep 1.1
+OB=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"co B\",\"human\":true,\"priority\":5,\"after\":[\"$OA\"]}" | jq -r .id)
+sleep 1.1
+OC=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"title\":\"co C\",\"human\":true,\"priority\":5}" | jq -r .id)
+hget() { curl -sL -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL$1"; }
+hco() { curl -si -H "Authorization: Bearer ${2:-$HUMAN_TOKEN}" -H 'Content-Type: application/x-www-form-urlencoded' \
+  -X POST -d go=1 "$BOARD_URL/t/$1/checkoff" | tr -d '\r'; }
+PB=$(hget "/t/$OB")
+grep -q "data-autosubmit disabled" <<<"$PB" && grep -q "Venter på $OA" <<<"$PB" \
+  && ok "a task held by after shows the checkbox disabled, with why" || no "held checkbox" "$(grep -o 'data-autosubmit[^>]*' <<<"$PB")"
+grep -q "Oppgave 1 av 2" <<<"$(hget "/t/$OA")" && grep -q "Hopp over" <<<"$(hget "/t/$OA")" \
+  && ok "task page says Oppgave 1 av 2 with a skip link" || no "position header" ""
+grep -q "<noscript><button" <<<"$(hget "/t/$OA")" && ok "noscript fallback button present" || no "noscript button" ""
+NA=$(hco "$OA" "$TOKEN"); echo "$NA" | head -1 | grep -q " 403" \
+  && [ "$(api GET "/tasks/$OA" | jq -r .status)" = open ] \
+  && ok "an agent token cannot complete via the checkbox route" || no "agent token checkoff" "$(head -1 <<<"$NA")"
+R=$(hco "$OA"); L=$(grep -i '^location:' <<<"$R" | awk '{print $2}')
+[ "$L" = "/t/$OB" ] && ok "done(A) jumps to B (freed by after, priority 5, created before C)" || no "next after A" "$L"
+R=$(hco "$OB"); L=$(grep -i '^location:' <<<"$R" | awk '{print $2}')
+[ "$L" = "/t/$OC" ] && ok "done(B) jumps to C" || no "next after B" "$L"
+R=$(hco "$OC"); L=$(grep -i '^location:' <<<"$R" | awk '{print $2}')
+[ "$L" = "/status?alldone=1" ] && grep -q "Alt gjort" <<<"$(hget "$L")" \
+  && ok "done on the last task goes to /status with Alt gjort" || no "last task" "$L"
+
 echo
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }

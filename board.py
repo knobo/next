@@ -2588,6 +2588,10 @@ document.addEventListener('click',function(e){
   apply(t);
 });
 document.addEventListener('DOMContentLoaded',function(){apply(get());});
+document.addEventListener('change',function(e){
+  var el=e.target;
+  if(el&&el.matches&&el.matches('input[data-autosubmit]')&&el.form)el.form.submit();
+});
 })();
 """
 COPY_JS = r"""
@@ -2874,14 +2878,47 @@ def watchline(s):
             "sm:text-2xl'>%s</p>" % "".join(parts))
 
 
+NEEDS_HUMAN = re.compile(r"\s*(needs (a )?human|human needed|waiting for human)", re.I)
+
+
+def blocked_note(project, tid):
+    # project=? so this hits the events_stream(project, stream, id) index.
+    r = db.execute("SELECT body FROM events WHERE project=? AND stream=? AND type='task.blocked' "
+                   "ORDER BY id DESC LIMIT 1", (project, "task/" + tid)).fetchone()
+    return (jl(r["body"], {}).get("note") or "") if r else ""
+
+
+def owner_list():
+    """The owner's tasks in the order an agent would take them: his own open tasks plus
+    those blocked on him, minus anything held back by `after`; priority DESC, created."""
+    return [t for t in db.execute(
+        "SELECT * FROM tasks WHERE (human=1 AND status='open') OR status='blocked' "
+        "ORDER BY priority DESC, created")
+        if not waiting_on(t) and (t["status"] == "open"
+                                  or NEEDS_HUMAN.match(blocked_note(t["project"], t["id"])))]
+
+
+def owner_key(t):
+    return (-(t["priority"] or 0), t["created"] or "")
+
+
+def owner_next(done_row):
+    """The task after `done_row` in owner order, else the first one left, else None.
+    Called after the done is applied, so freed `after` dependents are already in."""
+    rest = owner_list()
+    k = owner_key(done_row)
+    return next((t for t in rest if owner_key(t) > k), rest[0] if rest else None)
+
+
+def after_checkoff(b, res):
+    t = db.execute("SELECT priority, created FROM tasks WHERE id=?", (res["id"],)).fetchone()
+    n = owner_next(t)
+    return "/t/" + urllib.parse.quote(n["id"]) if n else "/status?alldone=1"
+
+
 def for_you(s):
     """"Til deg": everything that is the owner's, in one block at the very top of /status —
     human tasks, tasks blocked on a human, open questions. Compact rows, links only."""
-    def blocked_note(project, tid):
-        # project=? so this hits the events_stream(project, stream, id) index.
-        r = db.execute("SELECT body FROM events WHERE project=? AND stream=? AND type='task.blocked' "
-                       "ORDER BY id DESC LIMIT 1", (project, "task/" + tid)).fetchone()
-        return (jl(r["body"], {}).get("note") or "") if r else ""
     sec = {"Oppgaver til deg": [], "Blokkert: trenger deg": [], "Spørsmål til deg": []}
     for p in s["projects"]:
         sec["Oppgaver til deg"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/")
@@ -2889,7 +2926,7 @@ def for_you(s):
         sec["Blokkert: trenger deg"] += [
             (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/")
             for t in p["tasks"] if t["status"] == "blocked"
-            and re.match(r"\s*(needs (a )?human|human needed|waiting for human)", blocked_note(p["name"], t["id"]), re.I)]
+            and NEEDS_HUMAN.match(blocked_note(p["name"], t["id"]))]
         sec["Spørsmål til deg"] += [(q["id"], q.get("text") or q.get("task") or "",
                                            q.get("created"), q.get("kind") or "question", "/q/")
                                           for q in p["questions"]]
@@ -3502,16 +3539,29 @@ def plan_chips(t):
     return "".join(" " + x for x in out)
 
 
+def checkoff_form(t, small=False):
+    """A checkbox that marks the owner's task done and jumps to the next one. Submits on
+    change (THEME_JS); without script the <noscript> button does the same."""
+    held = waiting_on(t)
+    why = ("<span class='text-sm text-warning'>Venter på %s</span>" % escape(" ".join(held))
+           if held else "")
+    return ("<form method='POST' action='/t/%s/checkoff' class='m-0'>"
+            "<input type='hidden' name='go' value='1'>"
+            "<label class='flex min-h-11 cursor-pointer items-center gap-3%s'>"
+            "<input type='checkbox' class='checkbox checkbox-lg' data-autosubmit%s>"
+            "<span>Ferdig — gå til neste</span></label>%s"
+            "%s</form>" % (
+                escape(t["id"]), "" if small else " text-lg", " disabled" if held else "", why,
+                "" if held else "<noscript><button type='submit' class='btn btn-primary min-h-11'>"
+                                "Ferdig — gå til neste</button></noscript>"))
+
+
 def done_button(t, human, back):
     """The one control on a task that is the owner's own work: say it is done."""
     if not (human and t.get("human") and t.get("status") not in ("done", "archived")
             and not t.get("merge_sha") and not t.get("pr")):
         return ""
-    return (" <form method='POST' action='/t/%s/done' class='inline m-0'>"
-            "<input type='hidden' name='back' value='%s'>"
-            "<button type='submit' class='badge badge-sm badge-success cursor-pointer'>"
-            "done</button></form>"
-            % (escape(t["id"]), escape(back)))
+    return " <span class='inline-block align-middle'>%s</span>" % checkoff_form(t, small=True)
 
 
 def queue(p, human, back):
@@ -3704,10 +3754,13 @@ def new_task_form(p, human, back):
             DIM, name, escape(back), kinds, name, name, dl))
 
 
-def html_status(project, token="", human=False):
+def html_status(project, token="", human=False, alldone=False):
     s = status(project)
     h = [head("board", "<span class='%s text-xs'>%s</span>" % (
         MONO + " " + DIM, escape(s["generated"][11:16] + " UTC")), (), human)]
+    if alldone:
+        h.append("<div role='status' class='mt-4 rounded-box border border-l-4 border-base-300 "
+                 "border-l-success bg-base-200 p-3 font-semibold'>Alt gjort ✓</div>")
     if s.get("ntfy_failures_since_success", 0) > 0:
         fails = s["ntfy_failures_since_success"]
         h.append("<div class='mt-4 rounded-box border border-l-4 border-base-300 "
@@ -3843,14 +3896,11 @@ def task_controls(d, human):
            "<input type='hidden' name='back' value='/status'>"
            "<button type='submit' class='btn btn-outline min-h-10'>Archive</button></form>"
            % tid) if d.get("status") != "archived" else ""
-    done = ("<form method='POST' action='/t/%s/done' class='m-0'>"
-            "<input type='hidden' name='back' value='/t/%s'>"
-            "<button type='submit' class='btn btn-primary min-h-10'>I have done this</button>"
-            "</form>" % (tid, tid)) if d.get("human") and d.get("status") not in (
+    done = checkoff_form(d) if d.get("human") and d.get("status") not in (
                 "done", "archived") and not d.get("merge_sha") and not d.get("pr") else ""
     if not (rel or arc or done):
         return ""
-    return "<div class='mt-4 flex flex-wrap gap-3'>%s%s%s</div>" % (done, rel, arc)
+    return "<div class='mt-4 flex flex-wrap items-center gap-3'>%s%s%s</div>" % (done, rel, arc)
 
 
 def plan_form(d, human):
@@ -3877,6 +3927,19 @@ def plan_form(d, human):
         % (DIM, tid, tid, kinds, escape(d.get("milestone") or ""),
            escape(",".join(jl(d.get("after")))), " checked" if d.get("human") else "",
            escape(HUMAN)))
+
+
+def owner_pos(d, human):
+    """"Oppgave 2 av 7" and "Hopp over" for a task in the owner's list."""
+    if not (human and d.get("human") and d.get("status") in ("open", "blocked")):
+        return ""
+    ids = [t["id"] for t in owner_list()]
+    if d["id"] not in ids:
+        return ""
+    i = ids.index(d["id"])
+    skip = ("<a class='%s text-sm' href='/t/%s'>Hopp over</a>" % (LINK, escape(ids[i + 1]))
+            if i + 1 < len(ids) else "")
+    return " <span class='%s text-sm'>Oppgave %d av %d</span> %s" % (DIM, i + 1, len(ids), skip)
 
 
 def html_task(tid, token="", human=False):
@@ -3978,7 +4041,7 @@ def html_task(tid, token="", human=False):
           <button class='btn btn-primary mt-3 min-h-12'>Add comment</button>
         </form>%s""" % (
         head(d["id"], "<span class='badge badge-sm %s'>%s</span>" % (
-            BADGE.get(st, "badge-ghost"), escape(st)), human=human),
+            BADGE.get(st, "badge-ghost"), escape(st)) + owner_pos(d, human), human=human),
         md(d.get("title"), inline=True),
         prose(d.get("spec"), "md-spec"),
         "".join("<dt class='%s'>%s<dd class='m-0 [overflow-wrap:anywhere]'>%s" % (DIM, k, v)
@@ -4179,7 +4242,11 @@ UI_POST = [
      lambda m, b, q: (human_only(b, "closing a task"),
                       dict(task_done(m.group(1), HUMAN, {"_human": True}), id=m.group(1)))[1],
      proj_back),
-    (r"/t/([^/]+)/patch$",
+    (r"/t/([^/]+)/checkoff$",
+     lambda m, b, q: (human_only(b, "closing a task"),
+                      dict(task_done(m.group(1), HUMAN, {"_human": True}), id=m.group(1)))[1],
+     after_checkoff),
+  (r"/t/([^/]+)/patch$",
      lambda m, b, q: task_patch(m.group(1), actor_h(q, b), b),
      lambda b, res: back_to(b, "/t/" + urllib.parse.quote(res.get("id", "")))),
     (r"/t/([^/]+)/release$",
@@ -4830,7 +4897,7 @@ class Handler(BaseHTTPRequestHandler):
         # then refuses every answer (T-390).
         human = getattr(self, "is_human", False)
         if path in ("/", "/status"):
-            return html_status(q.get("project", [None])[0], token, human)
+            return html_status(q.get("project", [None])[0], token, human, bool(q.get("alldone")))
         m = re.match(r"^/q/([^/]+)$", path)
         if m and method == "GET":
             return html_question(m.group(1), token, human)
