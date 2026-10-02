@@ -69,7 +69,9 @@ for pth in "/status" "/q/$QID" "/t/$TID"; do
     && ok "$pth 200, links $CSSURL" || no "$pth is missing the link to $CSSURL"
   grep -qi "Content-Security-Policy: default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'sha256-.*'; form-action 'self'" "$D/hdr" \
     && ok "$pth CSP widened by 'self' and nothing else" || { no "$pth CSP:"; grep -i content-security "$D/hdr"; }
-  grep -q "<style" "$D/body" && no "$pth still has an inline <style> block" || ok "$pth has no inline <style>"
+  # The one inline <style> allowed is THEME_CSS (the .cb code-block rules, CSP-hashed theme).
+  [ "$(grep -o '<style' "$D/body" | wc -l)" -le 1 ] && { ! grep -q "<style" "$D/body" || grep -q '^\.cb{' "$D/body"; } \
+    && ok "$pth has no inline <style> besides THEME_CSS" || no "$pth still has an inline <style> block"
 done
 
 # What is waiting on a human has to be ON the task's card, with a link to the question and
@@ -79,8 +81,8 @@ grep -q "waiting on you" <<<"$TP" \
   && ok "/t opens with what is waiting on a human" || no "/t is missing the waiting panel"
 grep -q "href='/q/$QID'" <<<"$TP" \
   && ok "/t links to the question that blocks the task" || no "/t does not link to $QID"
-grep -q "data-copy='cd ui &amp;&amp; ./verify.sh'" <<<"$TP" \
-  && ok "/t offers the command for copying, verbatim" || no "/t has no copy button for the command"
+grep -q "<pre><code>cd ui &amp;&amp; ./verify.sh</code></pre>" <<<"$TP" && grep -q "data-copy>Kopier" <<<"$TP" \
+  && ok "/t offers the command as a .cb block with Kopier, verbatim" || no "/t has no copy button for the command"
 grep -q "<script>" <<<"$TP" \
   && ok "/t carries the script the copy button needs" || no "/t has no script, so copy does nothing"
 curl -s -H "Authorization: Bearer $T" "$B/q/$QID" | grep -q "href='/t/$TID'" \
