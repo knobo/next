@@ -2919,26 +2919,28 @@ def after_checkoff(b, res):
 def for_you(s):
     """"Til deg": everything that is the owner's, in one block at the very top of /status —
     human tasks, tasks blocked on a human, open questions. Compact rows, links only."""
+    multi = len(s["projects"]) > 1
+    wb = lambda t: where_badges(dict(t, project=p["name"]), multi)
     sec = {"Oppgaver til deg": [], "Blokkert: trenger deg": [], "Spørsmål til deg": []}
     for p in s["projects"]:
-        sec["Oppgaver til deg"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/")
+        sec["Oppgaver til deg"] += [(t["id"], t["title"], t.get("created"), t.get("kind") or "task", "/t/", wb(t))
                                  for t in yours(p)]
         sec["Blokkert: trenger deg"] += [
-            (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/")
+            (t["id"], t["title"], t.get("updated"), t.get("kind") or "task", "/t/", wb(t))
             for t in p["tasks"] if t["status"] == "blocked"
             and NEEDS_HUMAN.match(blocked_note(p["name"], t["id"]))]
         sec["Spørsmål til deg"] += [(q["id"], q.get("text") or q.get("task") or "",
-                                           q.get("created"), q.get("kind") or "question", "/q/")
+                                           q.get("created"), q.get("kind") or "question", "/q/", "")
                                           for q in p["questions"]]
     out = []
     for name, rows in sec.items():
         if rows:
             out.append("<h3 class='mt-3 text-sm font-semibold'>%s (%d)</h3><ul class='text-sm'>%s</ul>" % (
                 escape(name), len(rows), "".join(
-                    "<li class='flex gap-2'><a class='%s underline' href='%s%s'>%s</a><span>%s</span>%s"
+                    "<li class='flex flex-wrap gap-x-2'><a class='%s underline' href='%s%s'>%s</a><span>%s%s</span>%s"
                     "<span class='%s text-xs'>%s</span></li>" % (
-                        MONO, base, escape(i), escape(i), md(title[:100], inline=True, links=False), when(ts), DIM, escape(kind))
-                    for i, title, ts, kind, base in rows)))
+                        MONO, base, escape(i), escape(i), wbd, md(title[:100], inline=True, links=False), when(ts), DIM, escape(kind))
+                    for i, title, ts, kind, base, wbd in rows)))
     if not out:
         return ""
     return ("<section id='for-you' class='mt-4 rounded-box border border-l-4 border-base-300 "
@@ -3485,7 +3487,7 @@ def queue_card(t, human, back, questions, big, hidden=False):
             "<span class='tk-pri'>%s</span>"
             "<a class='tk-id %s %s' href='/t/%s'>%s</a>"
             "<span class='badge badge-sm %s tk-st'>%s</span>"
-            "<h4 class='tk-title'>%s</h4>"
+            "<h4 class='tk-title'>%s%s</h4>"
             "<span class='tk-meta'>%s%s</span>"
             "%s</article>" % (
                 "tk-big" if big else "", " " + SPINE.get(st, "") if SPINE.get(st) else "",
@@ -3497,7 +3499,7 @@ def queue_card(t, human, back, questions, big, hidden=False):
                 prio_cell(t, human, back),
                 LINK, MONO, escape(t["id"]), escape(t["id"]),
                 BADGE.get(st, "badge-ghost"), escape(st),
-                md(t.get("title"), inline=True),
+                where_badges(t, t.get("_multi")), md(t.get("title"), inline=True),
                 size_cell(t, human, back), pr_h + plan_chips(t) + " " + when(
                     t.get("last_activity") or t.get("updated") or t.get("created"),
                     "last activity ")
@@ -3537,6 +3539,18 @@ def plan_chips(t):
                    % (DIM, " ".join("<a class='%s %s' href='/t/%s'>%s</a>" % (
                        LINK, MONO, escape(x), escape(x)) for x in w)))
     return "".join(" " + x for x in out)
+
+
+def where_badges(t, multi):
+    """Repo (and project when the page shows more than one) as small marks."""
+    out = []
+    if multi and t.get("project"):
+        out.append("<span class='badge badge-sm badge-outline' title='project'>%s</span>"
+                   % escape(t["project"]))
+    if t.get("repo"):
+        out.append("<span class='badge badge-sm badge-ghost' title='repo'>%s</span>"
+                   % escape(t["repo"]))
+    return "".join(out) + " " if out else ""
 
 
 def checkoff_form(t, small=False):
@@ -3797,6 +3811,8 @@ def html_status(project, token="", human=False, alldone=False):
                      "border-l-error bg-base-200 p-3 text-sm'>%s</p>"
                      % escape(p["budget"]["note"]))
         h.append(milestone_row(p))
+        for t in p["tasks"]:
+            t["_multi"] = len(s["projects"]) > 1
         rows_html, shown = queue(p, human, back)
         h.append(rows_html)
         h.append(new_task_form(p, human, back))
@@ -3939,7 +3955,10 @@ def owner_pos(d, human):
     i = ids.index(d["id"])
     skip = ("<a class='%s text-sm' href='/t/%s'>Hopp over</a>" % (LINK, escape(ids[i + 1]))
             if i + 1 < len(ids) else "")
-    return " <span class='%s text-sm'>Oppgave %d av %d</span> %s" % (DIM, i + 1, len(ids), skip)
+    multi = db.execute("SELECT COUNT(DISTINCT project) FROM tasks WHERE status NOT IN "
+                       "('done','archived')").fetchone()[0] > 1
+    return " %s<span class='%s text-sm'>Oppgave %d av %d</span> %s" % (
+        where_badges(d, multi), DIM, i + 1, len(ids), skip)
 
 
 def html_task(tid, token="", human=False):

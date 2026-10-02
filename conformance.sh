@@ -2549,6 +2549,14 @@ R=$(hco "$OC"); L=$(grep -i '^location:' <<<"$R" | awk '{print $2}')
 [ "$L" = "/status?alldone=1" ] && grep -q "Alt gjort" <<<"$(hget "$L")" \
   && ok "done on the last task goes to /status with Alt gjort" || no "last task" "$L"
 
+# Repo/project badges on /status rows, Til deg and the task header.
+RA=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"badge-web\",\"title\":\"badge A\",\"human\":true}" | jq -r .id)
+RB=$(api POST /tasks "{\"agent\":\"$AID\",\"project\":\"demo\",\"repo\":\"badge-core\",\"title\":\"badge B\"}" | jq -r .id)
+HS=$(hget /status)
+[ "$(grep -o "title='repo'>badge-web<" <<<"$HS" | wc -l)" -ge 2 ] && grep -q "title='repo'>badge-core<" <<<"$HS" \
+  && ok "/status shows repo badges in Til deg and in the task rows" || no "repo badges" "$(grep -o "title='repo'>[^<]*" <<<"$HS" | sort | uniq -c)"
+grep -q "title='repo'>badge-web<" <<<"$(hget "/t/$RA")" && ok "task header shows the repo badge" || no "header repo badge" ""
+
 echo
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
