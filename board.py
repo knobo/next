@@ -1791,9 +1791,54 @@ def gate_merge(tid, aid):
             reasons.append("the agent lacks the merge grant in %s" % t["project"])
         if not set(jl(t["needs_grants"])) <= agent_grants(aid, t["project"]):
             reasons.append("missing grants: %s" % ",".join(jl(t["needs_grants"])))
-    # Simplification: CI status is not yet queried from Forgejo (needs forge credentials
-    # on the board). Branch protection is the mechanical safeguard meanwhile — §8.1.
-    return {"ok": not reasons, "reasons": reasons, "phase": phase, "risk": t["risk"]}
+    ci = forge_ci_state(t)
+    if ci in ("failure", "error"):
+        reasons.append("CI on the PR head is %s — fix the build before merging" % ci)
+    elif ci == "pending":
+        reasons.append("CI on the PR head is still pending — take another task and come "
+                       "back when it has finished. Do not wait in the foreground.")
+    return {"ok": not reasons, "reasons": reasons, "phase": phase, "risk": t["risk"], "ci": ci}
+
+
+def forge_ci_state(t):
+    """T-638: the combined commit status of the PR's head sha on a Forgejo forge, or None
+    when there is nothing to judge — no forgejo forge in the manifest, no PR, no statuses
+    reported (a project without CI), or the forge could not be read. None keeps the gate
+    as it was before; branch protection on the forge stays the mechanical safeguard
+    (§8.1) for the case where the board cannot see it."""
+    row = db.execute("SELECT manifest FROM projects WHERE name=?", (t["project"],)).fetchone()
+    forge = (jl(row["manifest"], {}) if row and row["manifest"] else {}).get("forge") or {}
+    pr = str(t["pr"] or "")
+    if forge.get("kind") != "forgejo" or not forge.get("url") or not pr:
+        return None
+    # pr is free text: a full URL (.../<owner>/<repo>/pulls/<n>), "#12" or "12".
+    m = re.search(r"/([^/]+)/([^/]+)/pulls?/(\d+)/?$", pr)
+    if m:
+        slug, num = m[1] + "/" + m[2], m[3]
+    else:
+        n = re.search(r"(\d+)$", pr)
+        repo = t["repo"] if t["repo"] not in (None, "", ".") else t["project"]
+        if not n or not forge.get("org"):
+            return None
+        slug, num = forge["org"] + "/" + repo, n[1]
+    base = forge["url"].rstrip("/") + "/api/v1/repos/" + slug
+    tok = os.environ.get("FORGE_TOKEN", "")
+
+    def get(path):
+        req = urllib.request.Request(base + path, headers={"Authorization": "token " + tok} if tok else {})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    try:
+        sha = get("/pulls/" + num)["head"]["sha"]
+        st = get("/commits/" + sha + "/status")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as e:
+        # ponytail: fail open on an unreadable forge, like a project without CI; the
+        # stderr line is the only trace. Fail closed once FORGE_TOKEN is mandatory.
+        print("gate_merge: forge status unreadable for %s#%s: %s" % (slug, num, e), file=sys.stderr)
+        return None
+    if not st.get("total_count") and not st.get("statuses"):
+        return None
+    return st.get("state") or None
 
 
 def task_merge_requested(tid, aid, b):
