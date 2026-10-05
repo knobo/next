@@ -1730,6 +1730,9 @@ def task_review(tid, aid, b):
     # The columns are derived (UI, status, WIP counter): the worst NON-OWNER result in this
     # round, same as the gate. Only the owner's word → NULL, i.e. still unreviewed.
     rs = [r for a, r in review_round(tid).items() if a != t["owner"]]
+    # T-751: a review on a finished task is history only; don't reopen it.
+    if t["status"] in ("done", "merged", "archived"):
+        return {"ok": True}
     db.execute("UPDATE tasks SET review_open=?, review_fixed=?, status='in_review', updated=? WHERE id=?",
                (max((r.get("open", 0) for r in rs), default=None),
                 max((r.get("fixed", 0) for r in rs), default=None), now(), tid))
