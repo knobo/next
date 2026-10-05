@@ -1,0 +1,58 @@
+{
+  "name": "next-autonomy",
+  "version": "0.4.0",
+  "description": "Deterministic allowlist for /next-driven devops: dev kubectl, git/tea/board, a board-gated push to main and an on/off prod gate. Never overrides a deny.",
+  "author": {
+    "name": "next"
+  },
+  "userConfig": {
+    "progRoot": {
+      "type": "string",
+      "title": "Project root",
+      "description": "Directory that holds your repos. cd, git -C and ls are only approved below it.",
+      "default": "/home/knobo/prog/"
+    },
+    "devContext": {
+      "type": "string",
+      "title": "Dev kube context",
+      "description": "The only kubectl context approved without the prod gate.",
+      "default": "default"
+    },
+    "remotes": {
+      "type": "string",
+      "title": "Git remotes",
+      "description": "Comma-separated remotes git may fetch from and push to.",
+      "default": "origin,forgejo"
+    },
+    "mainBranch": {
+      "type": "string",
+      "title": "Main branch",
+      "description": "The branch whose push is gated by board gate merge.",
+      "default": "main"
+    },
+    "mergeWorktreeRegex": {
+      "type": "string",
+      "title": "Merge worktree path (regex)",
+      "description": "A push to the main branch is only approved from a directory matching this.",
+      "default": "^/home/knobo/prog/(?:[^/]+/)?[^/]+-worktrees/merge/?$"
+    },
+    "prodGateFile": {
+      "type": "string",
+      "title": "Prod gate file",
+      "description": "Prod actions are approved only while its first line is `open`.",
+      "default": "/home/knobo/.claude/next-prod-gate"
+    },
+    "devWriteNamespaces": {
+      "type": "string",
+      "title": "Dev namespaces for writes",
+      "description": "Comma-separated namespaces on the dev context where kubectl exec/patch/scale/delete/rollout restart are approved. Reads work everywhere.",
+      "default": "queue"
+    },
+    "mainRemote": {
+      "type": "string",
+      "title": "Main remote",
+      "description": "The remote whose main and task/<id> branches a main push is checked against.",
+      "default": "origin"
+    }
+  }
+}
