@@ -93,6 +93,10 @@ spec:
               valueFrom: { secretKeyRef: { name: board, key: human_token, optional: true } }
             - name: NTFY_AUTH
               valueFrom: { secretKeyRef: { name: board, key: ntfy_auth } }
+            # Read-only forge token: `gate merge` reads the PR head's combined commit
+            # status (T-638). Absent = private repos are unreadable and the gate skips CI.
+            - name: FORGE_TOKEN
+              valueFrom: { secretKeyRef: { name: board, key: forge_token, optional: true } }
           ports: [{ containerPort: 8080 }]
           securityContext:
             allowPrivilegeEscalation: false
