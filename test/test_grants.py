@@ -208,9 +208,9 @@ class TestGrants(unittest.TestCase):
         # Human: add-grant form and pause button visible
         html_human = board.html_status("demo", token="human-token", human=True)
         self.assertIn(f"action='/agents/{aid}/grants'", html_human)
-        self.assertIn(f"grants-list-{aid}", html_human)
+        self.assertIn("aria-pressed=", html_human)  # grant chips replaced the datalist form
         self.assertIn("action='/projects/demo/pause'", html_human)
-        self.assertIn("⏸ pause", html_human)
+        self.assertIn(">Pause<", html_human)
 
         # 2. Form POST to add grant with agent-token (non-human) -> 403 Forbidden
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
