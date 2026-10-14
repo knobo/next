@@ -217,7 +217,7 @@ class TestGrants(unittest.TestCase):
                                                {"grant": "merge", "project": "demo"},
                                                token="agent-token")
         self.assertEqual(status, 403)
-        self.assertIn("needs_human_token", body)
+        self.assertIn("signed in as an agent", body)  # not_human_page, not JSON
 
         # 3. Form POST to add grant with human-token -> 302 Redirect to /status?project=demo
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
@@ -241,7 +241,7 @@ class TestGrants(unittest.TestCase):
                                                {"grant": "merge", "project": "demo"},
                                                token="agent-token")
         self.assertEqual(status, 403)
-        self.assertIn("needs_human_token", body)
+        self.assertIn("signed in as an agent", body)  # not_human_page, not JSON
 
         # 5. Form POST to revoke grant with human-token -> 302 Redirect to /status?project=demo
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants/revoke",
