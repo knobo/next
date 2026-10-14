@@ -3153,6 +3153,20 @@ b, closed = talk(chunked("/mcp", mat, [b"5\r\nhelloXX"]) + nxt)
 out["bad_crlf"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
 b, closed = talk(chunked("/mcp", mat, [b"%x\r\n" % (2 << 20)]) + nxt)
 out["big"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
+# strict framing (T-869 review): each of these is a 400 and closes, with no second reply.
+def bad(name, raw, code=400):
+    b, closed = talk(raw + nxt)
+    out[name] = {"ok": status(b) == code and b.count(b"HTTP/1.1 ") == 1 and closed}
+body5 = lambda sz, nl=b"\r\n": [sz + nl + b"hello\r\n"]
+bad("hex0x", chunked("/mcp", mat, body5(b"0x5")))
+bad("tabsize", chunked("/mcp", mat, body5(b"\t5")))
+bad("barelf_size", chunked("/mcp", mat, body5(b"5", b"\n")))
+bad("barelf_data", chunked("/mcp", mat, [b"5\r\nhello\n"]))
+bad("barelf_trailer", chunked("/mcp", mat, [], tail=b"0\r\nX: 1\n\r\n"))
+bad("two_te", chunked("/mcp", mat, [], extra="Transfer-Encoding: gzip\r\n"))
+bad("trailers17", chunked("/mcp", mat, [], tail=b"0\r\n" + b"X: 1\r\n" * 17 + b"\r\n"))
+b, closed = talk(chunked("/mcp", mat, [b"%x\r\n%s\r\n" % (len(msg), msg)], tail=b"0\r\n" + b"X: 1\r\n" * 16 + b"\r\n") + nxt)
+out["trailers16"] = {"ok": b.count(b"HTTP/1.1 200") == 2}
 # (c) Content-Length must be ASCII digits only; two headers are a 400.
 for name, cl in [("plus", "+41"), ("space", " 41 "), ("under", "4_0"), ("arabic", "٤")]:
     b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sContent-Length: %s\r\n\r\n" % (H, cl)).encode("utf-8"))
@@ -3173,6 +3187,9 @@ check "Transfer-Encoding: gzip is a 501 and closes" "$HH" '.te_gzip.status==501 
 check "a malformed chunk (bad size, bad CRLF) is a 400 and closes" "$HH" \
   '.bad_chunk.status==400 and .bad_chunk.replies==1 and .bad_chunk.closed and .bad_crlf.status==400 and .bad_crlf.closed'
 check "an oversized chunked body is a 413 and closes" "$HH" '.big.status==413 and .big.replies==1 and .big.closed'
+check "chunk framing is strict: 0x size, tab, bare LF (size, data, trailer), two TE headers, 17 trailers are 400 + close" "$HH" \
+  '[.hex0x,.tabsize,.barelf_size,.barelf_data,.barelf_trailer,.two_te,.trailers17]|all(.ok)'
+check "16 trailer lines are still accepted" "$HH" '.trailers16.ok'
 check "Content-Length '+41', ' 41 ', '4_0' and a non-ASCII digit are a 400" "$HH" \
   '.plus==400 and .space==400 and .under==400 and .arabic==400'
 check "two Content-Length headers are a 400 and the connection is closed" "$HH" '.dup.status==400 and .dup.closed'

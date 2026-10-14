@@ -5496,9 +5496,11 @@ class Handler(BaseHTTPRequestHandler):
     MAX_BODY = 1 << 20                     # 1 MiB. Without a limit a 500 MB Content-Length is an OOM.
 
     def body(self):
-        te = self.headers.get("Transfer-Encoding")
-        if te:                             # HTTP/2 ingresses forward a body without length as chunked
-            if te.strip().lower() != "chunked":
+        tes = self.headers.get_all("Transfer-Encoding") or []
+        if tes:                            # HTTP/2 ingresses forward a body without length as chunked
+            if len(tes) > 1:
+                raise Err(400, "multiple Transfer-Encoding headers")
+            if tes[0].strip().lower() != "chunked":
                 raise Err(501, "unsupported Transfer-Encoding")
             if self.headers.get("Content-Length") is not None:
                 raise Err(400, "Transfer-Encoding with Content-Length")   # smuggling shape
@@ -5516,27 +5518,28 @@ class Handler(BaseHTTPRequestHandler):
         return self.finish_body(self.rfile.read(n) if n else b"")
 
     def read_chunked(self):
-        """Chunked request body, stdlib only. Any error is an Err; the unread
-        Transfer-Encoding makes send_response close the connection."""
+        """Chunked request body, stdlib only, strict framing: every line ends in CRLF (a bare
+        LF is how proxies and servers disagree about where a request ends). Any error is an
+        Err; the unread Transfer-Encoding makes send_response close the connection."""
         out, total = [], 0
         while True:
             line = self.rfile.readline(1025)
-            try:
-                size = int(line.split(b";")[0].strip(), 16) if line.endswith(b"\n") else -1
-            except ValueError:
-                size = -1
-            if size < 0 or not line.split(b";")[0].strip().isalnum():
+            m = re.fullmatch(rb"([0-9A-Fa-f]{1,8})(;[^\r\n]*)?\r\n", line)
+            if not m:
                 raise Err(400, "malformed chunk")
+            size = int(m[1], 16)
             total += size
             if total > self.MAX_BODY:
                 raise Err(413, "body over %d bytes" % self.MAX_BODY)
             if size == 0:
-                while True:                # trailers, up to the empty line
+                for _ in range(17):        # trailers, up to the empty line; at most 16
                     t = self.rfile.readline(1025)
-                    if t in (b"\r\n", b"\n"):
-                        return b"".join(out)
-                    if not t.endswith(b"\n"):
+                    total += len(t)
+                    if not t.endswith(b"\r\n") or total > self.MAX_BODY:
                         raise Err(400, "malformed chunk")
+                    if t == b"\r\n":
+                        return b"".join(out)
+                raise Err(400, "too many trailers")
             data = self.rfile.read(size)
             if len(data) != size or self.rfile.read(2) != b"\r\n":
                 raise Err(400, "malformed chunk")
