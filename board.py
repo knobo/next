@@ -783,10 +783,30 @@ def register(b):
     return {"id": aid, "grants": all_g, "project": project}
 
 
-def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=None, actor=HUMAN):
+def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=None, actor=HUMAN,
+                   human=False):
     if phase and phase not in PHASES:
         raise Err(400, "unknown phase %r (%s)" % (phase, "|".join(PHASES)))
     row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
+    if row and not human:
+        # T-867: on an EXISTING project, the phase (merge gate, prod deploy) and the forge
+        # block (where agents clone from) are the owner's. `bin/board` mirrors project.yaml
+        # on every start, so the same phase / same forge is a no-op and must pass.
+        if phase and phase != row["phase"]:
+            raise Err(403, "project %s is in phase %s; only the human moves it to %s — the "
+                           "phase control on /status, or POST /projects/%s/phase with "
+                           "BOARD_HUMAN_TOKEN" % (name, row["phase"], phase, name),
+                      needs_human_token=True, action="changing the phase")
+        if manifest:
+            old = jl(row["manifest"], {}) if row["manifest"] else {}
+            new = json.loads(manifest) if isinstance(manifest, str) else manifest
+            # `forge: {}` (manifest.py's default) is the same as no forge block.
+            if (((old.get("forge") if isinstance(old, dict) else None) or None)
+                    != ((new.get("forge") if isinstance(new, dict) else None) or None)):
+                raise Err(403, "the manifest changes the forge block of project %s (where "
+                               "agents clone from); only the human may — `board project "
+                               "sync` with BOARD_HUMAN_TOKEN" % name,
+                          needs_human_token=True, action="changing the forge")
     if not row:
         db.execute("INSERT INTO projects (name,phase,updated) VALUES (?,?,?)",
                    (name, phase or "build", now()))
@@ -794,6 +814,7 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
         row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
     if phase and phase != row["phase"]:
         db.execute("UPDATE projects SET phase=?, updated=? WHERE name=?", (phase, now(), name))
+        ev(name, "project", "project.phase_set", actor, phase=phase)
     if manifest:
         m_dict = json.loads(manifest) if isinstance(manifest, str) else manifest
         routines = m_dict.get("routines", {})
@@ -817,9 +838,7 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
             else:
                 db.execute("INSERT INTO routines (project, name, title, spec, interval, deadline, repo, priority, role, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                            (name, r_id, title, spec, interval, deadline, repo, priority, role, "open"))
-                   
 
-        ev(name, "project", "project.phase_set", actor, phase=phase)
     if goal or manifest:
         db.execute("UPDATE projects SET goal=COALESCE(?,goal), manifest=COALESCE(?,manifest),"
                    " manifest_host=COALESCE(?,manifest_host), manifest_path=COALESCE(?,manifest_path),"
@@ -4631,7 +4650,8 @@ ROUTES = [
     ("POST",   r"/projects$",                   lambda h, m, b, q: dict(ensure_project(
         b["project"], b.get("phase"), b.get("goal"), b.get("manifest"), b.get("host"), b.get("path"),
         # A per-agent token is not the owner: log its agent, or its pattern before it has one (T-862).
-        (b.get("agent") or h.agent_pattern) if getattr(h, "agent_pattern", None) else HUMAN))),
+        (b.get("agent") or h.agent_pattern) if getattr(h, "agent_pattern", None) else HUMAN,
+        as_human(b)))),
     ("POST",   r"/tasks$",                      lambda h, m, b, q: task_create(b, actor_h(q, b))),
     ("GET",    r"/tasks/next$",                 lambda h, m, b, q: task_next(q["agent"][0], q)),
         ("GET",    r"/routines$",                   lambda h, m, b, q: routine_list(q)),

@@ -404,7 +404,7 @@ check "an old rl5/rl7 report is translated into the 5h/7d windows" "$(api GET '/
   '[.projects[0].agents[]|select(.id=="'"$BID"'")][0].budget | (map(.window)|sort)==["5h","7d"]'
 check "caps --add" "$(api PUT /agents/$AID/capabilities '{"add":["kubectl-dev"]}')" '.capabilities|index("kubectl-dev")'
 check "preference" "$(api PUT /agents/$BID/preference '{"preference":"implementer"}')" '.preference=="implementer"'
-check "project phase" "$(api POST /projects '{"project":"demo","phase":"launch","goal":"users"}')" '.phase=="launch"'
+check "project phase" "$(hum POST /projects '{"project":"demo","phase":"launch","goal":"users"}')" '.phase=="launch"'
 
 # Quota: the ceilings are the human's, per WINDOW NAME; the number is per account — the
 # highest per name.
@@ -634,10 +634,10 @@ api POST "/tasks/$SELFR/done" "{\"agent\":\"$AID\",\"no_merge\":true}" >/dev/nul
 check "the gate opens in launch, risk=high, with review done and no human test" "$G" '.ok==true'
 check "a test card is refused: the test stage is gone" \
   "$(api POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"kind\":\"test\",\"task\":\"$TID\",\"card\":{\"repo\":\"web\"}}")" '.error'
-api POST /projects '{"project":"demo","phase":"live"}' >/dev/null
+hum POST /projects '{"project":"demo","phase":"live"}' >/dev/null
 check "the gate opens in live with review done and no human test" \
   "$(api GET "/tasks/$TID/gate/merge?agent=$AID")" '.ok==true'
-api POST /projects '{"project":"demo","phase":"launch"}' >/dev/null
+hum POST /projects '{"project":"demo","phase":"launch"}' >/dev/null
 check "and the old /tests page is gone" \
   "$(jq -nc --arg c "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BOARD_URL/tests")" '{c:$c}')" '.c!="200"'
 
@@ -2830,6 +2830,25 @@ tok "$PT" POST /projects '{"project":"tokproj","phase":"build","manifest":{"proj
 check "a manifest sent with a per-agent token logs phase_set under the token, not the human (T-862)" \
   "$(api GET "/events?stream=project&project=tokproj")" \
   '[.events[]|select(.type=="project.phase_set")|.actor]|length>0 and all(. != "'"$BOARD_HUMAN"'")'
+# T-867: POST /projects on an EXISTING project must not route around the human-only phase.
+hum POST /projects '{"project":"t867","phase":"build","manifest":{"project":"t867","forge":{"kind":"forgejo","url":"https://git.ok.no","org":"o"}}}' >/dev/null
+[ "$(tok "$PT" POST /projects '{"project":"t867","phase":"live"}')" = 403 ] \
+  && ok "a per-agent token can NOT change an existing project's phase via POST /projects" || no "token moves phase" ""
+check "neither can the shared token, and it says how" "$(api POST /projects '{"project":"t867","phase":"live"}')" \
+  '.needs_human_token==true and (.error|test("/projects/t867/phase"))'
+check "the same phase from the shared token is a no-op (bin/board start)" \
+  "$(api POST /projects '{"project":"t867","phase":"build","goal":"g","manifest":{"project":"t867","x":1,"forge":{"kind":"forgejo","url":"https://git.ok.no","org":"o"}}}')" \
+  '.phase=="build" and .goal=="g" and (.manifest|fromjson|.x==1)'
+[ "$(tok "$PT" POST /projects '{"project":"t867","phase":"build","manifest":{"project":"t867","forge":{"kind":"forgejo","url":"https://evil.example","org":"o"}}}')" = 403 ] \
+  && ok "a per-agent token can NOT change forge.url of an existing project" || no "token moves forge.url" ""
+check "neither can the shared token" \
+  "$(api POST /projects '{"project":"t867","manifest":{"project":"t867","forge":{"kind":"github","url":"https://git.ok.no","org":"o"}}}')" '.needs_human_token==true'
+check "the human can move the phase and the forge" \
+  "$(hum POST /projects '{"project":"t867","phase":"launch","manifest":{"project":"t867","forge":{"kind":"github","url":"https://github.com","org":"o"}}}')" \
+  '.phase=="launch" and (.manifest|fromjson|.forge.url=="https://github.com")'
+check "phase_set is logged only when the phase moved, never with phase null" \
+  "$(api GET "/events?stream=project&project=t867")" \
+  '[.events[]|select(.type=="project.phase_set")|.body.phase]==["build","launch"]'
 [ "$(tok "$PT" POST "/tokens/$PTID/revoke" '{}')" = 403 ] \
   && ok "an agent token can NOT revoke tokens" || no "agent revoke" ""
 check "the human token revokes" "$(hum POST "/tokens/$PTID/revoke" '{}')" '.revoked'
