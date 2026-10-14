@@ -1984,10 +1984,14 @@ def forge_ci_state(t):
     # T-865: forge.url comes from an agent-posted manifest. Send FORGE_TOKEN only to the
     # one forge the operator named in FORGE_TOKEN_HOST, over https; anything else gets no
     # header. FORGE_TOKEN_HOST unset = the token is never sent (fail closed).
-    u = urllib.parse.urlparse(forge["url"])
-    allowed = os.environ.get("FORGE_TOKEN_HOST", "").strip().lower()
-    tok = os.environ.get("FORGE_TOKEN", "") if allowed and u.scheme == "https" \
-        and (u.hostname or "") == allowed else ""
+    # One trailing dot is the same DNS name, so "git.example.com." in board.env still matches.
+    allowed = os.environ.get("FORGE_TOKEN_HOST", "").strip().lower().removesuffix(".")
+    try:
+        u = urllib.parse.urlparse(forge["url"])
+        ok_host = u.scheme == "https" and (u.hostname or "") == allowed
+    except ValueError:  # "https://[x]" — a malformed URL gets no token, not a 500
+        ok_host = False
+    tok = os.environ.get("FORGE_TOKEN", "") if allowed and ok_host else ""
 
     def get(path):
         req = urllib.request.Request(base + path)

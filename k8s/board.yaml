@@ -100,7 +100,7 @@ spec:
             # The one host FORGE_TOKEN may be sent to, over https (T-865). forge.url comes
             # from an agent-posted manifest; without this pin any agent could point it at
             # itself and collect the token. Empty = the token is never sent (fail closed).
-            # From board.env, e.g. FORGE_TOKEN_HOST=git.knobo.no.
+            # Set it in board.env, for example: FORGE_TOKEN_HOST=git.knobo.no
             - name: FORGE_TOKEN_HOST
               value: "${FORGE_TOKEN_HOST}"
           ports: [{ containerPort: 8080 }]

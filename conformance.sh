@@ -1634,6 +1634,13 @@ if grep -q '/pulls/1 ' "$TMP/fakeforge" && ! grep -q 'AUTH=token' "$TMP/fakeforg
 else no "FORGE_TOKEN sent to (or forge never asked by) an agent-posted forge.url" "$(cat "$TMP/fakeforge")"; fi
 kill $FF_PID 2>/dev/null
 fi
+# A malformed forge.url ("https://[x]" makes urlparse raise) is no token and no CI, not a 500.
+FT=$(mkproj forgebadurl '{"project":"forgebadurl","forge":{"kind":"forgejo","url":"https://[x]","org":"o"}}')
+FA=$(api POST /agents '{"project":"forgebadurl","harness":"claude-code","host":"host-fb","session":"s-fb"}' | jq -r .id)
+api POST /tasks/$FT/claim "{\"agent\":\"$FA\"}" >/dev/null
+api POST /tasks/$FT/progress "{\"agent\":\"$FA\",\"pr\":\"#1\"}" >/dev/null
+check "a malformed forge.url leaves gate/merge answering, CI unread" \
+  "$(apic GET "/tasks/$FT/gate/merge?agent=$FA")" '.code==200 and .body.ci==null'
 # The host rule itself, in-process: https + exact host only; unset host never sends.
 FTH=$(BOARD_DB="$TMP/forgehost.db" FORGE_TOKEN=s3cret python3 - <<'PY'
 import json, os, sys, urllib.error, urllib.request
@@ -1646,17 +1653,18 @@ board.print = lambda *a, **k: None
 out = {}
 for host, url in [("git.example.test", "https://git.example.test"), ("git.example.test", "https://GIT.example.test:8443/"),
                   ("git.example.test", "http://git.example.test"), ("git.example.test", "https://git.example.test.evil.no"),
-                  ("git.example.test", "https://git.example.test@evil.no"), ("", "https://git.example.test")]:
+                  ("git.example.test", "https://git.example.test@evil.no"), ("", "https://git.example.test"),
+                  (" git.example.test. ", "https://git.example.test/"), ("git.example.test", "https://[x]")]:
     os.environ["FORGE_TOKEN_HOST"] = host; seen.clear()
     board.db.execute("INSERT OR REPLACE INTO projects(name,phase,manifest) VALUES('p','build',?)",
                      (json.dumps({"forge": {"kind": "forgejo", "url": url, "org": "o"}}),))
     board.forge_ci_state({"project": "p", "pr": "#1", "repo": "r"})
-    out[host + " " + url] = seen[0]
+    out[host + " " + url] = seen[0] if seen else "not-called"
 print(json.dumps(out))
 PY
 )
 check "FORGE_TOKEN goes only to https on FORGE_TOKEN_HOST (case-insensitive, any port)" "$FTH" \
-  '.["git.example.test https://git.example.test"]=="token s3cret" and .["git.example.test https://GIT.example.test:8443/"]=="token s3cret" and ([.[]|select(.!=null)]|length)==2'
+  '.["git.example.test https://git.example.test"]=="token s3cret" and .["git.example.test https://GIT.example.test:8443/"]=="token s3cret" and .[" git.example.test.  https://git.example.test/"]=="token s3cret" and .["git.example.test https://[x]"]!="token s3cret" and ([.[]|select(type=="string" and startswith("token"))]|length)==3'
 FT=$(api POST /tasks "{\"agent\":\"$CLIID\",\"project\":\"forgetest\",\"title\":\"no repo\"}" | jq -r .id)
 check "several repos and none named: repo_info is null" "$(api GET /tasks/$FT)" '.repo_info==null'
 check "status carries per-project repos with repo_info" "$(api GET '/status?project=forgetest')" \
