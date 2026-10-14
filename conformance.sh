@@ -1789,6 +1789,31 @@ if [ "$OWN_SERVER" = 1 ]; then
     '.ok==true and (.tasks|index("'"$CLEAN_CLI_T"'") != null)'
 fi
 
+# T-863: SessionEnd hook identifies the agent from stdin .session_id, not the inherited
+# CLAUDE_CODE_SESSION_ID (a nested `claude -p` carries its parent's). Stub `board` records
+# which agent it was asked to finish.
+SEROOT="$TMP/sessend"; mkdir -p "$SEROOT/bin"
+cat > "$SEROOT/bin/board" <<'SH'
+#!/usr/bin/env bash
+echo "$BOARD_AGENT_ID $*" >> "$SEROOT_CALLS"
+SH
+chmod +x "$SEROOT/bin/board"
+se_run() { # se_run <stdin-session-id>  (env session = parent "sessA")
+  rm -f "$SEROOT/calls"
+  jq -nc --arg s "$1" '{session_id:$s}' | env SEROOT_CALLS="$SEROOT/calls" BOARD_URL=http://sl-a.example \
+    BOARD_CACHE="$SLROOT/cache" CLAUDE_CODE_SESSION_ID=sessA PATH="$SEROOT/bin:$PATH" bash hooks/session-end.sh
+}
+echo parentA > "$SLROOT/cache/$(sl_urlsafe http://sl-a.example)/session-sessA"
+echo childB > "$SLROOT/cache/$(sl_urlsafe http://sl-a.example)/session-sessB"
+se_run sessB
+if grep -q '^childB finished' "$SEROOT/calls" 2>/dev/null && ! grep -q parentA "$SEROOT/calls"; then
+  ok "session-end: finishes the agent of stdin session_id, not the inherited env session"
+else no "session-end: finishes the agent of stdin session_id, not the inherited env session" "$(cat "$SEROOT/calls" 2>&1)"; fi
+se_run sess-unmapped
+if [ ! -s "$SEROOT/calls" ]; then ok "session-end: unmapped session finishes nothing"
+else no "session-end: unmapped session finishes nothing" "$(cat "$SEROOT/calls")"; fi
+
+
 # T-283: `board task deploy` ran the manifest AND the command against the primary working
 # copy wherever the caller stood. That copy is arbitrarily stale, so production silently got
 # old files with a green rollout — twice on 2026-09-09 (a board served with no CSS).
