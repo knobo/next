@@ -2765,6 +2765,9 @@ grep -q '^HTTP/1.1 401' <<<"$R" && grep -qi '^WWW-Authenticate: Bearer' <<<"$R" 
   && ok "/mcp without a token is a 401 with WWW-Authenticate: Bearer" || no "mcp 401" "$R"
 [ "$(code "$(mcp "" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H "Cookie: board_token=$TOKEN")")" = 401 ] \
   && ok "/mcp ignores the board_token cookie (Authorization header only)" || no "mcp cookie auth" ""
+R=$(mcp "$HUMAN_TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}')
+[ "$(code "$R")" = 403 ] && jq -e '.error.message|test("human token is not accepted")' >/dev/null <<<"$(body "$R")" \
+  && ok "/mcp refuses the human token (403) — it must never sit in an external model" || no "mcp human token" "$R"
 [ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BOARD_URL/mcp")" = 405 ] \
   && ok "GET /mcp is 405" || no "GET /mcp" ""
 [ "$(code "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'Origin: https://evil.example')")" = 403 ] \

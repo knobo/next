@@ -5451,6 +5451,10 @@ class Handler(BaseHTTPRequestHandler):
         challenge = [("WWW-Authenticate", 'Bearer realm="board"')]
         if not self.headers.get("Authorization", "").startswith("Bearer ") or not self.authed({}):
             return self.send(401, {"error": "invalid token"}, extra=challenge)
+        # An MCP client is an external model: the owner's token must never end up in one.
+        if self.is_human:
+            return self.send(403, rpc_err(None, -32600, "the human token is not accepted on /mcp — "
+                                          "issue a per-agent token with `board token issue`"))
         version = self.headers.get("MCP-Protocol-Version")
         if version and version not in MCP_VERSIONS:
             return self.send(400, rpc_err(None, -32600, "unsupported MCP-Protocol-Version %s; "
