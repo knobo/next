@@ -1572,6 +1572,19 @@ if [ "$OWN_SERVER" = 1 ]; then
   sql "UPDATE tasks SET status='done', owner=NULL WHERE id='$BLKT'"
 fi
 
+# T-861: repo_info derived from the manifest on the project row, per forge kind.
+api POST /projects '{"project":"forgetest","phase":"build","manifest":{"project":"forgetest","repos":["gh","fj","gl","web"],"forge":{"kind":"forgejo","url":"https://git.knobo.no","org":"knobo","repos":{"gh":{"path":"octo/gh-repo","default_branch":"trunk"}}}}}' >/dev/null
+api POST /projects '{"project":"forgegl","phase":"build","manifest":{"project":"forgegl","repos":["."],"forge":{"kind":"gitlab","url":"https://gitlab.com","org":"grp/sub"}}}' >/dev/null
+FT=$(api POST /tasks "{\"agent\":\"$CLIID\",\"project\":\"forgetest\",\"repo\":\"fj\",\"title\":\"forge\"}" | jq -r .id)
+check "repo_info forgejo: urls derived from forge url/org/repo" "$(api GET /tasks/$FT)" \
+  '.repo_info=={forge_kind:"forgejo",web_url:"https://git.knobo.no/knobo/fj",clone_url:"https://git.knobo.no/knobo/fj.git",ssh_url:"git@git.knobo.no:knobo/fj.git",default_branch:"main"}'
+FT=$(api POST /tasks "{\"agent\":\"$CLIID\",\"project\":\"forgetest\",\"repo\":\"gh\",\"title\":\"forge\"}" | jq -r .id)
+check "repo_info per-repo override (path and default_branch)" "$(api GET /tasks/$FT)" \
+  '.repo_info.web_url=="https://git.knobo.no/octo/gh-repo" and .repo_info.default_branch=="trunk"'
+FT=$(api POST /tasks "{\"agent\":\"$CLIID\",\"project\":\"forgegl\",\"title\":\"forge\"}" | jq -r .id)
+check "repo_info gitlab: repos [.] uses the project name, nested group kept" "$(api GET /tasks/$FT)" \
+  '.repo_info.forge_kind=="gitlab" and .repo_info.clone_url=="https://gitlab.com/grp/sub/forgegl.git"'
+check "repo_info is null when the manifest has no forge" "$(api GET /tasks/$TID)" '.repo_info==null'
 check "task create without --project" "$(cli task create --title "cli task" --repo web)" '.id'
 
 # T-201: a `--repo` the manifest does not know is a silent error at creation time that only

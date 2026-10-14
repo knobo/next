@@ -828,6 +828,31 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
     return db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
 
 
+def repo_info(manifest, repo, project):
+    """T-861: where a task's code lives, derived from the manifest already on the project
+    row (no new table). `forge: {kind: github|forgejo|gitlab, url, org}` gives
+    <url>/<org>/<repo>; `forge.repos: {<repo>: "<path>" | {path, default_branch}}` overrides
+    per repo, `forge.default_branch` (default main) for the rest. None when the manifest
+    does not say enough. No credentials: clone_url is the plain https URL."""
+    forge = (manifest or {}).get("forge") or {}
+    kind, url = forge.get("kind"), str(forge.get("url") or "").rstrip("/")
+    if kind not in ("github", "forgejo", "gitlab") or not url:
+        return None
+    name = project if repo in (None, "", ".") else repo
+    ov = (forge.get("repos") or {}).get(name)
+    if isinstance(ov, str):
+        ov = {"path": ov}
+    ov = ov or {}
+    path = ov.get("path") or (forge.get("org") and "%s/%s" % (forge["org"], name))
+    if not path:
+        return None
+    host = re.sub(r"^\w+://", "", url).split("/")[0]
+    web = "%s/%s" % (url, path)
+    return {"forge_kind": kind, "web_url": web, "clone_url": web + ".git",
+            "ssh_url": "git@%s:%s.git" % (host, path),
+            "default_branch": ov.get("default_branch") or forge.get("default_branch") or "main"}
+
+
 def check_repo(project, repo):
     """A `--repo` that does not exist in the manifest is a silent error at creation time
     that only blows up several steps later, in a different agent: `board task worktree`
@@ -1346,6 +1371,9 @@ def task_show(tid):
     ost, oa = owner_view(t)
     d["owner_status"] = ost
     d["owner_agent"] = oa
+    prow = db.execute("SELECT manifest FROM projects WHERE name=?", (d["project"],)).fetchone()
+    d["repo_info"] = repo_info(jl(prow["manifest"], {}) if prow and prow["manifest"] else {},
+                               d.get("repo"), d["project"])
     return d
 
 

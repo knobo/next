@@ -148,7 +148,7 @@ def propose(cwd, name):
     url = remote(probe)
     if url:
         host = url.split("@")[-1].split(":")[0].replace("https://", "").split("/")[0]
-        kind = "github" if "github.com" in url else "forgejo"
+        kind = "github" if "github.com" in url else "gitlab" if "gitlab" in host else "forgejo"
         m["forge"] = {"kind": kind, "url": "https://" + host}
     return m, repos
 
