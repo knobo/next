@@ -2,7 +2,7 @@
 # Deploy the board to a Kubernetes cluster.
 #
 # board.py and board.css go in as a ConfigMap — no image build, no registry. The manifest
-# carries ${BOARD_HOST}, ${BOARD_HUMAN} and ${NTFY_URL} as placeholders because those are
+# carries ${BOARD_HOST}, ${BOARD_HUMAN}, ${NTFY_URL} and ${FORGE_TOKEN_HOST} as placeholders because those are
 # per-installation values, not source code; they come from board.env (see
 # board.env.example). That is also why `kubectl apply -f k8s/board.yaml` on its own is
 # wrong: it would deploy the placeholders verbatim.
@@ -27,6 +27,8 @@ set -a; . "$ENVFILE"; set +a
 : "${KUBE_CONTEXT:=}"
 : "${BOARD_HUMAN:=human}"
 : "${NTFY_URL:=}"
+: "${FORGE_TOKEN_HOST:=}"
+[ -n "$FORGE_TOKEN_HOST" ] || echo "warning: FORGE_TOKEN_HOST unset in $ENVFILE — FORGE_TOKEN is never sent, the merge gate cannot read CI on private repos" >&2
 K=(kubectl ${KUBE_CONTEXT:+--context "$KUBE_CONTEXT"})
 
 command -v envsubst >/dev/null || { echo "envsubst is missing (gettext)" >&2; exit 2; }
@@ -55,6 +57,6 @@ SRCBYTES=$(( $(wc -c < board.py) + $(wc -c < board.css) ))
   --from-file=board.py --from-file=board.css \
   --dry-run=client -o yaml | "${K[@]}" apply --server-side --force-conflicts -f -
 
-envsubst '${BOARD_HOST} ${BOARD_HUMAN} ${NTFY_URL}' < k8s/board.yaml | "${K[@]}" apply -f -
+envsubst '${BOARD_HOST} ${BOARD_HUMAN} ${NTFY_URL} ${FORGE_TOKEN_HOST}' < k8s/board.yaml | "${K[@]}" apply -f -
 "${K[@]}" -n board rollout restart deploy/board
 "${K[@]}" -n board rollout status deploy/board --timeout=120s
