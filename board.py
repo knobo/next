@@ -5205,6 +5205,87 @@ def prometheus_metrics():
     return "\n".join(out) + "\n"
 
 
+# ── MCP (T-859): POST /mcp, JSON-RPC 2.0 over streamable HTTP ──────────────────────────
+# The legacy (initialize) era of the spec, newest first. 2026-07-28 drops initialize for
+# per-request _meta; a client that speaks only that gets a 400 it reads as "legacy server"
+# and falls back to initialize. ponytail: add 2026-07-28 (server/discover, header/_meta
+# validation) when a client needs it.
+MCP_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
+MCP_ORIGIN = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(BASE_URL))
+MCP_INSTRUCTIONS = ("The board: a work queue shared by coding agents. Call `register` once "
+                    "(project, harness, host) and pass the returned id as `agent` to every "
+                    "other tool. Then task_next → task_claim → task_progress, and `ask` when "
+                    "a human must decide (it returns at once; carry on with the default).")
+
+
+def _s(desc, typ="string"):
+    return {"type": typ, "description": desc}
+
+
+_AGENT = _s("your agent id, from register")
+_TASK = _s("task id, e.g. T-42")
+# name → (description, inputSchema, HTTP method, API path). Each tool IS the REST call of
+# the same name: same handler, same LOCK, same per-agent identity check. Deliberately
+# absent: merge, grants, role pin, tokens, cleanup — and `task pr`, which pushes git and
+# opens the PR from the agent's own checkout (bin/board), not from the server.
+MCP_TOOLS = {
+    "register": ("Register this agent session on a project; returns {id}. With a per-agent "
+                 "token, harness@host must match the token's pattern.",
+                 {"type": "object", "required": ["project", "harness", "host"], "properties": {
+                     "project": _s("project name"), "harness": _s("e.g. claude-code, codex"),
+                     "host": _s("machine name"), "model": _s("model name"),
+                     "session": _s("stable session id; re-registering with it keeps the agent id"),
+                     "capabilities": {"type": "array", "items": {"type": "string"}}}},
+                 "POST", "/agents"),
+    "task_next": ("The highest-priority open task this agent qualifies for.",
+                  {"type": "object", "required": ["agent"], "properties": {
+                      "agent": _AGENT, "repo": _s("limit to one repo")}},
+                  "GET", "/tasks/next"),
+    "task_claim": ("Claim a task (409 if someone else holds it). Starts the lease.",
+                   {"type": "object", "required": ["agent", "task"], "properties": {
+                       "agent": _AGENT, "task": _TASK}},
+                   "POST", "/tasks/{task}/claim"),
+    "task_progress": ("Progress note on a task you hold; renews the lease. Write what another "
+                      "agent needs to take over.",
+                      {"type": "object", "required": ["agent", "task"], "properties": {
+                          "agent": _AGENT, "task": _TASK, "note": _s("free text"),
+                          "worktree": _s("path"), "branch": _s("git branch"), "pr": _s("e.g. web#201"),
+                          "dispatch": _s("role:model of a subagent run"),
+                          "tokens": _s("tokens that dispatch used", "integer"),
+                          "result": _s("what the dispatch produced")}},
+                      "POST", "/tasks/{task}/progress"),
+    "task_show": ("Everything about one task: spec, status, owner, timeline, questions.",
+                  {"type": "object", "required": ["task"], "properties": {"task": _TASK}},
+                  "GET", "/tasks/{task}"),
+    "status": ("Board status: phase, agents, tasks, questions and roles per project.",
+               {"type": "object", "properties": {"project": _s("one project only")}},
+               "GET", "/status"),
+    "ask": ("Ask the human a question. Returns at once with {id}; at the deadline the "
+            "default becomes the answer.",
+            {"type": "object", "required": ["agent", "project", "text"], "properties": {
+                "agent": _AGENT, "project": _s("project name"), "task": _TASK,
+                "text": _s("the question (markdown)"), "default": _s("answer used if nobody replies"),
+                "options": {"type": "array", "items": {"type": "string"}},
+                "deadline": _s("e.g. 8h")}},
+            "POST", "/questions"),
+}
+
+
+def rpc_ok(mid, result):
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def rpc_err(mid, code, message):
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+def tool_result(r, is_error=False):
+    out = {"content": [{"type": "text", "text": json.dumps(r, ensure_ascii=False)}], "isError": is_error}
+    if isinstance(r, dict):
+        out["structuredContent"] = r
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "board/0"
@@ -5253,6 +5334,19 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.5)          # slows guessing; the board has no other users to starve
         return ok
 
+    def send_response(self, code, message=None):
+        """Every reply goes through here. A request whose body was never read (the 401 that
+        refuses before reading, a 405, a 413) leaves that body on a keep-alive socket, where
+        it is parsed as the NEXT request line — the client's next call then fails as "Bad
+        request syntax" (T-859, seen with Claude Code's MCP probe). Close the connection
+        instead of draining: draining would read a body an unauthenticated client sent."""
+        super().send_response(code, message)
+        h = getattr(self, "headers", None) or {}      # send_error can come before headers
+        unread = (h.get("Content-Length") or "0") != "0" or h.get("Transfer-Encoding")
+        if unread and not getattr(self, "body_read", False):
+            self.send_header("Connection", "close")
+            self.close_connection = True
+
     def send(self, code, obj, ctype="application/json", extra=()):
         data = (obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)).encode()
         self.send_response(code)
@@ -5284,11 +5378,13 @@ class Handler(BaseHTTPRequestHandler):
         if n > self.MAX_BODY:
             raise Err(413, "body over %d bytes" % self.MAX_BODY)
         raw = self.rfile.read(n) if n else b""
+        self.body_read = True
         if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
             return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode()).items()}
         return json.loads(raw) if raw else {}
 
     def handle_one(self, method):
+        self.body_read = False                # per request: keep-alive reuses this handler
         url = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(url.query)
         if url.path == "/healthz":            # kubelet probe: no token, no data
@@ -5297,6 +5393,8 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 text = prometheus_metrics()
             return self.send(200, text, "text/plain; version=0.0.4; charset=utf-8")
+        if url.path == "/mcp":
+            return self.handle_mcp(method)
         if not self.authed(q):                # BEFORE the body is read — an
             return self.send(401, {"error": "invalid token"})   # unauthenticated client
         try:                                                    # must not make us allocate
@@ -5320,19 +5418,8 @@ class Handler(BaseHTTPRequestHandler):
                 # form stands.
                 ("Set-Cookie", "board_token=%s; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=7776000"
                  % urllib.parse.quote(q["t"][0], safe=""))])
-        # The rollback MUST happen under the same lock as the write. Outside it, it rolls
-        # back another thread's in-flight transaction on the shared connection — and the
-        # agent believes it owns a task the board considers free.
         try:
-            with LOCK:
-                try:
-                    if self.agent_pattern:
-                        token_identity_check(self.agent_pattern, method, url.path, body, q)
-                    r = self.route(method, url.path, body, q, "")
-                    db.commit()
-                except BaseException:
-                    db.rollback()
-                    raise
+            r = self.dispatch(method, url.path, body, q)
         except Err as e:
             return self.send(e.code, e.body)
         except (KeyError, IndexError) as e:
@@ -5345,6 +5432,112 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(r, str):
             return self.send(200, r, "text/html")
         return self.send(200, r)
+
+    def dispatch(self, method, path, body, q):
+        """One call: under LOCK, through the per-agent identity check, then route(). The
+        REST handler and every MCP tool call both come through here, so MCP is not a way
+        around token_identity_check (T-859).
+
+        The rollback MUST happen under the same lock as the write. Outside it, it rolls
+        back another thread's in-flight transaction on the shared connection — and the
+        agent believes it owns a task the board considers free."""
+        with LOCK:
+            try:
+                if self.agent_pattern:
+                    token_identity_check(self.agent_pattern, method, path, body, q)
+                r = self.route(method, path, body, q, "")
+                db.commit()
+                return r
+            except BaseException:
+                db.rollback()
+                raise
+
+    def handle_mcp(self, method):
+        """POST /mcp — MCP streamable HTTP (T-859), answered with plain application/json.
+        Stateless: no Mcp-Session-Id, no SSE, no GET stream."""
+        if method != "POST":
+            return self.send(405, {"error": "POST only"}, extra=[("Allow", "POST")])
+        # DNS rebinding (the spec's MUST): a browser on another origin is refused outright.
+        origin = self.headers.get("Origin")
+        if origin and origin != MCP_ORIGIN:
+            return self.send(403, rpc_err(None, -32600, "origin %s not allowed" % origin))
+        # The header and nothing else: no ?t= and no cookie, so a page in the owner's
+        # browser cannot ride the board_token cookie into a tool call.
+        challenge = [("WWW-Authenticate", 'Bearer realm="board"')]
+        if not self.headers.get("Authorization", "").startswith("Bearer ") or not self.authed({}):
+            return self.send(401, {"error": "invalid token"}, extra=challenge)
+        # An MCP client is an external model: the owner's token must never end up in one.
+        if self.is_human:
+            return self.send(403, rpc_err(None, -32600, "the human token is not accepted on /mcp — "
+                                          "issue a per-agent token with `board token issue`"))
+        version = self.headers.get("MCP-Protocol-Version")
+        if version and version not in MCP_VERSIONS:
+            return self.send(400, rpc_err(None, -32600, "unsupported MCP-Protocol-Version %s; "
+                                          "this server speaks %s (initialize)" % (version, ", ".join(MCP_VERSIONS))))
+        try:
+            msg = self.body()
+        except Err as e:
+            return self.send(e.code, e.body)
+        except ValueError:
+            return self.send(400, rpc_err(None, -32700, "parse error"))
+        try:
+            code, reply = self.mcp(msg)
+        except Exception as e:
+            self.log_message("500 %r", e)
+            code, reply = 200, rpc_err(msg.get("id"), -32603, repr(e))
+        if reply is None:
+            self.send_response(code)
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+        return self.send(code, reply)
+
+    def mcp(self, msg):
+        """One JSON-RPC message → (http status, reply or None for a notification)."""
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+            return 400, rpc_err(None, -32600, "a single JSON-RPC 2.0 message (no batches)")
+        if "id" not in msg:                          # a notification: accepted, nothing to say
+            return 202, None
+        mid, method, params = msg["id"], msg["method"], msg.get("params") or {}
+        if method == "initialize":
+            asked = params.get("protocolVersion")
+            return 200, rpc_ok(mid, {
+                "protocolVersion": asked if asked in MCP_VERSIONS else MCP_VERSIONS[0],
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "board", "version": "0"},
+                "instructions": MCP_INSTRUCTIONS})
+        if method == "ping":
+            return 200, rpc_ok(mid, {})
+        if method == "tools/list":
+            return 200, rpc_ok(mid, {"tools": [{"name": n, "description": t[0], "inputSchema": t[1]}
+                                               for n, t in MCP_TOOLS.items()]})
+        if method != "tools/call":
+            return 200, rpc_err(mid, -32601, "method not found: %s" % method)
+        name, args = params.get("name"), params.get("arguments") or {}
+        if name not in MCP_TOOLS or not isinstance(args, dict):
+            return 200, rpc_err(mid, -32602, "unknown tool: %s" % name)
+        _, schema, verb, path = MCP_TOOLS[name]
+        missing = [k for k in schema.get("required", []) if args.get(k) in (None, "")]
+        if missing:
+            return 200, rpc_err(mid, -32602, "%s: missing %s" % (name, ", ".join(missing)))
+        # The declared arguments only: `_human` in the arguments must never reach a
+        # handler — whether the caller is the human is the TOKEN's to say, not the body's.
+        args = {k: v for k, v in args.items() if k in schema["properties"]}
+        if "{task}" in path:
+            tid = str(args.pop("task"))
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", tid):
+                return 200, rpc_err(mid, -32602, "task must be a task id like T-42")
+            path = path.replace("{task}", tid)
+        if verb == "GET":
+            body, q = {}, {k: [str(v)] for k, v in args.items()}
+        else:
+            body, q = args, {}
+        body["_human"] = self.is_human
+        try:
+            return 200, rpc_ok(mid, tool_result(self.dispatch(verb, API + path, body, q)))
+        except Err as e:
+            return 200, rpc_ok(mid, tool_result(dict(e.body, status=e.code), True))
+        except (KeyError, IndexError) as e:
+            return 200, rpc_ok(mid, tool_result({"error": "missing parameter %s" % e, "status": 400}, True))
 
     def route(self, method, path, body, q, token):
         if path == "/healthz":

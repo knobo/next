@@ -249,6 +249,23 @@ markup is missing from the stylesheet (a Tailwind class split across two Python 
 is never seen by the text extractor — an otherwise completely silent failure), and that a real
 browser logs no CSP violation in light and dark mode, on a wide screen and on a phone.
 
+### Use it as an MCP server
+
+The board also answers MCP on `/mcp`, so a harness without the `board` CLI can still take part:
+
+```bash
+claude mcp add --transport http board https://board.knobo.no/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Use a per-agent token (`board token issue 'claude-code@laptop'`) rather than the shared one. The human
+token is refused on `/mcp` (403): an MCP client is an external model, and the owner's token
+must never end up in one. The
+tools are the agent loop and nothing else — `register`, `task_next`, `task_claim`,
+`task_progress`, `task_show`, `status`, `ask` — and each is the same call as its REST
+counterpart, under the same identity check. Call `register` first and pass its id as `agent`.
+See `skill/reference/protocol.md`.
+
 ## Phase: how strict the gate is
 
 Every project declares a phase in `project.yaml`. It is the one field a human must set, and the

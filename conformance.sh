@@ -2750,6 +2750,109 @@ jq -e '[.questions[].text] | (index("ob-mine") != null) and (index("ob-theirs") 
   || no "outbox token fingerprint" "$(cat "$OBC/outbox.jsonl" 2>/dev/null)"
 fi
 
+if [ "$OWN_SERVER" = 1 ]; then
+echo "== MCP endpoint /mcp (T-859) =="
+# mcp <token> <json-rpc body> [extra curl args...] → the body, then the status on its own line
+mcp() { local t="$1" b="$2"; shift 2
+  curl -sS -m 5 -w '\n%{http_code}' -X POST ${t:+-H "Authorization: Bearer $t"} \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' "$@" \
+    -d "$b" "$BOARD_URL/mcp"; }
+body() { sed '$d' <<<"$1"; }
+code() { tail -1 <<<"$1"; }
+call() { mcp "$1" "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" | sed '$d'; }
+R=$(curl -sS -m 5 -i -X POST -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BOARD_URL/mcp")
+grep -q '^HTTP/1.1 401' <<<"$R" && grep -qi '^WWW-Authenticate: Bearer' <<<"$R" \
+  && ok "/mcp without a token is a 401 with WWW-Authenticate: Bearer" || no "mcp 401" "$R"
+[ "$(code "$(mcp "" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H "Cookie: board_token=$TOKEN")")" = 401 ] \
+  && ok "/mcp ignores the board_token cookie (Authorization header only)" || no "mcp cookie auth" ""
+R=$(mcp "$HUMAN_TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}')
+[ "$(code "$R")" = 403 ] && jq -e '.error.message|test("human token is not accepted")' >/dev/null <<<"$(body "$R")" \
+  && ok "/mcp refuses the human token (403) — it must never sit in an external model" || no "mcp human token" "$R"
+[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BOARD_URL/mcp")" = 405 ] \
+  && ok "GET /mcp is 405" || no "GET /mcp" ""
+[ "$(code "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'Origin: https://evil.example')")" = 403 ] \
+  && ok "/mcp refuses a foreign Origin (DNS rebinding)" || no "mcp origin" ""
+check "initialize answers the client's version and the tools capability" \
+  "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}')")" \
+  '.id==1 and .result.protocolVersion=="2025-06-18" and (.result.capabilities.tools|type=="object") and .result.serverInfo.name=="board"'
+check "initialize with an unknown version answers the server's own" \
+  "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1900-01-01"}}')")" \
+  '.result.protocolVersion=="2025-11-25"'
+R=$(mcp "$TOKEN" '{"jsonrpc":"2.0","method":"notifications/initialized"}')
+[ "$(code "$R")" = 202 ] && [ -z "$(body "$R")" ] && ok "a notification is 202 with no body" || no "mcp notification" "$R"
+[ "$(code "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'MCP-Protocol-Version: 2099-01-01')")" = 400 ] \
+  && ok "an unsupported MCP-Protocol-Version header is a 400" || no "mcp version header" ""
+# Claude Code's real opening (T-859): a 2026-07-28 server/discover probe, then — on the SAME
+# keep-alive connection — initialize. The probe is refused before its body is read; if that
+# body stays on the socket, it is parsed as the next request line and initialize dies as
+# "Bad request syntax". http.client reconnects on its own when the server closes, so this
+# passes either by the server draining or by it closing — never by leaving the body behind.
+KA=$(python3 - "$PORT" "$TOKEN" <<'PY'
+import http.client, json, sys
+c = http.client.HTTPConnection("localhost", int(sys.argv[1]), timeout=5)
+h = {"Authorization": "Bearer " + sys.argv[2], "Content-Type": "application/json",
+     "Accept": "application/json, text/event-stream"}
+probe = {"jsonrpc": "2.0", "id": "p", "method": "server/discover",
+         "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}
+c.request("POST", "/mcp", json.dumps(probe), dict(h, **{"MCP-Protocol-Version": "2026-07-28"}))
+r1 = c.getresponse(); b1 = r1.read()
+c.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+          "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "c", "version": "1"}}}), h)
+r2 = c.getresponse()
+print(json.dumps({"probe": r1.status, "probe_code": json.loads(b1)["error"]["code"],
+                  "init": r2.status, "version": json.loads(r2.read())["result"]["protocolVersion"]}))
+PY
+)
+check "a 2026-07-28 probe gets a non-modern 400, and initialize after it on one keep-alive connection works" \
+  "$KA" '.probe==400 and .probe_code==-32600 and .init==200 and .version=="2025-11-25"'
+R=$(curl -sS -m 5 -i -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BOARD_URL/api/v1/status")
+grep -qi '^Connection: close' <<<"$R" && ok "a refusal that never read the body closes the connection (REST too)" || no "unread body keep-alive" "$R"
+check "ping" "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":"p","method":"ping"}')")" '.id=="p" and .result=={}'
+check "tools/list is exactly the agent loop — no merge, grants, pin, token or cleanup" \
+  "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')")" \
+  '([.result.tools[].name]|sort)==["ask","register","status","task_claim","task_next","task_progress","task_show"] and ([.result.tools[]|.inputSchema.type=="object"]|all)'
+check "an unknown method is JSON-RPC -32601" "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":3,"method":"nope"}')")" '.error.code==-32601'
+check "an unknown tool is JSON-RPC -32602" "$(call "$TOKEN" merge '{}')" '.error.code==-32602'
+check "a missing required argument is -32602" "$(call "$TOKEN" task_claim '{"task":"T-1"}')" '.error.code==-32602'
+check "a task id with a slash is refused, not routed" "$(call "$TOKEN" task_show '{"task":"T-1/claim"}')" '.error.code==-32602'
+MR=$(call "$TOKEN" register '{"project":"mcp","harness":"codex","host":"mcp-a","session":"mcp-s1"}')
+check "register over MCP returns an agent id" "$MR" '.result.isError==false and (.result.structuredContent.id|startswith("cx-mcp-a-"))'
+MAID=$(jq -r .result.structuredContent.id <<<"$MR")
+MT=$(api POST /tasks "{\"agent\":\"$MAID\",\"project\":\"mcp\",\"title\":\"an mcp task to claim\"}" | jq -r .id)
+check "task_next over MCP finds the open task" "$(call "$TOKEN" task_next "{\"agent\":\"$MAID\"}")" \
+  ".result.structuredContent.id==\"$MT\""
+check "status over MCP is the same answer as GET /status" "$(call "$TOKEN" status '{"project":"mcp"}')" \
+  '.result.structuredContent.projects[0].name=="mcp"'
+check "a refused call is a tool error (isError) carrying the HTTP status" \
+  "$(call "$TOKEN" task_claim '{"agent":"cx-nobody-0000","task":"T-1"}')" '.result.isError==true and .result.structuredContent.status==404'
+# Per-agent token: MCP must enforce exactly what REST enforces (T-858).
+MPT=$(hum POST /tokens '{"pattern":"codex@mcp-*","note":"mcp conformance"}' | jq -r .token)
+check "a per-agent token registers over MCP as an identity its pattern matches" \
+  "$(call "$MPT" register '{"project":"mcp","harness":"codex","host":"mcp-b","session":"mcp-s2"}')" '.result.isError==false'
+MBID=$(call "$MPT" register '{"project":"mcp","harness":"codex","host":"mcp-b","session":"mcp-s2"}' | jq -r .result.structuredContent.id)
+check "a per-agent token can NOT register over MCP as another harness" \
+  "$(call "$MPT" register '{"project":"mcp","harness":"claude-code","host":"mcp-b","session":"mcp-s3"}')" '.result.isError==true and .result.structuredContent.status==403'
+check "a per-agent token can NOT take another agent's session over MCP" \
+  "$(call "$MPT" register '{"project":"mcp","harness":"codex","host":"mcp-b","session":"s1"}')" '.result.structuredContent.status==403'
+check "a per-agent token can NOT claim as another agent over MCP" \
+  "$(call "$MPT" task_claim "{\"agent\":\"$AID\",\"task\":\"$MT\"}")" '.result.isError==true and .result.structuredContent.status==403'
+check "a per-agent token can NOT read task_next as another agent over MCP" \
+  "$(call "$MPT" task_next "{\"agent\":\"$AID\"}")" '.result.structuredContent.status==403'
+check "a per-agent token can NOT ask as the human over MCP" \
+  "$(call "$MPT" ask "{\"agent\":\"$BOARD_HUMAN\",\"project\":\"mcp\",\"text\":\"as the owner?\"}")" '.result.structuredContent.status==403'
+check "_human in the arguments is dropped — the human is a token, not a field" \
+  "$(call "$MPT" ask "{\"agent\":\"$BOARD_HUMAN\",\"_human\":true,\"project\":\"mcp\",\"text\":\"as the owner?\"}")" '.result.structuredContent.status==403'
+check "a per-agent token claims as itself over MCP" \
+  "$(call "$MPT" task_claim "{\"agent\":\"$MBID\",\"task\":\"$MT\"}")" '.result.isError==false'
+check "and reports progress on it" \
+  "$(call "$MPT" task_progress "{\"agent\":\"$MBID\",\"task\":\"$MT\",\"note\":\"via mcp\"}")" '.result.structuredContent.ok==true'
+check "task_show over MCP shows the claim" "$(call "$MPT" task_show "{\"task\":\"$MT\"}")" \
+  ".result.structuredContent.owner==\"$MBID\""
+check "a per-agent token asks as itself over MCP" \
+  "$(call "$MPT" ask "{\"agent\":\"$MBID\",\"project\":\"mcp\",\"text\":\"Should the MCP tools be named like the CLI?\",\"default\":\"yes\"}")" \
+  '.result.structuredContent.id|startswith("Q-")'
+fi
+
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
 exit $((FAIL > 0))
