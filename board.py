@@ -4,7 +4,7 @@
 Stdlib only: http.server + sqlite3. One writer, one pod (do not scale to 2 replicas).
 Run:  BOARD_TOKEN=... BOARD_DB=/data/board.db python3 board.py
 """
-import base64, hashlib, hmac, json, os, re, secrets, sqlite3, sys, threading, time
+import base64, fnmatch, hashlib, hmac, json, os, re, secrets, sqlite3, sys, threading, time
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS agents (
   current_project TEXT, capabilities TEXT, preference TEXT,
   last_seen TEXT, status TEXT, registered TEXT,
   ctx_pct REAL, budget TEXT, current_task TEXT);
+-- Per-agent tokens (T-858). Only the sha256 of the token is stored; the token itself is
+-- shown once, at issue. `pattern` is a glob over "harness@host" — the identities the
+-- token may register as and act as. No expiry: revoking is the only way out.
+CREATE TABLE IF NOT EXISTS agent_tokens (
+  id TEXT PRIMARY KEY, hash TEXT UNIQUE NOT NULL, pattern TEXT NOT NULL, note TEXT,
+  created TEXT, revoked TEXT);
 CREATE TABLE IF NOT EXISTS grants (
   agent TEXT, project TEXT, grant_name TEXT, source TEXT DEFAULT 'policy', PRIMARY KEY (agent, project, grant_name));
 -- tasks.human_test and questions.kind='test'/card are legacy from the removed test stage
@@ -671,6 +677,73 @@ def agent_grant_del(aid, grant, b, q):
     db.execute("DELETE FROM grants WHERE agent=? AND project=? AND grant_name=?", (aid, project, grant))
     ev(project, "agent/" + aid, "agent.revoked", HUMAN, grant=grant, project=project)
     return {"id": aid, "project": project, "grants": sorted(agent_grants(aid, project))}
+
+
+def token_hash(tok):
+    return hashlib.sha256(tok.encode()).hexdigest()
+
+
+def token_issue(b):
+    """T-858: a token bound to the identities `pattern` matches (glob over harness@host)."""
+    human_only(b, "issuing an agent token")
+    pattern = (b.get("pattern") or "").strip()
+    if "@" not in pattern:
+        raise Err(400, "pattern must be harness@host (glob), e.g. codex@build-*")
+    tok = "bat_" + secrets.token_urlsafe(32)
+    tid = next_id("AT-", "agent_tokens")
+    db.execute("INSERT INTO agent_tokens (id,hash,pattern,note,created) VALUES (?,?,?,?,?)",
+               (tid, token_hash(tok), pattern, b.get("note"), now()))
+    return {"id": tid, "token": tok, "pattern": pattern, "note": b.get("note")}
+
+
+def token_list(b):
+    human_only(b, "listing agent tokens")
+    return {"tokens": [dict(r) for r in db.execute(
+        "SELECT id, pattern, note, created, revoked FROM agent_tokens ORDER BY created")]}
+
+
+def token_revoke(tid, b):
+    human_only(b, "revoking an agent token")
+    if not db.execute("SELECT 1 FROM agent_tokens WHERE id=?", (tid,)).fetchone():
+        raise Err(404, "unknown token %s" % tid)
+    db.execute("UPDATE agent_tokens SET revoked=COALESCE(revoked, ?) WHERE id=?", (now(), tid))
+    return dict(db.execute("SELECT id, pattern, note, created, revoked FROM agent_tokens WHERE id=?",
+                           (tid,)).fetchone())
+
+
+def token_identity_check(pattern, method, path, b, q):
+    """A per-agent token acts only as identities its pattern matches — on register (the
+    harness@host it registers as, and the agent a reused session points at) AND on every
+    call that names an agent, so it cannot borrow another agent's id after the fact."""
+    def bad(who):
+        raise Err(403, "this token is bound to %s and cannot act as %s" % (pattern, who))
+
+    def check_agent(aid):
+        row = db.execute("SELECT harness, host FROM agents WHERE id=?", (aid,)).fetchone()
+        if not row or not fnmatch.fnmatchcase("%s@%s" % (row["harness"], row["host"]), pattern):
+            bad(aid)
+
+    # agents cleanup orphans OTHER agents' tasks — fleet maintenance, not this agent's.
+    if re.match("^(%s)?/agents/cleanup$" % re.escape(API), path):
+        bad("the fleet (agents cleanup)")
+    b = b if isinstance(b, dict) else {}
+    ids = {x for x in (b.get("agent"), b.get("by"), q.get("agent", [None])[0], q.get("by", [None])[0])
+           if isinstance(x, str)}
+    if method == "POST" and path == API + "/agents":
+        ident = "%s@%s" % (b.get("harness", "unknown"), b.get("host", "unknown"))
+        if not fnmatch.fnmatchcase(ident, pattern):
+            bad(ident)
+        old = db.execute("SELECT id FROM agents WHERE session=?", (b["session"],)).fetchone() \
+            if b.get("session") else None
+        if old:
+            ids.add(old["id"])
+    m = re.match("^" + API + r"/agents/([^/]+)/", path)
+    if m:
+        ids.add(m.group(1))
+    # HUMAN is not exempt: it is no agent row, so naming it is a 403 — a per-agent token
+    # must not forge the owner's authorship or slip past owner guards as the human.
+    for a in ids - {""}:
+        check_agent(a)
 
 
 def same_project(a, project):
@@ -4537,6 +4610,9 @@ ROUTES = [
     ("POST",   r"/projects/([^/]+)/phase$",    lambda h, m, b, q: set_phase(m[0], b)),
     ("GET",    r"/status$",                     lambda h, m, b, q: status(q.get("project", [None])[0])),
     ("GET",    r"/events$",                     lambda h, m, b, q: events(q)),
+    ("POST",   r"/tokens$",                     lambda h, m, b, q: token_issue(b)),
+    ("GET",    r"/tokens$",                     lambda h, m, b, q: token_list(b)),
+    ("POST",   r"/tokens/([^/]+)/revoke$",      lambda h, m, b, q: token_revoke(m[0], b)),
 ]
 ROUTES = [(mth, re.compile("^" + API + pat), fn) for mth, pat, fn in ROUTES]
 
@@ -5156,8 +5232,20 @@ class Handler(BaseHTTPRequestHandler):
         # The human token is a SUPERSET: it authenticates like every other token, and in
         # addition sets the flag that lets the call act as the human.
         self.is_human = bool(HUMAN_TOKEN) and hmac.compare_digest(given, HUMAN_TOKEN)
+        self.agent_pattern = None
         if self.is_human:
             return True
+        # A per-agent token (T-858): looked up by hash, so the stored value is useless
+        # to whoever reads the database. Revoked = 401, same as a wrong token.
+        if given.startswith("bat_"):
+            with LOCK:
+                row = db.execute("SELECT pattern, revoked FROM agent_tokens WHERE hash=?",
+                                 (token_hash(given),)).fetchone()
+            if row and not row["revoked"]:
+                self.agent_pattern = row["pattern"]
+                return True
+            time.sleep(0.5)          # outside LOCK: a wrong guess must not stall the board
+            return False
         if not TOKEN:
             return True
         ok = hmac.compare_digest(given, TOKEN)
@@ -5238,6 +5326,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with LOCK:
                 try:
+                    if self.agent_pattern:
+                        token_identity_check(self.agent_pattern, method, url.path, body, q)
                     r = self.route(method, url.path, body, q, "")
                     db.commit()
                 except BaseException:

@@ -2689,6 +2689,67 @@ done
 CE=$(bash -c "$(sed -n '/^parse() {/,/^}/p' bin/board); POS=(); JQARGS=(); CMDS=(); LIST_KEYS='[]'; parse blocked --cmd --note x" 2>&1; echo "rc=$?")
 grep -q "board: --cmd needs a command" <<<"$CE" && grep -q "rc=1" <<<"$CE" && ok "bin/board: --cmd without a command is an error, exit 1" || no "cli --cmd" "$CE"
 
+if [ "$OWN_SERVER" = 1 ]; then
+echo "== per-agent tokens bound to an identity (T-858) =="
+tok() { local t="$1" m="$2" p="$3"; shift 3
+  curl -sS -m 5 -w '\n%{http_code}' -X "$m" -H "Authorization: Bearer $t" -H 'Content-Type: application/json' \
+    ${1:+-d "$1"} "$BOARD_URL/api/v1$p" | tail -1; }
+check "the shared agent token can NOT issue a token" \
+  "$(api POST /tokens '{"pattern":"codex@*"}')" '.needs_human_token==true'
+TI=$(hum POST /tokens '{"pattern":"codex@tok-*","note":"conformance"}')
+check "the human token issues a token bound to a pattern" "$TI" '(.token|startswith("bat_")) and .pattern=="codex@tok-*"'
+PT=$(jq -r .token <<<"$TI"); PTID=$(jq -r .id <<<"$TI")
+check "list shows the token without the secret or its hash" "$(hum GET /tokens)" \
+  '[.tokens[]|select(.id=="'"$PTID"'")]|length==1 and (.[0]|has("token")|not) and (.[0]|has("hash")|not)'
+python3 -c "import sqlite3,sys;sys.exit(any(sys.argv[2] in str(r) for r in sqlite3.connect(sys.argv[1]).execute('SELECT * FROM agent_tokens')))" "$TMP/board.db" "$PT" \
+  && ok "the database holds only a hash of the token" || no "token stored in plaintext" ""
+TR=$(curl -sS -m 5 -X POST -H "Authorization: Bearer $PT" -H 'Content-Type: application/json' \
+  -d '{"project":"demo","harness":"codex","host":"tok-1","session":"tok-s1"}' "$BOARD_URL/api/v1/agents")
+check "the token registers as an identity its pattern matches" "$TR" '.id'
+TAID=$(jq -r .id <<<"$TR")
+[ "$(tok "$PT" POST /agents '{"project":"demo","harness":"claude-code","host":"tok-1","session":"tok-s2"}')" = 403 ] \
+  && ok "the token can NOT register as another harness" || no "register outside the pattern" ""
+[ "$(tok "$PT" POST /agents '{"project":"demo","harness":"codex","host":"tok-1","session":"s1"}')" = 403 ] \
+  && ok "the token can NOT take over another agent's session" || no "session takeover" ""
+[ "$(tok "$PT" POST "/agents/$TAID/heartbeat" '{"ctx_pct":1}')" = 200 ] \
+  && ok "the token heartbeats as its own agent" || no "own heartbeat" ""
+[ "$(tok "$PT" POST "/agents/$AID/heartbeat" '{"ctx_pct":1}')" = 403 ] \
+  && ok "the token can NOT heartbeat as another agent" || no "foreign heartbeat" ""
+[ "$(tok "$PT" POST /questions "{\"agent\":\"$AID\",\"project\":\"demo\",\"text\":\"spoof?\"}")" = 403 ] \
+  && ok "the token can NOT put another agent's id in the body" || no "foreign agent in body" ""
+[ "$(tok "$PT" POST /questions "{\"agent\":\"$TAID\",\"project\":\"demo\",\"text\":\"mine?\"}")" = 200 ] \
+  && ok "the token can ask under its own agent id" || no "own question" ""
+for HC in "POST /questions {\"agent\":\"$BOARD_HUMAN\",\"project\":\"demo\",\"text\":\"as owner?\"}" \
+          "POST /tasks {\"agent\":\"$BOARD_HUMAN\",\"project\":\"demo\",\"title\":\"as owner\"}" \
+          "PATCH /tasks/$CT {\"agent\":\"$BOARD_HUMAN\",\"risk\":\"low\"}" \
+          "POST /tasks {\"by\":\"$BOARD_HUMAN\",\"agent\":\"$TAID\",\"project\":\"demo\",\"title\":\"by owner\"}"; do
+  read -r HM HP HB <<<"$HC"
+  [ "$(tok "$PT" "$HM" "$HP" "$HB")" = 403 ] \
+    && ok "the token can NOT act as the human ($HM $HP)" || no "token acts as the human: $HM $HP" ""
+done
+[ "$(tok "$PT" POST /agents/cleanup '{"project":"demo"}')" = 403 ] \
+  && ok "the token can NOT run agents cleanup (it orphans other agents' tasks)" || no "token cleanup" ""
+[ "$(tok "$PT" POST "/tokens/$PTID/revoke" '{}')" = 403 ] \
+  && ok "an agent token can NOT revoke tokens" || no "agent revoke" ""
+check "the human token revokes" "$(hum POST "/tokens/$PTID/revoke" '{}')" '.revoked'
+[ "$(tok "$PT" GET /status)" = 401 ] && ok "a revoked token is a 401" || no "revoked still works" ""
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BOARD_URL/api/v1/status")" = 200 ] \
+  && ok "the shared BOARD_TOKEN still works" || no "shared token broken" ""
+# The outbox replays only entries queued under the current token; others stay put.
+OBC="$TMP/ob-cache/$(printf '%s' "${BOARD_URL#*://}" | tr -c 'A-Za-z0-9._-' '_')"; mkdir -p "$OBC/cache"
+MYFP=$(printf '%s' "$TOKEN" | sha256sum | cut -c1-8)
+{ jq -nc --arg a "$AID" --arg f "$MYFP" '{method:"POST",path:"/questions",fp:$f,
+    body:({agent:$a,project:"demo",text:"ob-mine"}|tojson)}'
+  jq -nc --arg a "$AID" '{method:"POST",path:"/questions",fp:"0badf00d",
+    body:({agent:$a,project:"demo",text:"ob-theirs"}|tojson)}'; } > "$OBC/outbox.jsonl"
+BOARD_CACHE="$TMP/ob-cache" cli status --json >/dev/null
+OBQ=$(api GET /questions)
+jq -e '[.questions[].text] | (index("ob-mine") != null) and (index("ob-theirs") == null)' >/dev/null <<<"$OBQ" \
+  && [ "$(jq -r .body "$OBC/outbox.jsonl" 2>/dev/null | jq -r .text)" = ob-theirs ] \
+  && ok "the outbox flushes only this token's entries, and keeps the others" \
+  || no "outbox token fingerprint" "$(cat "$OBC/outbox.jsonl" 2>/dev/null)"
+fi
+
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
 [ "$OWN_SERVER" = 1 ] && [ "$FAIL" -gt 0 ] && { echo "--- server log ---"; tail -20 "$TMP/log"; }
 exit $((FAIL > 0))
