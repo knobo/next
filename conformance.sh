@@ -78,7 +78,7 @@ JSON
     NTFY_LOG="$TMP/ntfy" NTFY_PORT="$NTFY_PORT" \
     BOARD_DB="$TMP/board.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" BOARD_HUMAN="human" BOARD_POLICY="$TMP/policy.json" \
     FORGE_TOKEN="forge-secret-T865" FORGE_TOKEN_HOST="git.example.test" \
-      BOARD_PORT="$PORT" BOARD_BASE_URL="http://localhost:$PORT" BOARD_REAP_INTERVAL="$1" \
+      BOARD_PORT="$PORT" BOARD_BASE_URL="http://localhost:$PORT" BOARD_REAP_INTERVAL="$1" BOARD_SOCKET_TIMEOUT=2 \
       NTFY_URL="http://127.0.0.1:$NTFY_PORT/board" \
       python3 board.py >> "$TMP/log" 2>&1 &
     BOARD_PID=$!
@@ -3096,6 +3096,104 @@ PY
 )
 check "a negative or junk Content-Length is a 400 on /mcp and on REST, GET and POST" "$NCL" \
   '.mcp==400 and .get==400 and .post==400 and .junk==400'
+
+# HTTP hardening (T-869). Raw sockets: curl will not send these.
+# REST catch-all: an unexpected exception is a bare "internal error", detail only in the log.
+R500=$(api POST /agents '{"project":{"x":1},"harness":"codex","host":"rest-500"}')
+check "a REST 500 is a bare 'internal error' — no repr, no SQL" "$R500" '.error=="internal error"'
+grep -q 'ProgrammingError' "$TMP/log" && ok "... and its details are in the server log" || no "rest 500 log" "$(tail -3 "$TMP/log")"
+HH=$(python3 - "$PORT" "$TOKEN" "$MAT" <<'PY'
+import json, socket, sys, time
+port, tok, mat = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+def talk(raw, wait=3):
+    s = socket.create_connection(("localhost", port), timeout=wait)
+    s.sendall(raw)
+    buf = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d: break           # server closed the connection
+            buf += d
+        closed = True
+    except socket.timeout:
+        closed = False
+    s.close()
+    return buf, closed
+H = "Host: x\r\nAuthorization: Bearer %s\r\n" % tok
+def status(b): return int(b.split()[1]) if b else 0
+out = {}
+# (a) chunked bodies (an HTTP/2 ingress forwards length-less bodies this way). A valid chunked
+# /mcp ping split over two chunks, with an extension and a trailer, then a second request on
+# the SAME connection: both answered 200, no desync.
+def chunked(path, tok_, chunks, extra="", tail=b"0\r\n\r\n"):
+    h = "POST %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n%s\r\n" % (path, tok_, extra)
+    return h.encode() + b"".join(chunks) + tail
+msg = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
+two = [b"%x;ext=1\r\n%s\r\n" % (10, msg[:10]), b"%x\r\n%s\r\n" % (len(msg) - 10, msg[10:])]
+nxt = ("GET /api/v1/status HTTP/1.1\r\n%s\r\n" % H).encode()
+s = socket.create_connection(("localhost", port), timeout=3)
+s.sendall(chunked("/mcp", mat, two, tail=b"0\r\nX-Trailer: 1\r\n\r\n") + nxt)
+buf = b""
+try:
+    while buf.count(b"HTTP/1.1 200") < 2:
+        d = s.recv(65536)
+        if not d: break
+        buf += d
+except socket.timeout:
+    pass
+s.close()
+out["chunked_ok"] = {"ok200": buf.count(b"HTTP/1.1 200"), "pong": b'"result"' in buf}
+b, closed = talk(chunked("/mcp", mat, [b"%x\r\n%s\r\n" % (len(msg), msg)], tail=b"0\r\n\r\n") .replace(b"Transfer-Encoding: chunked", b"Transfer-Encoding: chunked\r\nContent-Length: 5") + nxt)
+out["te_cl"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
+b, closed = talk(chunked("/mcp", mat, [], extra="") .replace(b"chunked", b"gzip") + nxt)
+out["te_gzip"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
+b, closed = talk(chunked("/mcp", mat, [b"zz\r\nhello\r\n"]) + nxt)
+out["bad_chunk"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
+b, closed = talk(chunked("/mcp", mat, [b"5\r\nhelloXX"]) + nxt)
+out["bad_crlf"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
+b, closed = talk(chunked("/mcp", mat, [b"%x\r\n" % (2 << 20)]) + nxt)
+out["big"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
+# strict framing (T-869 review): each of these is a 400 and closes, with no second reply.
+def bad(name, raw, code=400):
+    b, closed = talk(raw + nxt)
+    out[name] = {"ok": status(b) == code and b.count(b"HTTP/1.1 ") == 1 and closed}
+body5 = lambda sz, nl=b"\r\n": [sz + nl + b"hello\r\n"]
+bad("hex0x", chunked("/mcp", mat, body5(b"0x5")))
+bad("tabsize", chunked("/mcp", mat, body5(b"\t5")))
+bad("barelf_size", chunked("/mcp", mat, body5(b"5", b"\n")))
+bad("barelf_data", chunked("/mcp", mat, [b"5\r\nhello\n"]))
+bad("barelf_trailer", chunked("/mcp", mat, [], tail=b"0\r\nX: 1\n\r\n"))
+bad("two_te", chunked("/mcp", mat, [], extra="Transfer-Encoding: gzip\r\n"))
+bad("trailers17", chunked("/mcp", mat, [], tail=b"0\r\n" + b"X: 1\r\n" * 17 + b"\r\n"))
+b, closed = talk(chunked("/mcp", mat, [b"%x\r\n%s\r\n" % (len(msg), msg)], tail=b"0\r\n" + b"X: 1\r\n" * 16 + b"\r\n") + nxt)
+out["trailers16"] = {"ok": b.count(b"HTTP/1.1 200") == 2}
+# (c) Content-Length must be ASCII digits only; two headers are a 400.
+for name, cl in [("plus", "+41"), ("space", " 41 "), ("under", "4_0"), ("arabic", "٤")]:
+    b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sContent-Length: %s\r\n\r\n" % (H, cl)).encode("utf-8"))
+    out[name] = status(b)
+b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sContent-Length: 0\r\nContent-Length: 0\r\n\r\n" % H).encode())
+out["dup"] = {"status": status(b), "closed": closed}
+# (d) headers, a big Content-Length, then silence: the server hangs up by itself (timeout 2 s here).
+t = time.time()
+b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sContent-Length: 1000\r\n\r\n{" % H).encode(), wait=8)
+out["stall"] = {"closed": closed, "secs": round(time.time() - t, 1)}
+print(json.dumps(out))
+PY
+)
+check "a chunked /mcp POST is decoded (extension, trailer) and the next request on the connection works" "$HH" \
+  '.chunked_ok.ok200==2 and .chunked_ok.pong'
+check "Transfer-Encoding with Content-Length is a 400 and closes" "$HH" '.te_cl.status==400 and .te_cl.replies==1 and .te_cl.closed'
+check "Transfer-Encoding: gzip is a 501 and closes" "$HH" '.te_gzip.status==501 and .te_gzip.replies==1 and .te_gzip.closed'
+check "a malformed chunk (bad size, bad CRLF) is a 400 and closes" "$HH" \
+  '.bad_chunk.status==400 and .bad_chunk.replies==1 and .bad_chunk.closed and .bad_crlf.status==400 and .bad_crlf.closed'
+check "an oversized chunked body is a 413 and closes" "$HH" '.big.status==413 and .big.replies==1 and .big.closed'
+check "chunk framing is strict: 0x size, tab, bare LF (size, data, trailer), two TE headers, 17 trailers are 400 + close" "$HH" \
+  '[.hex0x,.tabsize,.barelf_size,.barelf_data,.barelf_trailer,.two_te,.trailers17]|all(.ok)'
+check "16 trailer lines are still accepted" "$HH" '.trailers16.ok'
+check "Content-Length '+41', ' 41 ', '4_0' and a non-ASCII digit are a 400" "$HH" \
+  '.plus==400 and .space==400 and .under==400 and .arabic==400'
+check "two Content-Length headers are a 400 and the connection is closed" "$HH" '.dup.status==400 and .dup.closed'
+check "a stalled client is hung up on by the socket timeout" "$HH" '.stall.closed and .stall.secs<6'
 fi
 
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
