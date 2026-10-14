@@ -148,19 +148,28 @@ def propose(cwd, name):
         m["docs"] = "docs/"
     url = remote(probe)
     if url:
-        # ssh://[user@]host[:port]/org/repo.git | user@host:org/repo.git | https://host/org/repo
-        p = (re.match(r"\w+://(?:[^/@]*@)?([^/:]+)(?::(\d+))?/(.*)$", url)
-             or re.match(r"(?:[^/@]*@)?([^/:]+)():(.*)$", url))
+        # ssh://[user@]host[:port]/org/repo.git | user@host:org/repo.git | https://host[:port]/org/repo
+        # Nothing from userinfo is ever kept: the host is what follows the LAST '@' of the
+        # authority, so an unencoded '@' in a password cannot leave a fragment behind.
+        p = re.match(r"(https?|ssh)://([^/]*)/(.*)$", url)
         if p:
-            host, port, path = p[1], p[2], re.sub(r"(\.git)?/*$", "", p[3])
+            scheme, auth, path = p[1], p[2].rsplit("@", 1)[-1], p[3]
+            host, _, port = auth.partition(":")
+        else:
+            q2 = re.match(r"(?:.*@)?([^/:@]+):(?!//)(.*)$", url) if "://" not in url else None
+            scheme, host, port, path = ("ssh", q2[1], "", q2[2]) if q2 else (None, "", "", "")
+        if scheme and host:
+            path = re.sub(r"(\.git)?/*$", "", path)
             kind = "github" if "github.com" in host else "gitlab" if "gitlab" in host else "forgejo"
-            m["forge"] = {"kind": kind, "url": "https://" + host}
-            if port and url.startswith("ssh://"):
+            m["forge"] = {"kind": kind, "url": "%s://%s%s" % (
+                scheme if scheme != "ssh" else "https", host,
+                ":" + port if port and scheme != "ssh" else "")}
+            if port.isdigit() and scheme == "ssh":
                 m["forge"]["ssh_port"] = int(port)
             org, _, name = path.rpartition("/")
             if org:
                 m["forge"]["org"] = org
-                key = m["project"] if repos[0] == "." else repos[0] if repos else None
+                key = (m["project"] if repos[0] == "." else repos[0]) if repos else None
                 if key and name != key:
                     m["forge"]["repos"] = {key: org + "/" + name}
     return m, repos

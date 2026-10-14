@@ -1586,12 +1586,43 @@ check "repo_info gitlab without ssh_port keeps scp-style ssh_url" "$(api GET /ta
   '.repo_info.ssh_url=="git@gitlab.com:grp/sub/forgegl.git"'
 check "repo_info gitlab: repos [.] uses the project name, nested group kept" "$(api GET /tasks/$FT)" \
   '.repo_info.forge_kind=="gitlab" and .repo_info.clone_url=="https://gitlab.com/grp/sub/forgegl.git"'
-check "repo_info is null when the manifest has no forge" "$(api GET /tasks/$TID)" '.repo_info==null'
+check "repo_info key is present and null when the manifest has no forge" "$(api GET /tasks/$TID)" \
+  'has("repo_info") and .repo_info==null'
+mkproj() { api POST /projects "{\"project\":\"$1\",\"phase\":\"build\",\"manifest\":$2}" >/dev/null
+  api POST /tasks "{\"agent\":\"$CLIID\",\"project\":\"$1\",\"title\":\"forge\"}" | jq -r .id; }
+FT=$(mkproj forgegh '{"project":"forgegh","repos":["."],"forge":{"kind":"github","url":"https://github.com","org":"knobo"}}')
+check "repo_info github" "$(api GET /tasks/$FT)" \
+  '.repo_info.forge_kind=="github" and .repo_info.clone_url=="https://github.com/knobo/forgegh.git" and .repo_info.ssh_url=="git@github.com:knobo/forgegh.git"'
+FT=$(mkproj forgebad1 '{"project":"forgebad1","forge":"https://github.com"}')
+check "malformed forge (string): task show is 200 with repo_info null" "$(api GET /tasks/$FT)" 'has("repo_info") and .repo_info==null and .id'
+FT=$(mkproj forgebad2 '{"project":"forgebad2","forge":{"kind":"github","url":"https://github.com","org":"o","repos":["a"]},"repos":"x"}')
+check "malformed forge.repos (list): task show survives" "$(api GET /tasks/$FT)" '.id and (.repo_info|type)!="string"'
+FT=$(mkproj forgecred '{"project":"forgecred","forge":{"kind":"forgejo","url":"https://u:tok@git.x.no:8443","org":"o","ssh_port":2200}}')
+R=$(api GET /tasks/$FT)
+check "userinfo in forge.url leaks nowhere in repo_info, port kept" "$R" \
+  '(.repo_info|tostring|test("tok|u:")|not) and .repo_info.clone_url=="https://git.x.no:8443/o/forgecred.git" and .repo_info.ssh_url=="ssh://git@git.x.no:2200/o/forgecred.git"'
+FT=$(mkproj forgebadport '{"project":"forgebadport","forge":{"kind":"forgejo","url":"https://git.x.no","org":"o","ssh_port":99999}}')
+check "bad ssh_port omits ssh_url" "$(api GET /tasks/$FT)" '.repo_info.web_url and (.repo_info|has("ssh_url")|not)'
+FT=$(mkproj forgebadorg '{"project":"forgebadorg","forge":{"kind":"forgejo","url":"https://git.x.no","org":"--upload-pack=x"}}')
+check "org starting with - gives null" "$(api GET /tasks/$FT)" '.repo_info==null'
+FT=$(mkproj forgedots '{"project":"forgedots","forge":{"kind":"forgejo","url":"https://git.x.no","org":"a/../b"}}')
+check "org with .. gives null" "$(api GET /tasks/$FT)" '.repo_info==null'
+FT=$(api POST /tasks "{\"agent\":\"$CLIID\",\"project\":\"forgetest\",\"title\":\"no repo\"}" | jq -r .id)
+check "several repos and none named: repo_info is null" "$(api GET /tasks/$FT)" '.repo_info==null'
+check "status carries per-project repos with repo_info" "$(api GET '/status?project=forgetest')" \
+  '(.projects[0].repos|map(.repo)|sort)==["fj","gh","gl","web"] and (.projects[0].repos[]|select(.repo=="fj")|.clone_url)=="https://git.knobo.no/knobo/fj.git"'
 # T-861: `board project init` derives org (+ repo override, ssh port) from the origin remote.
 PROPOSED=$(for u in ssh://git@git.knobo.no:2222/knobo/claude-skills.git git@gitlab.com:grp/sub/x.git https://github.com/knobo/x; do
   rm -rf "$TMP/pr"; git init -q "$TMP/pr"; git -C "$TMP/pr" remote add origin "$u"
   python3 -c "import sys,json;sys.path.insert(0,'bin');import manifest;print(json.dumps(manifest.propose(sys.argv[1],'x')[0]['forge']))" "$TMP/pr"
 done | jq -s .)
+PWD_FORGE=$(rm -rf "$TMP/pr"; git init -q "$TMP/pr"; git -C "$TMP/pr" remote add origin 'https://user:p@ss@git.x.no:8443/o/r.git'
+  python3 -c "import sys,json;sys.path.insert(0,'bin');import manifest;print(json.dumps(manifest.propose(sys.argv[1],'x')[0]['forge']))" "$TMP/pr")
+check "project init: '@' in a password leaves no userinfo, keeps scheme and port" "$PWD_FORGE" \
+  '.url=="https://git.x.no:8443" and .org=="o" and (tostring|test("ss|user")|not)'
+FILE_FORGE=$(rm -rf "$TMP/pr"; git init -q "$TMP/pr"; git -C "$TMP/pr" remote add origin 'file:///srv/git/x.git'
+  python3 -c "import sys,json;sys.path.insert(0,'bin');import manifest;print(json.dumps(manifest.propose(sys.argv[1],'x')[0].get('forge')))" "$TMP/pr")
+check "project init: file:// remote gives no forge block" "$FILE_FORGE" '.==null'
 check "project init derives org, repo override and ssh port from the three remote shapes" "$PROPOSED" \
   '.[0]=={kind:"forgejo",url:"https://git.knobo.no",ssh_port:2222,org:"knobo",repos:{x:"knobo/claude-skills"}} and .[1]=={kind:"gitlab",url:"https://gitlab.com",org:"grp/sub"} and .[2]=={kind:"github",url:"https://github.com",org:"knobo"}'
 check "task create without --project" "$(cli task create --title "cli task" --repo web)" '.id'
