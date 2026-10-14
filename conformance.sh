@@ -78,7 +78,7 @@ JSON
     NTFY_LOG="$TMP/ntfy" NTFY_PORT="$NTFY_PORT" \
     BOARD_DB="$TMP/board.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" BOARD_HUMAN="human" BOARD_POLICY="$TMP/policy.json" \
     FORGE_TOKEN="forge-secret-T865" FORGE_TOKEN_HOST="git.example.test" \
-      BOARD_PORT="$PORT" BOARD_BASE_URL="http://localhost:$PORT" BOARD_REAP_INTERVAL="$1" \
+      BOARD_PORT="$PORT" BOARD_BASE_URL="http://localhost:$PORT" BOARD_REAP_INTERVAL="$1" BOARD_SOCKET_TIMEOUT=2 \
       NTFY_URL="http://127.0.0.1:$NTFY_PORT/board" \
       python3 board.py >> "$TMP/log" 2>&1 &
     BOARD_PID=$!
@@ -3096,6 +3096,55 @@ PY
 )
 check "a negative or junk Content-Length is a 400 on /mcp and on REST, GET and POST" "$NCL" \
   '.mcp==400 and .get==400 and .post==400 and .junk==400'
+
+# HTTP hardening (T-869). Raw sockets: curl will not send these.
+# REST catch-all: an unexpected exception is a bare "internal error", detail only in the log.
+R500=$(api POST /agents '{"project":{"x":1},"harness":"codex","host":"rest-500"}')
+check "a REST 500 is a bare 'internal error' — no repr, no SQL" "$R500" '.error=="internal error"'
+grep -q 'ProgrammingError' "$TMP/log" && ok "... and its details are in the server log" || no "rest 500 log" "$(tail -3 "$TMP/log")"
+HH=$(python3 - "$PORT" "$TOKEN" <<'PY'
+import json, socket, sys, time
+port, tok = int(sys.argv[1]), sys.argv[2]
+def talk(raw, wait=3):
+    s = socket.create_connection(("localhost", port), timeout=wait)
+    s.sendall(raw)
+    buf = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d: break           # server closed the connection
+            buf += d
+        closed = True
+    except socket.timeout:
+        closed = False
+    s.close()
+    return buf, closed
+H = "Host: x\r\nAuthorization: Bearer %s\r\n" % tok
+def status(b): return int(b.split()[1]) if b else 0
+out = {}
+# (a) chunked POST, then a valid request on the same connection: one reply, then closed.
+b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sTransfer-Encoding: chunked\r\n\r\n"
+                  "5\r\nhello\r\n0\r\n\r\nGET /api/v1/status HTTP/1.1\r\n%s\r\n" % (H, H)).encode())
+out["te"] = {"status": status(b), "replies": b.count(b"HTTP/1.1 "), "closed": closed}
+# (c) Content-Length must be ASCII digits only; two headers are a 400.
+for name, cl in [("plus", "+41"), ("space", " 41 "), ("under", "4_0"), ("arabic", "٤")]:
+    b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sContent-Length: %s\r\n\r\n" % (H, cl)).encode("utf-8"))
+    out[name] = status(b)
+b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sContent-Length: 0\r\nContent-Length: 0\r\n\r\n" % H).encode())
+out["dup"] = {"status": status(b), "closed": closed}
+# (d) headers, a big Content-Length, then silence: the server hangs up by itself (timeout 2 s here).
+t = time.time()
+b, closed = talk(("POST /api/v1/questions HTTP/1.1\r\n%sContent-Length: 1000\r\n\r\n{" % H).encode(), wait=8)
+out["stall"] = {"closed": closed, "secs": round(time.time() - t, 1)}
+print(json.dumps(out))
+PY
+)
+check "Transfer-Encoding is refused (411, not run as an empty-body request), once, and the connection is closed" "$HH" \
+  '.te.status==411 and .te.replies==1 and .te.closed'
+check "Content-Length '+41', ' 41 ', '4_0' and a non-ASCII digit are a 400" "$HH" \
+  '.plus==400 and .space==400 and .under==400 and .arabic==400'
+check "two Content-Length headers are a 400 and the connection is closed" "$HH" '.dup.status==400 and .dup.closed'
+check "a stalled client is hung up on by the socket timeout" "$HH" '.stall.closed and .stall.secs<6'
 fi
 
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"

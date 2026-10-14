@@ -5406,6 +5406,9 @@ def tool_result(r, is_error=False):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "board/0"
+    # A client that sends headers and stalls (or a big Content-Length and no body) would
+    # hold a thread forever. Env-overridable so conformance can test it in seconds.
+    timeout = float(os.environ.get("BOARD_SOCKET_TIMEOUT", "30"))
 
     def log_message(self, fmt, *a):
         # Simplification: the query string is stripped from the log — it can contain
@@ -5459,7 +5462,8 @@ class Handler(BaseHTTPRequestHandler):
         instead of draining: draining would read a body an unauthenticated client sent."""
         super().send_response(code, message)
         h = getattr(self, "headers", None) or {}      # send_error can come before headers
-        unread = (h.get("Content-Length") or "0") != "0" or h.get("Transfer-Encoding")
+        unread = (h.get("Content-Length") or "0") != "0" or h.get("Transfer-Encoding") \
+            or (hasattr(h, "get_all") and len(h.get_all("Content-Length") or []) > 1)
         if unread and not getattr(self, "body_read", False):
             self.send_header("Connection", "close")
             self.close_connection = True
@@ -5491,10 +5495,17 @@ class Handler(BaseHTTPRequestHandler):
     MAX_BODY = 1 << 20                     # 1 MiB. Without a limit a 500 MB Content-Length is an OOM.
 
     def body(self):
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            n = -1
+        # Chunked is not implemented: the chunk bytes would stay on the keep-alive socket
+        # and be parsed as the next request. Refuse, and close (send_response sees the
+        # unread Transfer-Encoding and adds Connection: close).
+        if self.headers.get("Transfer-Encoding"):
+            raise Err(411, "Transfer-Encoding is not supported; send Content-Length")
+        cls = self.headers.get_all("Content-Length") or []
+        if len(cls) > 1:
+            raise Err(400, "multiple Content-Length headers")
+        cl = cls[0] if cls else "0"
+        # int() accepts '+41', ' 41 ' and '4_0'; ASCII digits only (isdigit() takes unicode).
+        n = int(cl) if cl.isascii() and cl.isdigit() else -1
         if n < 0:                          # rfile.read(-1) would block until the client hangs up
             raise Err(400, "invalid Content-Length")
         if n > self.MAX_BODY:
@@ -5548,7 +5559,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(400, {"error": "missing parameter %s" % e})
         except Exception as e:
             self.log_message("500 %r", e)
-            return self.send(500, {"error": repr(e)})
+            return self.send(500, {"error": "internal error"})
         if r is None:
             return
         if isinstance(r, str):
