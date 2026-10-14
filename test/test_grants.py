@@ -208,16 +208,17 @@ class TestGrants(unittest.TestCase):
         # Human: add-grant form and pause button visible
         html_human = board.html_status("demo", token="human-token", human=True)
         self.assertIn(f"action='/agents/{aid}/grants'", html_human)
-        self.assertIn(f"grants-list-{aid}", html_human)
+        self.assertIn("chip chip-off' aria-pressed='false' title='give merge'", html_human)
         self.assertIn("action='/projects/demo/pause'", html_human)
-        self.assertIn("⏸ pause", html_human)
+        self.assertIn(">Pause<", html_human)
 
         # 2. Form POST to add grant with agent-token (non-human) -> 403 Forbidden
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
                                                {"grant": "merge", "project": "demo"},
                                                token="agent-token")
         self.assertEqual(status, 403)
-        self.assertIn("needs_human_token", body)
+        self.assertIn("text/html", hdrs.get("Content-Type", ""))
+        self.assertNotIn("needs_human_token", body)  # a page for a person, not the API's JSON
 
         # 3. Form POST to add grant with human-token -> 302 Redirect to /status?project=demo
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
@@ -228,20 +229,21 @@ class TestGrants(unittest.TestCase):
 
         # Verify grant is now present in html_status for both non-human and human
         html_nh = board.html_status("demo", token="agent-token", human=False)
-        self.assertIn("<span class='badge badge-sm badge-outline font-mono'>merge</span>", html_nh)
+        self.assertIn("<span class='chip chip-on'>merge</span>", html_nh)
         self.assertNotIn(f"/agents/{aid}/grants/revoke", html_nh)
 
         html_h = board.html_status("demo", token="human-token", human=True)
         self.assertIn(f"action='/agents/{aid}/grants/revoke'", html_h)
         self.assertIn("value='merge'", html_h)
-        self.assertIn("Trekk tilbake grant", html_h)
+        self.assertIn("take back merge", html_h)
 
         # 4. Form POST to revoke grant with agent-token (non-human) -> 403 Forbidden
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants/revoke",
                                                {"grant": "merge", "project": "demo"},
                                                token="agent-token")
         self.assertEqual(status, 403)
-        self.assertIn("needs_human_token", body)
+        self.assertIn("text/html", hdrs.get("Content-Type", ""))
+        self.assertNotIn("needs_human_token", body)  # a page for a person, not the API's JSON
 
         # 5. Form POST to revoke grant with human-token -> 302 Redirect to /status?project=demo
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants/revoke",
@@ -264,7 +266,7 @@ class TestGrants(unittest.TestCase):
         # Verify project is paused and resume button is rendered in human view
         html_paused = board.html_status("demo", token="human-token", human=True)
         self.assertIn("action='/projects/demo/resume'", html_paused)
-        self.assertIn("▶ gjenoppta", html_paused)
+        self.assertIn(">Resume<", html_paused)
 
         # 7. Form POST to resume project -> 302 Redirect
         status, hdrs, body = self.form_request("POST", "/projects/demo/resume",
