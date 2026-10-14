@@ -849,7 +849,8 @@ def repo_info(manifest, repo, project):
     host = re.sub(r"^\w+://", "", url).split("/")[0]
     web = "%s/%s" % (url, path)
     return {"forge_kind": kind, "web_url": web, "clone_url": web + ".git",
-            "ssh_url": "git@%s:%s.git" % (host, path),
+            "ssh_url": ("ssh://git@%s:%s/%s.git" % (host, forge["ssh_port"], path)
+                        if forge.get("ssh_port") else "git@%s:%s.git" % (host, path)),
             "default_branch": ov.get("default_branch") or forge.get("default_branch") or "main"}
 
 

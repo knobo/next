@@ -10,6 +10,7 @@ works offline (K6).
   manifest.py --sh       shell eval: ROOT, PROJECT, PHASE, ENTRY, REPOS, ...
   manifest.py --init <name>   write a minimal manifest in cwd
 """
+import re
 import json, os, subprocess, sys
 
 import yaml
@@ -150,6 +151,9 @@ def propose(cwd, name):
         host = url.split("@")[-1].split(":")[0].replace("https://", "").split("/")[0]
         kind = "github" if "github.com" in url else "gitlab" if "gitlab" in host else "forgejo"
         m["forge"] = {"kind": kind, "url": "https://" + host}
+        port = re.match(r"ssh://[^/@]*@?[^/:]+:(\d+)/", url)
+        if port:
+            m["forge"]["ssh_port"] = int(port[1])
     return m, repos
 
 

@@ -16,7 +16,8 @@ onboarding: README.md
 forge:
   # kind: forgejo | github | gitlab. `board task pr` uses `tea` for forgejo and `gh` for github
   # (gitlab: repo info only, no PR/CI). Optional `repos: {name: org/path}` and `default_branch`
-  # override the <url>/<org>/<repo> default; `board task show --json` exposes repo_info.
+  # override the <url>/<org>/<repo> default; `ssh_port` makes ssh_url ssh://git@host:port/...;
+  # `board task show --json` exposes repo_info.
   kind: github
   url: https://github.com
   org: knobo
