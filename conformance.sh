@@ -2807,6 +2807,29 @@ for HC in "POST /questions {\"agent\":\"$BOARD_HUMAN\",\"project\":\"demo\",\"te
 done
 [ "$(tok "$PT" POST /agents/cleanup '{"project":"demo"}')" = 403 ] \
   && ok "the token can NOT run agents cleanup (it orphans other agents' tasks)" || no "token cleanup" ""
+[ "$(tok "$PT" POST /tasks/cleanup '{"all":true}')" = 403 ] \
+  && ok "the token can NOT run tasks cleanup (it archives across projects, T-862)" || no "token tasks cleanup" ""
+check "the shared BOARD_TOKEN still runs tasks cleanup" "$(api POST /tasks/cleanup '{"project":"tokproj"}')" '.ok'
+for PR in pause resume; do
+  [ "$(tok "$PT" POST "/projects/demo/$PR" '{"note":"anon"}')" = 403 ] \
+    && ok "the token can NOT $PR without naming an agent (no HUMAN default, T-862)" || no "anonymous token $PR" ""
+  [ "$(tok "$PT" POST "/projects/demo/$PR" "{\"by\":\"$BOARD_HUMAN\"}")" = 403 ] \
+    && ok "the token can NOT $PR as the human" || no "token $PR as human" ""
+done
+[ "$(api POST /projects/demo/pause '{"note":"anon"}' | jq -r .needs_human_token)" = true ] \
+  && ok "the shared token can NOT pause without naming an agent either" || no "shared anonymous pause" ""
+check "the token pauses under its own agent" "$(curl -sS -m 5 -X POST -H "Authorization: Bearer $PT" \
+  -H 'Content-Type: application/json' -d "{\"by\":\"$TAID\",\"note\":\"own\"}" "$BOARD_URL/api/v1/projects/demo/pause")" \
+  '.paused=="'"$TAID"': own"'
+[ "$(tok "$PT" POST /projects/demo/resume "{\"agent\":\"$TAID\"}")" = 200 ] \
+  && ok "the token resumes under its own agent" || no "own resume" ""
+check "the human token still pauses as the human without naming anyone" \
+  "$(hum POST /projects/demo/pause '{"note":"h"}')" '.paused=="'"$BOARD_HUMAN"': h"'
+hum POST /projects/demo/resume '{}' >/dev/null
+tok "$PT" POST /projects '{"project":"tokproj","phase":"build","manifest":{"project":"tokproj"}}' >/dev/null
+check "a manifest sent with a per-agent token logs phase_set under the token, not the human (T-862)" \
+  "$(api GET "/events?stream=project&project=tokproj")" \
+  '[.events[]|select(.type=="project.phase_set")|.actor]|length>0 and all(. != "'"$BOARD_HUMAN"'")'
 [ "$(tok "$PT" POST "/tokens/$PTID/revoke" '{}')" = 403 ] \
   && ok "an agent token can NOT revoke tokens" || no "agent revoke" ""
 check "the human token revokes" "$(hum POST "/tokens/$PTID/revoke" '{}')" '.revoked'

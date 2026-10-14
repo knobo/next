@@ -723,9 +723,11 @@ def token_identity_check(pattern, method, path, b, q):
         if not row or not fnmatch.fnmatchcase("%s@%s" % (row["harness"], row["host"]), pattern):
             bad(aid)
 
-    # agents cleanup orphans OTHER agents' tasks — fleet maintenance, not this agent's.
-    if re.match("^(%s)?/agents/cleanup$" % re.escape(API), path):
-        bad("the fleet (agents cleanup)")
+    # agents cleanup orphans OTHER agents' tasks, tasks cleanup archives across projects —
+    # fleet maintenance, not this agent's (T-862).
+    m = re.match("^(%s)?/(agents|tasks)/cleanup$" % re.escape(API), path)
+    if m:
+        bad("the fleet (%s cleanup)" % m.group(2))
     b = b if isinstance(b, dict) else {}
     ids = {x for x in (b.get("agent"), b.get("by"), q.get("agent", [None])[0], q.get("by", [None])[0])
            if isinstance(x, str)}
@@ -781,7 +783,7 @@ def register(b):
     return {"id": aid, "grants": all_g, "project": project}
 
 
-def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=None):
+def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=None, actor=HUMAN):
     if phase and phase not in PHASES:
         raise Err(400, "unknown phase %r (%s)" % (phase, "|".join(PHASES)))
     row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
@@ -817,7 +819,7 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
                            (name, r_id, title, spec, interval, deadline, repo, priority, role, "open"))
                    
 
-        ev(name, "project", "project.phase_set", HUMAN, phase=phase)
+        ev(name, "project", "project.phase_set", actor, phase=phase)
     if goal or manifest:
         db.execute("UPDATE projects SET goal=COALESCE(?,goal), manifest=COALESCE(?,manifest),"
                    " manifest_host=COALESCE(?,manifest_host), manifest_path=COALESCE(?,manifest_path),"
@@ -4627,7 +4629,9 @@ ROUTES = [
     ("POST",   r"/agents/([^/]+)/finished$",    lambda h, m, b, q: finished(m[0], b)),
     ("GET",    r"/agents/([^/]+)/inbox$",       lambda h, m, b, q: inbox(m[0], q)),
     ("POST",   r"/projects$",                   lambda h, m, b, q: dict(ensure_project(
-        b["project"], b.get("phase"), b.get("goal"), b.get("manifest"), b.get("host"), b.get("path")))),
+        b["project"], b.get("phase"), b.get("goal"), b.get("manifest"), b.get("host"), b.get("path"),
+        # A per-agent token is not the owner: log its agent, or its pattern before it has one (T-862).
+        (b.get("agent") or h.agent_pattern) if getattr(h, "agent_pattern", None) else HUMAN))),
     ("POST",   r"/tasks$",                      lambda h, m, b, q: task_create(b, actor_h(q, b))),
     ("GET",    r"/tasks/next$",                 lambda h, m, b, q: task_next(q["agent"][0], q)),
         ("GET",    r"/routines$",                   lambda h, m, b, q: routine_list(q)),
@@ -4811,7 +4815,11 @@ def human_only(b, what):
 
 def set_paused(project, b, on):
     ensure_project(project)
-    who = b.get("by") or b.get("agent") or HUMAN
+    # HUMAN only with the human token; anyone else names an agent (T-862).
+    who = b.get("by") or b.get("agent")
+    if not who:
+        human_only(b, "pausing or resuming without naming an agent")
+        who = HUMAN
     val = ("%s: %s" % (who, b.get("note") or "paused")) if on else None
     db.execute("UPDATE projects SET paused=?, updated=? WHERE name=?", (val, now(), project))
     ev(project, "project", "project.paused" if on else "project.resumed", who, note=b.get("note"))
