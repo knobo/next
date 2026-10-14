@@ -202,12 +202,18 @@ offline() {  # the board is not answering
     /agents/*/grants*) echo '{"error":"board down — grant/revoke is never queued"}' >&2; return 1;;
     /tokens*) echo '{"error":"board down — token issue/revoke is never queued"}' >&2; return 1;;
   esac
-  jq -nc --arg m "$method" --arg p "$path" --arg d "$data" '{method:$m,path:$p,body:$d}' >> "$OUTBOX"
+  jq -nc --arg m "$method" --arg p "$path" --arg d "$data" --arg f "$(token_fp)" \
+    '{method:$m,path:$p,body:$d,fp:$f}' >> "$OUTBOX"
   echo '{"queued":true}'
 }
 
+# Whose write it is. A queued call is replayed with the token of whoever flushes, so an
+# entry is flushed only under the token that queued it — otherwise agent A's write goes
+# out as agent B (403, dropped) or as the human (T-858). The rest wait in the outbox.
+token_fp() { printf '%s' "$BOARD_TOKEN" | sha256sum | cut -c1-8; }
+
 flush_outbox() {
-  local tmp="$OUTBOX.flushing"
+  local tmp="$OUTBOX.flushing" myfp; myfp=$(token_fp)
   # An interrupted flush used to leave a .flushing behind that was never read again — lost writes.
   [ -s "$tmp" ] && { cat "$tmp" "$OUTBOX" 2>/dev/null > "$OUTBOX.merge"; mv "$OUTBOX.merge" "$OUTBOX"; rm -f "$tmp"; }
   [ -s "$OUTBOX" ] || return 0
@@ -216,9 +222,12 @@ flush_outbox() {
   exec 9>"$OUTBOX.lock"
   flock -n 9 || return 0
   mv "$OUTBOX" "$tmp" 2>/dev/null || { flock -u 9; return 0; }
-  local m p d code
+  local m p d f code
   while read -r line; do
     [ -n "$line" ] || continue
+    # No fp = queued before T-858, when there was only the shared token: replay as before.
+    f=$(jq -r '.fp // empty' <<<"$line")
+    [ -n "$f" ] && [ "$f" != "$myfp" ] && { echo "$line" >> "$OUTBOX"; continue; }
     m=$(jq -r .method <<<"$line"); p=$(jq -r .path <<<"$line"); d=$(jq -r .body <<<"$line")
     code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X "$m" \
       -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \

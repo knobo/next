@@ -2719,12 +2719,35 @@ TAID=$(jq -r .id <<<"$TR")
   && ok "the token can NOT put another agent's id in the body" || no "foreign agent in body" ""
 [ "$(tok "$PT" POST /questions "{\"agent\":\"$TAID\",\"project\":\"demo\",\"text\":\"mine?\"}")" = 200 ] \
   && ok "the token can ask under its own agent id" || no "own question" ""
+for HC in "POST /questions {\"agent\":\"$BOARD_HUMAN\",\"project\":\"demo\",\"text\":\"as owner?\"}" \
+          "POST /tasks {\"agent\":\"$BOARD_HUMAN\",\"project\":\"demo\",\"title\":\"as owner\"}" \
+          "PATCH /tasks/$CT {\"agent\":\"$BOARD_HUMAN\",\"risk\":\"low\"}" \
+          "POST /tasks {\"by\":\"$BOARD_HUMAN\",\"agent\":\"$TAID\",\"project\":\"demo\",\"title\":\"by owner\"}"; do
+  read -r HM HP HB <<<"$HC"
+  [ "$(tok "$PT" "$HM" "$HP" "$HB")" = 403 ] \
+    && ok "the token can NOT act as the human ($HM $HP)" || no "token acts as the human: $HM $HP" ""
+done
+[ "$(tok "$PT" POST /agents/cleanup '{"project":"demo"}')" = 403 ] \
+  && ok "the token can NOT run agents cleanup (it orphans other agents' tasks)" || no "token cleanup" ""
 [ "$(tok "$PT" POST "/tokens/$PTID/revoke" '{}')" = 403 ] \
   && ok "an agent token can NOT revoke tokens" || no "agent revoke" ""
 check "the human token revokes" "$(hum POST "/tokens/$PTID/revoke" '{}')" '.revoked'
 [ "$(tok "$PT" GET /status)" = 401 ] && ok "a revoked token is a 401" || no "revoked still works" ""
 [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BOARD_URL/api/v1/status")" = 200 ] \
   && ok "the shared BOARD_TOKEN still works" || no "shared token broken" ""
+# The outbox replays only entries queued under the current token; others stay put.
+OBC="$TMP/ob-cache/$(printf '%s' "${BOARD_URL#*://}" | tr -c 'A-Za-z0-9._-' '_')"; mkdir -p "$OBC/cache"
+MYFP=$(printf '%s' "$TOKEN" | sha256sum | cut -c1-8)
+{ jq -nc --arg a "$AID" --arg f "$MYFP" '{method:"POST",path:"/questions",fp:$f,
+    body:({agent:$a,project:"demo",text:"ob-mine"}|tojson)}'
+  jq -nc --arg a "$AID" '{method:"POST",path:"/questions",fp:"0badf00d",
+    body:({agent:$a,project:"demo",text:"ob-theirs"}|tojson)}'; } > "$OBC/outbox.jsonl"
+BOARD_CACHE="$TMP/ob-cache" cli status --json >/dev/null
+OBQ=$(api GET /questions)
+jq -e '[.questions[].text] | (index("ob-mine") != null) and (index("ob-theirs") == null)' >/dev/null <<<"$OBQ" \
+  && [ "$(jq -r .body "$OBC/outbox.jsonl" 2>/dev/null | jq -r .text)" = ob-theirs ] \
+  && ok "the outbox flushes only this token's entries, and keeps the others" \
+  || no "outbox token fingerprint" "$(cat "$OBC/outbox.jsonl" 2>/dev/null)"
 fi
 
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"

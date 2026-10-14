@@ -723,6 +723,9 @@ def token_identity_check(pattern, method, path, b, q):
         if not row or not fnmatch.fnmatchcase("%s@%s" % (row["harness"], row["host"]), pattern):
             bad(aid)
 
+    # agents cleanup orphans OTHER agents' tasks — fleet maintenance, not this agent's.
+    if re.match("^(%s)?/agents/cleanup$" % re.escape(API), path):
+        bad("the fleet (agents cleanup)")
     b = b if isinstance(b, dict) else {}
     ids = {x for x in (b.get("agent"), b.get("by"), q.get("agent", [None])[0], q.get("by", [None])[0])
            if isinstance(x, str)}
@@ -737,7 +740,9 @@ def token_identity_check(pattern, method, path, b, q):
     m = re.match("^" + API + r"/agents/([^/]+)/", path)
     if m:
         ids.add(m.group(1))
-    for a in ids - {"", HUMAN}:
+    # HUMAN is not exempt: it is no agent row, so naming it is a 403 — a per-agent token
+    # must not forge the owner's authorship or slip past owner guards as the human.
+    for a in ids - {""}:
         check_agent(a)
 
 
@@ -5232,15 +5237,15 @@ class Handler(BaseHTTPRequestHandler):
             return True
         # A per-agent token (T-858): looked up by hash, so the stored value is useless
         # to whoever reads the database. Revoked = 401, same as a wrong token.
-        if given:
+        if given.startswith("bat_"):
             with LOCK:
                 row = db.execute("SELECT pattern, revoked FROM agent_tokens WHERE hash=?",
                                  (token_hash(given),)).fetchone()
-            if row:
-                if row["revoked"]:
-                    return False
+            if row and not row["revoked"]:
                 self.agent_pattern = row["pattern"]
                 return True
+            time.sleep(0.5)          # outside LOCK: a wrong guess must not stall the board
+            return False
         if not TOKEN:
             return True
         ok = hmac.compare_digest(given, TOKEN)
