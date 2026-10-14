@@ -5408,7 +5408,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "board/0"
     # A client that sends headers and stalls (or a big Content-Length and no body) would
     # hold a thread forever. Env-overridable so conformance can test it in seconds.
-    timeout = float(os.environ.get("BOARD_SOCKET_TIMEOUT", "30"))
+    # Default 120 s sits above Traefik's 90 s idle upstream keep-alive, so the proxy closes first (a 30 s close races a request sent in that instant: 502).
+    timeout = float(os.environ.get("BOARD_SOCKET_TIMEOUT", "120"))
 
     def log_message(self, fmt, *a):
         # Simplification: the query string is stripped from the log — it can contain
