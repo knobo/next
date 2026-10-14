@@ -200,6 +200,7 @@ offline() {  # the board is not answering
   case "$path" in
     /roles/*/claim) echo '{"error":"board down — a role claim is never queued (DESIGN §3.8)"}' >&2; return 1;;
     /agents/*/grants*) echo '{"error":"board down — grant/revoke is never queued"}' >&2; return 1;;
+    /tokens*) echo '{"error":"board down — token issue/revoke is never queued"}' >&2; return 1;;
   esac
   jq -nc --arg m "$method" --arg p "$path" --arg d "$data" '{method:$m,path:$p,body:$d}' >> "$OUTBOX"
   echo '{"queued":true}'
@@ -276,6 +277,7 @@ finished::board finished::Mark this agent's session finished.
 inbox::board inbox [--as <role>]::List this agent's pending questions and messages.
 grant::board grant <agent> <grant> [--project <p>] [--json]::Grant a capability to an agent.
 revoke::board revoke <agent> <grant> [--project <p>] [--json]::Revoke a capability from an agent.
+token|tokens::board token issue <harness@host-glob> [--note <n>] | list | revoke <id>::Per-agent tokens bound to an identity (human token).
 grants::board grants [agent] [--project <p>] [--json]::List an agent's grants.
 agent|agents::board agent cleanup [--older-than <dur>] [--project <p>] [--all]::Agent maintenance (cleanup dead agents).
 project::board project detect|show|init|sync|set::Project manifest operations.
@@ -519,6 +521,19 @@ grants)
   r=$(req GET "/agents/$aid/grants${proj:+?project=$proj}") || { echo "$r"; exit 1; }
   jq -e '.json' >/dev/null <<<"$b" && { echo "$r"; exit 0; }
   jq -r '"\(.id) (\(.project)): " + (.grants | join(" "))' <<<"$r" ;;
+
+token|tokens)
+  # Per-agent tokens (T-858). Human token only — the board refuses an agent's call.
+  # The token is printed once, at issue; the board keeps only its hash.
+  sub="${1:-}"; shift || true; parse "$@"; b=$(body)
+  case "$sub" in
+    issue)  [ -n "${POS[0]:-}" ] || die "board token issue <harness@host-glob> [--note <n>]"
+            req POST /tokens "$(jq -c --arg p "${POS[0]}" '{pattern:$p, note:.note}' <<<"$b")" ;;
+    list)   req GET /tokens ;;
+    revoke) [ -n "${POS[0]:-}" ] || die "board token revoke <id>"
+            req POST "/tokens/${POS[0]}/revoke" '{}' ;;
+    *) die "board token issue <harness@host-glob> [--note <n>] | list | revoke <id>" ;;
+  esac ;;
 
 agent|agents)
   sub="${1:-}"; shift || true; parse "$@"
