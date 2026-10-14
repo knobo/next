@@ -2782,6 +2782,31 @@ R=$(mcp "$TOKEN" '{"jsonrpc":"2.0","method":"notifications/initialized"}')
 [ "$(code "$R")" = 202 ] && [ -z "$(body "$R")" ] && ok "a notification is 202 with no body" || no "mcp notification" "$R"
 [ "$(code "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'MCP-Protocol-Version: 2099-01-01')")" = 400 ] \
   && ok "an unsupported MCP-Protocol-Version header is a 400" || no "mcp version header" ""
+# Claude Code's real opening (T-859): a 2026-07-28 server/discover probe, then — on the SAME
+# keep-alive connection — initialize. The probe is refused before its body is read; if that
+# body stays on the socket, it is parsed as the next request line and initialize dies as
+# "Bad request syntax". http.client reconnects on its own when the server closes, so this
+# passes either by the server draining or by it closing — never by leaving the body behind.
+KA=$(python3 - "$PORT" "$TOKEN" <<'PY'
+import http.client, json, sys
+c = http.client.HTTPConnection("localhost", int(sys.argv[1]), timeout=5)
+h = {"Authorization": "Bearer " + sys.argv[2], "Content-Type": "application/json",
+     "Accept": "application/json, text/event-stream"}
+probe = {"jsonrpc": "2.0", "id": "p", "method": "server/discover",
+         "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}
+c.request("POST", "/mcp", json.dumps(probe), dict(h, **{"MCP-Protocol-Version": "2026-07-28"}))
+r1 = c.getresponse(); b1 = r1.read()
+c.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+          "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "c", "version": "1"}}}), h)
+r2 = c.getresponse()
+print(json.dumps({"probe": r1.status, "probe_code": json.loads(b1)["error"]["code"],
+                  "init": r2.status, "version": json.loads(r2.read())["result"]["protocolVersion"]}))
+PY
+)
+check "a 2026-07-28 probe gets a non-modern 400, and initialize after it on one keep-alive connection works" \
+  "$KA" '.probe==400 and .probe_code==-32600 and .init==200 and .version=="2025-11-25"'
+R=$(curl -sS -m 5 -i -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BOARD_URL/api/v1/status")
+grep -qi '^Connection: close' <<<"$R" && ok "a refusal that never read the body closes the connection (REST too)" || no "unread body keep-alive" "$R"
 check "ping" "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":"p","method":"ping"}')")" '.id=="p" and .result=={}'
 check "tools/list is exactly the agent loop — no merge, grants, pin, token or cleanup" \
   "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')")" \

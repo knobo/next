@@ -5334,6 +5334,19 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.5)          # slows guessing; the board has no other users to starve
         return ok
 
+    def send_response(self, code, message=None):
+        """Every reply goes through here. A request whose body was never read (the 401 that
+        refuses before reading, a 405, a 413) leaves that body on a keep-alive socket, where
+        it is parsed as the NEXT request line — the client's next call then fails as "Bad
+        request syntax" (T-859, seen with Claude Code's MCP probe). Close the connection
+        instead of draining: draining would read a body an unauthenticated client sent."""
+        super().send_response(code, message)
+        h = getattr(self, "headers", None) or {}      # send_error can come before headers
+        unread = (h.get("Content-Length") or "0") != "0" or h.get("Transfer-Encoding")
+        if unread and not getattr(self, "body_read", False):
+            self.send_header("Connection", "close")
+            self.close_connection = True
+
     def send(self, code, obj, ctype="application/json", extra=()):
         data = (obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)).encode()
         self.send_response(code)
@@ -5365,11 +5378,13 @@ class Handler(BaseHTTPRequestHandler):
         if n > self.MAX_BODY:
             raise Err(413, "body over %d bytes" % self.MAX_BODY)
         raw = self.rfile.read(n) if n else b""
+        self.body_read = True
         if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
             return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode()).items()}
         return json.loads(raw) if raw else {}
 
     def handle_one(self, method):
+        self.body_read = False                # per request: keep-alive reuses this handler
         url = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(url.query)
         if url.path == "/healthz":            # kubelet probe: no token, no data
