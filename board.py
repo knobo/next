@@ -5495,11 +5495,13 @@ class Handler(BaseHTTPRequestHandler):
     MAX_BODY = 1 << 20                     # 1 MiB. Without a limit a 500 MB Content-Length is an OOM.
 
     def body(self):
-        # Chunked is not implemented: the chunk bytes would stay on the keep-alive socket
-        # and be parsed as the next request. Refuse, and close (send_response sees the
-        # unread Transfer-Encoding and adds Connection: close).
-        if self.headers.get("Transfer-Encoding"):
-            raise Err(411, "Transfer-Encoding is not supported; send Content-Length")
+        te = self.headers.get("Transfer-Encoding")
+        if te:                             # HTTP/2 ingresses forward a body without length as chunked
+            if te.strip().lower() != "chunked":
+                raise Err(501, "unsupported Transfer-Encoding")
+            if self.headers.get("Content-Length") is not None:
+                raise Err(400, "Transfer-Encoding with Content-Length")   # smuggling shape
+            return self.finish_body(self.read_chunked())
         cls = self.headers.get_all("Content-Length") or []
         if len(cls) > 1:
             raise Err(400, "multiple Content-Length headers")
@@ -5510,7 +5512,36 @@ class Handler(BaseHTTPRequestHandler):
             raise Err(400, "invalid Content-Length")
         if n > self.MAX_BODY:
             raise Err(413, "body over %d bytes" % self.MAX_BODY)
-        raw = self.rfile.read(n) if n else b""
+        return self.finish_body(self.rfile.read(n) if n else b"")
+
+    def read_chunked(self):
+        """Chunked request body, stdlib only. Any error is an Err; the unread
+        Transfer-Encoding makes send_response close the connection."""
+        out, total = [], 0
+        while True:
+            line = self.rfile.readline(1025)
+            try:
+                size = int(line.split(b";")[0].strip(), 16) if line.endswith(b"\n") else -1
+            except ValueError:
+                size = -1
+            if size < 0 or not line.split(b";")[0].strip().isalnum():
+                raise Err(400, "malformed chunk")
+            total += size
+            if total > self.MAX_BODY:
+                raise Err(413, "body over %d bytes" % self.MAX_BODY)
+            if size == 0:
+                while True:                # trailers, up to the empty line
+                    t = self.rfile.readline(1025)
+                    if t in (b"\r\n", b"\n"):
+                        return b"".join(out)
+                    if not t.endswith(b"\n"):
+                        raise Err(400, "malformed chunk")
+            data = self.rfile.read(size)
+            if len(data) != size or self.rfile.read(2) != b"\r\n":
+                raise Err(400, "malformed chunk")
+            out.append(data)
+
+    def finish_body(self, raw):
         self.body_read = True
         if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
             return {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode()).items()}
