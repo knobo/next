@@ -2907,6 +2907,22 @@ check "the human can move the phase and the forge" \
 check "phase_set is logged only when the phase moved, never with phase null" \
   "$(api GET "/events?stream=project&project=t867")" \
   '[.events[]|select(.type=="project.phase_set")|.body.phase]==["build","launch"]'
+# T-868: bin/board start/register/project sync must say WHY the manifest was not mirrored.
+M868="$TMP/m868"; mkdir -p "$M868"; printf 'project: t867\nphase: build\n' > "$M868/project.yaml"
+E868=$(cd "$M868" && BOARD_TOKEN="$TOKEN" board project sync 2>&1 >/dev/null); RC868=$?
+[ "$RC868" = 1 ] && [ "$(wc -l <<<"$E868")" = 1 ] && grep -q 'phase' <<<"$E868" && grep -q 'board project sync' <<<"$E868" \
+  && ok "a 403 on the manifest mirror is one stderr line naming the cause + the human-token hint, project sync exits 1" || no "T-868 stderr" "rc=$RC868 $E868"
+E868=$(cd "$M868" && BOARD_TOKEN="$TOKEN" board register --cap merge --model claude-sonnet-5 2>&1 >/dev/null); RC868=$?
+[ "$RC868" = 0 ] && [ "$(wc -l <<<"$E868")" = 1 ] && grep -q 'not mirrored' <<<"$E868" \
+  && ok "register with a mismatched phase still exits 0 and prints the stderr line" || no "T-868 register" "rc=$RC868 $E868"
+E868=$(cd "$M868" && BOARD_URL=http://127.0.0.1:9 BOARD_CACHE="$TMP/m868c" board project sync 2>&1 >/dev/null)
+[ -z "$E868" ] && ok "a down board stays silent (outbox)" || no "T-868 offline noise" "$E868"
+for M in '"[1]"' '"5"' '"\"x\""' '[1]' '5' '{"routines":[1]}' '{"routines":{"a":5}}' '"{\"routines\":{\"a\":5}}"'; do
+  [ "$(tok "$TOKEN" POST /projects '{"project":"t867","manifest":'"$M"'}')" = 400 ] \
+    && ok "manifest $M is a 400, not a 500 (T-868)" || no "T-868 manifest shape $M" ""
+done
+[ "$(tok "$TOKEN" POST /projects '{"project":"t867","manifest":"{not json"}')" = 400 ] \
+  && ok "invalid manifest JSON on an existing project is a 400, not a 500" || no "T-868 bad json" ""
 [ "$(tok "$PT" POST "/tokens/$PTID/revoke" '{}')" = 403 ] \
   && ok "an agent token can NOT revoke tokens" || no "agent revoke" ""
 check "the human token revokes" "$(hum POST "/tokens/$PTID/revoke" '{}')" '.revoked'

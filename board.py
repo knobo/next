@@ -787,6 +787,17 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
                    human=False):
     if phase and phase not in PHASES:
         raise Err(400, "unknown phase %r (%s)" % (phase, "|".join(PHASES)))
+    if isinstance(manifest, str) and manifest:
+        try:
+            manifest = json.loads(manifest)
+        except ValueError:
+            raise Err(400, "manifest is not valid JSON")
+    if manifest not in (None, "") and not isinstance(manifest, dict):
+        raise Err(400, "manifest must be a JSON object")
+    if manifest:
+        rt = manifest.get("routines", {})
+        if not isinstance(rt, dict) or not all(isinstance(v, dict) for v in rt.values()):
+            raise Err(400, "manifest.routines must be an object of objects")
     row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
     if row and not human:
         # T-867: on an EXISTING project, the phase (merge gate, prod deploy) and the forge
@@ -799,7 +810,7 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
                       needs_human_token=True, action="changing the phase")
         if manifest:
             old = jl(row["manifest"], {}) if row["manifest"] else {}
-            new = json.loads(manifest) if isinstance(manifest, str) else manifest
+            new = manifest
             # `forge: {}` (manifest.py's default) is the same as no forge block.
             if (((old.get("forge") if isinstance(old, dict) else None) or None)
                     != ((new.get("forge") if isinstance(new, dict) else None) or None)):
@@ -816,7 +827,7 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
         db.execute("UPDATE projects SET phase=?, updated=? WHERE name=?", (phase, now(), name))
         ev(name, "project", "project.phase_set", actor, phase=phase)
     if manifest:
-        m_dict = json.loads(manifest) if isinstance(manifest, str) else manifest
+        m_dict = manifest
         routines = m_dict.get("routines", {})
         existing = db.execute("SELECT name FROM routines WHERE project=?", (name,)).fetchall()
         for row in existing:

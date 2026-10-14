@@ -239,6 +239,15 @@ flush_outbox() {
   rm -f "$tmp"; flock -u 9
 }
 
+# Mirror project.yaml to the board. A 4xx used to vanish into >/dev/null (T-868): say why on
+# stderr, one line. Returns 1 then: start/register ignore it (never block), `project sync` exits with it. Offline = queued, silent.
+mirror_manifest() {
+  local r; MIRROR_R=; r=$(req POST /projects "$(jq -c --arg h "$(hostname -s)" \
+    '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$1")") && { MIRROR_R=$r; return 0; }
+  echo "board: project.yaml was not mirrored: $(jq -r '(.error? // .message? // empty) | strings' <<<"$r" 2>/dev/null | head -1 | grep . || echo rejected)$(jq -e '.needs_human_token' >/dev/null 2>&1 <<<"$r" && echo " — the human must run \`board project sync\` with the human token")" >&2
+  return 1
+}
+
 with_agent() { jq -c --arg a "$(agent_id)" '. + {agent:$a}' <<<"${1:-\{\}}"; }
 
 # A task's `repo` field is often the PROJECT NAME (the board stores that, not a manifest
@@ -374,8 +383,7 @@ start)
   fi
 
   m=$("$MANIFEST" 2>/dev/null) && [ -n "$m" ] && \
-    req POST /projects "$(jq -c --arg h "$(hostname -s)" \
-      '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$m")" >/dev/null
+    mirror_manifest "$m"
 
   caps_str=$("$0" probe)
   b=$(body harness "$BOARD_HARNESS" host "$(hostname -s)" \
@@ -442,8 +450,7 @@ register)
   # Mirror the manifest BEFORE registering: the phase drives the merge gate, and a board
   # that does not know the project defaults to `build` — a slacker gate than the truth.
   m=$("$MANIFEST" 2>/dev/null) && [ -n "$m" ] && \
-    req POST /projects "$(jq -c --arg h "$(hostname -s)" \
-      '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$m")" >/dev/null
+    mirror_manifest "$m"
   r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
   id=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
   echo "$id" > "$CACHE/agent"
@@ -559,8 +566,7 @@ project)
     init)   "$MANIFEST" --init "${POS[0]:-$(basename "$PWD")}" ;;
     sync)   # mirror the manifest to the board, so other machines see phase and repos
             m=$("$MANIFEST") || exit 1
-            req POST /projects "$(jq -c --arg h "$(hostname -s)" \
-              '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$m")" ;;
+            mirror_manifest "$m"; rc=$?; [ -z "$MIRROR_R" ] || echo "$MIRROR_R"; exit $rc ;;
     set|use) req POST /projects "$(body)" ;;
     *) die "board project detect|sh|init|sync|set" ;;
   esac ;;
