@@ -5324,8 +5324,10 @@ def prometheus_metrics():
 # The legacy (initialize) era of the spec, newest first. 2026-07-28 drops initialize for
 # per-request _meta; a client that speaks only that gets a 400 it reads as "legacy server"
 # and falls back to initialize. ponytail: add 2026-07-28 (server/discover, header/_meta
-# validation) when a client needs it.
-MCP_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
+# validation) when a client needs it. 2025-03-26 is out: JSON-RPC batching was its feature,
+# and this server answers single messages only (T-864). Claude Code 2.1.x initializes with
+# 2025-11-25; a client asking for an older version is answered with ours and decides.
+MCP_VERSIONS = ("2025-11-25", "2025-06-18")
 MCP_ORIGIN = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(BASE_URL))
 MCP_INSTRUCTIONS = ("The board: a work queue shared by coding agents. Call `register` once "
                     "(project, harness, host) and pass the returned id as `agent` to every "
@@ -5489,7 +5491,12 @@ class Handler(BaseHTTPRequestHandler):
     MAX_BODY = 1 << 20                     # 1 MiB. Without a limit a 500 MB Content-Length is an OOM.
 
     def body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0:                          # rfile.read(-1) would block until the client hangs up
+            raise Err(400, "invalid Content-Length")
         if n > self.MAX_BODY:
             raise Err(413, "body over %d bytes" % self.MAX_BODY)
         raw = self.rfile.read(n) if n else b""
@@ -5585,6 +5592,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.is_human:
             return self.send(403, rpc_err(None, -32600, "the human token is not accepted on /mcp — "
                                           "issue a per-agent token with `board token issue`"))
+        # The shared BOARD_TOKEN is not either (T-864): it can act as any agent, and an
+        # external model holding it is every agent at once. Per-agent tokens only.
+        if not self.agent_pattern:
+            return self.send(403, rpc_err(None, -32600, "the shared board token is not accepted "
+                                          "on /mcp — issue a per-agent token with `board token issue`"))
         version = self.headers.get("MCP-Protocol-Version")
         if version and version not in MCP_VERSIONS:
             return self.send(400, rpc_err(None, -32600, "unsupported MCP-Protocol-Version %s; "
@@ -5598,8 +5610,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             code, reply = self.mcp(msg)
         except Exception as e:
+            # The details go to the server log only: a repr can carry SQL, paths or row data.
             self.log_message("500 %r", e)
-            code, reply = 200, rpc_err(msg.get("id"), -32603, repr(e))
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            code, reply = 200, rpc_err(mid, -32603, "internal error")
         if reply is None:
             self.send_response(code)
             self.send_header("Content-Length", "0")
@@ -5608,11 +5622,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def mcp(self, msg):
         """One JSON-RPC message → (http status, reply or None for a notification)."""
+        # A response from the client (to a request this server never sends): accepted, like
+        # a notification — the spec's 202 for "responses and notifications".
+        if isinstance(msg, dict) and msg.get("jsonrpc") == "2.0" and "method" not in msg \
+                and "id" in msg and ("result" in msg or "error" in msg):
+            return 202, None
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
             return 400, rpc_err(None, -32600, "a single JSON-RPC 2.0 message (no batches)")
         if "id" not in msg:                          # a notification: accepted, nothing to say
             return 202, None
-        mid, method, params = msg["id"], msg["method"], msg.get("params") or {}
+        mid, method, params = msg["id"], msg["method"], msg.get("params")
+        params = {} if params is None else params
+        if not isinstance(params, dict):
+            return 200, rpc_err(mid, -32602, "params must be an object")
         if method == "initialize":
             asked = params.get("protocolVersion")
             return 200, rpc_ok(mid, {

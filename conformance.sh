@@ -2954,6 +2954,11 @@ mcp() { local t="$1" b="$2"; shift 2
 body() { sed '$d' <<<"$1"; }
 code() { tail -1 <<<"$1"; }
 call() { mcp "$1" "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}" | sed '$d'; }
+# /mcp takes per-agent tokens only (T-864). MAT is the general-purpose one for this section.
+MAT=$(hum POST /tokens '{"pattern":"codex@mcp-a","note":"mcp conformance a"}' | jq -r .token)
+R=$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}')
+[ "$(code "$R")" = 403 ] && jq -e '.error.message|test("shared board token.*board token issue")' >/dev/null <<<"$(body "$R")" \
+  && ok "/mcp refuses the shared BOARD_TOKEN (403, hint: board token issue)" || no "mcp shared token" "$R"
 R=$(curl -sS -m 5 -i -X POST -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BOARD_URL/mcp")
 grep -q '^HTTP/1.1 401' <<<"$R" && grep -qi '^WWW-Authenticate: Bearer' <<<"$R" \
   && ok "/mcp without a token is a 401 with WWW-Authenticate: Bearer" || no "mcp 401" "$R"
@@ -2964,24 +2969,24 @@ R=$(mcp "$HUMAN_TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}')
   && ok "/mcp refuses the human token (403) — it must never sit in an external model" || no "mcp human token" "$R"
 [ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BOARD_URL/mcp")" = 405 ] \
   && ok "GET /mcp is 405" || no "GET /mcp" ""
-[ "$(code "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'Origin: https://evil.example')")" = 403 ] \
+[ "$(code "$(mcp "$MAT" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'Origin: https://evil.example')")" = 403 ] \
   && ok "/mcp refuses a foreign Origin (DNS rebinding)" || no "mcp origin" ""
 check "initialize answers the client's version and the tools capability" \
-  "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}')")" \
+  "$(body "$(mcp "$MAT" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}')")" \
   '.id==1 and .result.protocolVersion=="2025-06-18" and (.result.capabilities.tools|type=="object") and .result.serverInfo.name=="board"'
 check "initialize with an unknown version answers the server's own" \
-  "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1900-01-01"}}')")" \
+  "$(body "$(mcp "$MAT" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1900-01-01"}}')")" \
   '.result.protocolVersion=="2025-11-25"'
-R=$(mcp "$TOKEN" '{"jsonrpc":"2.0","method":"notifications/initialized"}')
+R=$(mcp "$MAT" '{"jsonrpc":"2.0","method":"notifications/initialized"}')
 [ "$(code "$R")" = 202 ] && [ -z "$(body "$R")" ] && ok "a notification is 202 with no body" || no "mcp notification" "$R"
-[ "$(code "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'MCP-Protocol-Version: 2099-01-01')")" = 400 ] \
+[ "$(code "$(mcp "$MAT" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'MCP-Protocol-Version: 2099-01-01')")" = 400 ] \
   && ok "an unsupported MCP-Protocol-Version header is a 400" || no "mcp version header" ""
 # Claude Code's real opening (T-859): a 2026-07-28 server/discover probe, then — on the SAME
 # keep-alive connection — initialize. The probe is refused before its body is read; if that
 # body stays on the socket, it is parsed as the next request line and initialize dies as
 # "Bad request syntax". http.client reconnects on its own when the server closes, so this
 # passes either by the server draining or by it closing — never by leaving the body behind.
-KA=$(python3 - "$PORT" "$TOKEN" <<'PY'
+KA=$(python3 - "$PORT" "$MAT" <<'PY'
 import http.client, json, sys
 c = http.client.HTTPConnection("localhost", int(sys.argv[1]), timeout=5)
 h = {"Authorization": "Bearer " + sys.argv[2], "Content-Type": "application/json",
@@ -3001,26 +3006,26 @@ check "a 2026-07-28 probe gets a non-modern 400, and initialize after it on one 
   "$KA" '.probe==400 and .probe_code==-32600 and .init==200 and .version=="2025-11-25"'
 R=$(curl -sS -m 5 -i -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BOARD_URL/api/v1/status")
 grep -qi '^Connection: close' <<<"$R" && ok "a refusal that never read the body closes the connection (REST too)" || no "unread body keep-alive" "$R"
-check "ping" "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":"p","method":"ping"}')")" '.id=="p" and .result=={}'
+check "ping" "$(body "$(mcp "$MAT" '{"jsonrpc":"2.0","id":"p","method":"ping"}')")" '.id=="p" and .result=={}'
 check "tools/list is exactly the agent loop — no merge, grants, pin, token or cleanup" \
-  "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')")" \
+  "$(body "$(mcp "$MAT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')")" \
   '([.result.tools[].name]|sort)==["ask","register","status","task_claim","task_next","task_progress","task_show"] and ([.result.tools[]|.inputSchema.type=="object"]|all)'
-check "an unknown method is JSON-RPC -32601" "$(body "$(mcp "$TOKEN" '{"jsonrpc":"2.0","id":3,"method":"nope"}')")" '.error.code==-32601'
-check "an unknown tool is JSON-RPC -32602" "$(call "$TOKEN" merge '{}')" '.error.code==-32602'
-check "a missing required argument is -32602" "$(call "$TOKEN" task_claim '{"task":"T-1"}')" '.error.code==-32602'
-check "a task id with a slash is refused, not routed" "$(call "$TOKEN" task_show '{"task":"T-1/claim"}')" '.error.code==-32602'
-MR=$(call "$TOKEN" register '{"project":"mcp","harness":"codex","host":"mcp-a","session":"mcp-s1"}')
+check "an unknown method is JSON-RPC -32601" "$(body "$(mcp "$MAT" '{"jsonrpc":"2.0","id":3,"method":"nope"}')")" '.error.code==-32601'
+check "an unknown tool is JSON-RPC -32602" "$(call "$MAT" merge '{}')" '.error.code==-32602'
+check "a missing required argument is -32602" "$(call "$MAT" task_claim '{"task":"T-1"}')" '.error.code==-32602'
+check "a task id with a slash is refused, not routed" "$(call "$MAT" task_show '{"task":"T-1/claim"}')" '.error.code==-32602'
+MR=$(call "$MAT" register '{"project":"mcp","harness":"codex","host":"mcp-a","session":"mcp-s1"}')
 check "register over MCP returns an agent id" "$MR" '.result.isError==false and (.result.structuredContent.id|startswith("cx-mcp-a-"))'
 MAID=$(jq -r .result.structuredContent.id <<<"$MR")
 MT=$(api POST /tasks "{\"agent\":\"$MAID\",\"project\":\"mcp\",\"title\":\"an mcp task to claim\"}" | jq -r .id)
-check "task_next over MCP finds the open task" "$(call "$TOKEN" task_next "{\"agent\":\"$MAID\"}")" \
+check "task_next over MCP finds the open task" "$(call "$MAT" task_next "{\"agent\":\"$MAID\"}")" \
   ".result.structuredContent.id==\"$MT\""
-check "status over MCP is the same answer as GET /status" "$(call "$TOKEN" status '{"project":"mcp"}')" \
+check "status over MCP is the same answer as GET /status" "$(call "$MAT" status '{"project":"mcp"}')" \
   '.result.structuredContent.projects[0].name=="mcp"'
 check "a refused call is a tool error (isError) carrying the HTTP status" \
-  "$(call "$TOKEN" task_claim '{"agent":"cx-nobody-0000","task":"T-1"}')" '.result.isError==true and .result.structuredContent.status==404'
+  "$(call "$MAT" task_claim "{\"agent\":\"$MAID\",\"task\":\"T-999999\"}")" '.result.isError==true and .result.structuredContent.status==404'
 # Per-agent token: MCP must enforce exactly what REST enforces (T-858).
-MPT=$(hum POST /tokens '{"pattern":"codex@mcp-*","note":"mcp conformance"}' | jq -r .token)
+MPT=$(hum POST /tokens '{"pattern":"codex@mcp-b","note":"mcp conformance b"}' | jq -r .token)
 check "a per-agent token registers over MCP as an identity its pattern matches" \
   "$(call "$MPT" register '{"project":"mcp","harness":"codex","host":"mcp-b","session":"mcp-s2"}')" '.result.isError==false'
 MBID=$(call "$MPT" register '{"project":"mcp","harness":"codex","host":"mcp-b","session":"mcp-s2"}' | jq -r .result.structuredContent.id)
@@ -3034,8 +3039,6 @@ check "a per-agent token can NOT read task_next as another agent over MCP" \
   "$(call "$MPT" task_next "{\"agent\":\"$AID\"}")" '.result.structuredContent.status==403'
 check "a per-agent token can NOT ask as the human over MCP" \
   "$(call "$MPT" ask "{\"agent\":\"$BOARD_HUMAN\",\"project\":\"mcp\",\"text\":\"as the owner?\"}")" '.result.structuredContent.status==403'
-check "_human in the arguments is dropped — the human is a token, not a field" \
-  "$(call "$MPT" ask "{\"agent\":\"$BOARD_HUMAN\",\"_human\":true,\"project\":\"mcp\",\"text\":\"as the owner?\"}")" '.result.structuredContent.status==403'
 check "a per-agent token claims as itself over MCP" \
   "$(call "$MPT" task_claim "{\"agent\":\"$MBID\",\"task\":\"$MT\"}")" '.result.isError==false'
 check "and reports progress on it" \
@@ -3045,6 +3048,54 @@ check "task_show over MCP shows the claim" "$(call "$MPT" task_show "{\"task\":\
 check "a per-agent token asks as itself over MCP" \
   "$(call "$MPT" ask "{\"agent\":\"$MBID\",\"project\":\"mcp\",\"text\":\"Should the MCP tools be named like the CLI?\",\"default\":\"yes\"}")" \
   '.result.structuredContent.id|startswith("Q-")'
+# _human must not be a field (T-864, review of T-859): the token's OWN agent id, so the
+# identity check passes. NOTE: this one cannot go red today — owns() never reads _human,
+# and none of the 7 tools' handlers does (verified: it still passes with both the argument
+# whitelist and the _human overwrite removed). It guards the day a tool like release or
+# archive, whose handler does honour _human, is exposed. What bites on the whitelist is
+# the undeclared-argument check below.
+MT2=$(api POST /tasks "{\"agent\":\"$MAID\",\"project\":\"mcp\",\"title\":\"held by agent a\"}" | jq -r .id)
+call "$MAT" task_claim "{\"agent\":\"$MAID\",\"task\":\"$MT2\"}" >/dev/null
+check "_human:true in the arguments does not let a per-agent token write on another agent's task" \
+  "$(call "$MPT" task_progress "{\"agent\":\"$MBID\",\"_human\":true,\"task\":\"$MT2\",\"note\":\"as the owner\"}")" \
+  '.result.isError==true and .result.structuredContent.status==403 and (.result.structuredContent.error|test("owned by"))'
+call "$MPT" task_progress "{\"agent\":\"$MBID\",\"task\":\"$MT\",\"status\":\"blocked\",\"note\":\"undeclared\"}" >/dev/null
+check "an undeclared argument (status) never reaches the handler" \
+  "$(call "$MPT" task_show "{\"task\":\"$MT\"}")" '.result.structuredContent.status=="claimed"'
+check "params that are not an object are -32602" \
+  "$(body "$(mcp "$MAT" '{"jsonrpc":"2.0","id":4,"method":"ping","params":[1]}')")" '.error.code==-32602'
+R=$(mcp "$MAT" '{"jsonrpc":"2.0","id":7,"result":{}}')
+[ "$(code "$R")" = 202 ] && [ -z "$(body "$R")" ] && ok "a JSON-RPC response from the client is 202 with no body" || no "mcp response 202" "$R"
+R=$(mcp "$MAT" '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"register","arguments":{"project":{"x":1},"harness":"codex","host":"mcp-a"}}}')
+check "an unexpected exception is a bare -32603 — no repr, no SQL" "$(body "$R")" \
+  '.id==8 and .error.code==-32603 and .error.message=="internal error"'
+grep -q 'ProgrammingError' "$TMP/log" && ok "... and its details are in the server log" || no "mcp -32603 log" "$(tail -3 "$TMP/log")"
+check "2025-03-26 is not spoken (batching was its feature): initialize answers 2025-11-25" \
+  "$(body "$(mcp "$MAT" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}')")" \
+  '.result.protocolVersion=="2025-11-25"'
+[ "$(code "$(mcp "$MAT" '{"jsonrpc":"2.0","id":1,"method":"ping"}' -H 'MCP-Protocol-Version: 2025-03-26')")" = 400 ] \
+  && ok "an MCP-Protocol-Version: 2025-03-26 header is a 400" || no "mcp 2025-03-26 header" ""
+# A negative Content-Length: rfile.read(-1) reads until the client hangs up, so without the
+# check the request hangs and holds a thread. Raw sockets: curl will not send this header.
+NCL=$(python3 - "$PORT" "$MAT" "$TOKEN" <<'PY'
+import json, socket, sys
+port, mat, tok = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+out = {}
+for name, line, t, n in [("mcp", "POST /mcp", mat, "-1"), ("get", "GET /api/v1/status", tok, "-5"),
+                         ("post", "POST /api/v1/questions", tok, "-1"), ("junk", "GET /api/v1/status", tok, "abc")]:
+    s = socket.create_connection(("localhost", port), timeout=3)
+    s.sendall(("%s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Length: %s\r\n\r\n"
+               % (line, t, n)).encode())
+    try:
+        out[name] = int(s.recv(64).split()[1])
+    except (socket.timeout, IndexError, ValueError):
+        out[name] = "hang"
+    s.close()
+print(json.dumps(out))
+PY
+)
+check "a negative or junk Content-Length is a 400 on /mcp and on REST, GET and POST" "$NCL" \
+  '.mcp==400 and .get==400 and .post==400 and .junk==400'
 fi
 
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
