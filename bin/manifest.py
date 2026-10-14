@@ -148,12 +148,21 @@ def propose(cwd, name):
         m["docs"] = "docs/"
     url = remote(probe)
     if url:
-        host = url.split("@")[-1].split(":")[0].replace("https://", "").split("/")[0]
-        kind = "github" if "github.com" in url else "gitlab" if "gitlab" in host else "forgejo"
-        m["forge"] = {"kind": kind, "url": "https://" + host}
-        port = re.match(r"ssh://[^/@]*@?[^/:]+:(\d+)/", url)
-        if port:
-            m["forge"]["ssh_port"] = int(port[1])
+        # ssh://[user@]host[:port]/org/repo.git | user@host:org/repo.git | https://host/org/repo
+        p = (re.match(r"\w+://(?:[^/@]*@)?([^/:]+)(?::(\d+))?/(.*)$", url)
+             or re.match(r"(?:[^/@]*@)?([^/:]+)():(.*)$", url))
+        if p:
+            host, port, path = p[1], p[2], re.sub(r"(\.git)?/*$", "", p[3])
+            kind = "github" if "github.com" in host else "gitlab" if "gitlab" in host else "forgejo"
+            m["forge"] = {"kind": kind, "url": "https://" + host}
+            if port and url.startswith("ssh://"):
+                m["forge"]["ssh_port"] = int(port)
+            org, _, name = path.rpartition("/")
+            if org:
+                m["forge"]["org"] = org
+                key = m["project"] if repos[0] == "." else repos[0] if repos else None
+                if key and name != key:
+                    m["forge"]["repos"] = {key: org + "/" + name}
     return m, repos
 
 

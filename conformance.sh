@@ -1587,6 +1587,13 @@ check "repo_info gitlab without ssh_port keeps scp-style ssh_url" "$(api GET /ta
 check "repo_info gitlab: repos [.] uses the project name, nested group kept" "$(api GET /tasks/$FT)" \
   '.repo_info.forge_kind=="gitlab" and .repo_info.clone_url=="https://gitlab.com/grp/sub/forgegl.git"'
 check "repo_info is null when the manifest has no forge" "$(api GET /tasks/$TID)" '.repo_info==null'
+# T-861: `board project init` derives org (+ repo override, ssh port) from the origin remote.
+PROPOSED=$(for u in ssh://git@git.knobo.no:2222/knobo/claude-skills.git git@gitlab.com:grp/sub/x.git https://github.com/knobo/x; do
+  rm -rf "$TMP/pr"; git init -q "$TMP/pr"; git -C "$TMP/pr" remote add origin "$u"
+  python3 -c "import sys,json;sys.path.insert(0,'bin');import manifest;print(json.dumps(manifest.propose(sys.argv[1],'x')[0]['forge']))" "$TMP/pr"
+done | jq -s .)
+check "project init derives org, repo override and ssh port from the three remote shapes" "$PROPOSED" \
+  '.[0]=={kind:"forgejo",url:"https://git.knobo.no",ssh_port:2222,org:"knobo",repos:{x:"knobo/claude-skills"}} and .[1]=={kind:"gitlab",url:"https://gitlab.com",org:"grp/sub"} and .[2]=={kind:"github",url:"https://github.com",org:"knobo"}'
 check "task create without --project" "$(cli task create --title "cli task" --repo web)" '.id'
 
 # T-201: a `--repo` the manifest does not know is a silent error at creation time that only
