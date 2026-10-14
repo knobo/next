@@ -240,12 +240,12 @@ flush_outbox() {
 }
 
 # Mirror project.yaml to the board. A 4xx used to vanish into >/dev/null (T-868): say why on
-# stderr, one line, and carry on — registering never blocks on this. Offline = queued, silent.
+# stderr, one line. Returns 1 then: start/register ignore it (never block), `project sync` exits with it. Offline = queued, silent.
 mirror_manifest() {
   local r; MIRROR_R=; r=$(req POST /projects "$(jq -c --arg h "$(hostname -s)" \
     '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$1")") && { MIRROR_R=$r; return 0; }
   echo "board: project.yaml was not mirrored: $(jq -r '.error // .message // "rejected"' <<<"$r" 2>/dev/null)$(jq -e '.needs_human_token' >/dev/null 2>&1 <<<"$r" && echo " — the human must run \`board project sync\` with the human token")" >&2
-  return 0
+  return 1
 }
 
 with_agent() { jq -c --arg a "$(agent_id)" '. + {agent:$a}' <<<"${1:-\{\}}"; }
@@ -566,7 +566,7 @@ project)
     init)   "$MANIFEST" --init "${POS[0]:-$(basename "$PWD")}" ;;
     sync)   # mirror the manifest to the board, so other machines see phase and repos
             m=$("$MANIFEST") || exit 1
-            mirror_manifest "$m"; echo "$MIRROR_R" ;;
+            mirror_manifest "$m"; rc=$?; [ -z "$MIRROR_R" ] || echo "$MIRROR_R"; exit $rc ;;
     set|use) req POST /projects "$(body)" ;;
     *) die "board project detect|sh|init|sync|set" ;;
   esac ;;

@@ -2910,8 +2910,11 @@ check "phase_set is logged only when the phase moved, never with phase null" \
 # T-868: bin/board start/register/project sync must say WHY the manifest was not mirrored.
 M868="$TMP/m868"; mkdir -p "$M868"; printf 'project: t867\nphase: build\n' > "$M868/project.yaml"
 E868=$(cd "$M868" && BOARD_TOKEN="$TOKEN" board project sync 2>&1 >/dev/null); RC868=$?
-[ "$RC868" = 0 ] && [ "$(wc -l <<<"$E868")" = 1 ] && grep -q 'phase' <<<"$E868" && grep -q 'board project sync' <<<"$E868" \
-  && ok "a 403 on the manifest mirror is one stderr line naming the cause + the human-token hint, exit 0" || no "T-868 stderr" "rc=$RC868 $E868"
+[ "$RC868" = 1 ] && [ "$(wc -l <<<"$E868")" = 1 ] && grep -q 'phase' <<<"$E868" && grep -q 'board project sync' <<<"$E868" \
+  && ok "a 403 on the manifest mirror is one stderr line naming the cause + the human-token hint, project sync exits 1" || no "T-868 stderr" "rc=$RC868 $E868"
+E868=$(cd "$M868" && BOARD_TOKEN="$TOKEN" board register --cap merge --model claude-sonnet-5 2>&1 >/dev/null); RC868=$?
+[ "$RC868" = 0 ] && [ "$(wc -l <<<"$E868")" = 1 ] && grep -q 'not mirrored' <<<"$E868" \
+  && ok "register with a mismatched phase still exits 0 and prints the stderr line" || no "T-868 register" "rc=$RC868 $E868"
 E868=$(cd "$M868" && BOARD_URL=http://127.0.0.1:9 BOARD_CACHE="$TMP/m868c" board project sync 2>&1 >/dev/null)
 [ -z "$E868" ] && ok "a down board stays silent (outbox)" || no "T-868 offline noise" "$E868"
 [ "$(tok "$TOKEN" POST /projects '{"project":"t867","manifest":"{not json"}')" = 400 ] \
