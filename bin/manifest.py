@@ -10,6 +10,7 @@ works offline (K6).
   manifest.py --sh       shell eval: ROOT, PROJECT, PHASE, ENTRY, REPOS, ...
   manifest.py --init <name>   write a minimal manifest in cwd
 """
+import re
 import json, os, subprocess, sys
 
 import yaml
@@ -147,9 +148,30 @@ def propose(cwd, name):
         m["docs"] = "docs/"
     url = remote(probe)
     if url:
-        host = url.split("@")[-1].split(":")[0].replace("https://", "").split("/")[0]
-        kind = "github" if "github.com" in url else "forgejo"
-        m["forge"] = {"kind": kind, "url": "https://" + host}
+        # ssh://[user@]host[:port]/org/repo.git | user@host:org/repo.git | https://host[:port]/org/repo
+        # Nothing from userinfo is ever kept: the host is what follows the LAST '@' of the
+        # authority, so an unencoded '@' in a password cannot leave a fragment behind.
+        p = re.match(r"(https?|ssh)://([^/]*)/(.*)$", url)
+        if p:
+            scheme, auth, path = p[1], p[2].rsplit("@", 1)[-1], p[3]
+            host, _, port = auth.partition(":")
+        else:
+            q2 = re.match(r"(?:.*@)?([^/:@]+):(?!//)(.*)$", url) if "://" not in url else None
+            scheme, host, port, path = ("ssh", q2[1], "", q2[2]) if q2 else (None, "", "", "")
+        if scheme and host:
+            path = re.sub(r"(\.git)?/*$", "", path)
+            kind = "github" if "github.com" in host else "gitlab" if "gitlab" in host else "forgejo"
+            m["forge"] = {"kind": kind, "url": "%s://%s%s" % (
+                scheme if scheme != "ssh" else "https", host,
+                ":" + port if port and scheme != "ssh" else "")}
+            if port.isdigit() and scheme == "ssh":
+                m["forge"]["ssh_port"] = int(port)
+            org, _, name = path.rpartition("/")
+            if org:
+                m["forge"]["org"] = org
+                key = (m["project"] if repos[0] == "." else repos[0]) if repos else None
+                if key and name != key:
+                    m["forge"]["repos"] = {key: org + "/" + name}
     return m, repos
 
 

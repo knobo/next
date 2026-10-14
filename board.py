@@ -828,6 +828,65 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
     return db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
 
 
+def repo_info(manifest, repo, project):
+    """T-861: where a task's code lives, derived from the manifest already on the project
+    row (no new table). `forge: {kind: github|forgejo|gitlab, url, org}` gives
+    <url>/<org>/<repo>; `forge.repos: {<repo>: "<path>" | {path, default_branch}}` overrides
+    per repo, `forge.default_branch` (default main) for the rest. None when the manifest
+    does not say enough OR is malformed — any agent can post a manifest, so this never
+    raises (a 500 here would break task show for the whole project). Userinfo in the url
+    is dropped; org/path/branch are restricted to a safe charset (they end up in a
+    `git clone` argument). No credentials: clone_url is the plain URL."""
+    try:
+        forge = manifest.get("forge") if isinstance(manifest, dict) else None
+        if not isinstance(forge, dict):
+            return None
+        kind = forge.get("kind")
+        u = urllib.parse.urlsplit(str(forge.get("url") or "").strip())
+        host, port = u.hostname, u.port
+        if (kind not in ("github", "forgejo", "gitlab") or u.scheme not in ("http", "https")
+                or not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host)):
+            return None
+        base = "%s://%s%s" % (u.scheme, host, ":%d" % port if port else "")
+        mrepos = manifest.get("repos")
+        if repo in (None, "", "."):
+            # several repos and none named: do not invent a URL for the project name
+            if isinstance(mrepos, list) and mrepos not in ([], ["."]):
+                return None
+            name = project
+        else:
+            name = repo
+        repos = forge.get("repos")
+        ov = repos.get(name) if isinstance(repos, dict) else None
+        ov = {"path": ov} if isinstance(ov, str) else ov if isinstance(ov, dict) else {}
+        org = forge.get("org")
+        path = ov.get("path") or (isinstance(org, str) and org and "%s/%s" % (org, name))
+        safe = lambda x: (isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_./-]+", x)
+                          and ".." not in x and not any(p.startswith("-") for p in x.split("/")))
+        if not safe(path):
+            return None
+        br = ov.get("default_branch") or forge.get("default_branch") or "main"
+        web = "%s/%s" % (base, path)
+        info = {"forge_kind": kind, "web_url": web, "clone_url": web + ".git",
+                "default_branch": br if safe(br) else "main"}
+        sp = forge.get("ssh_port")
+        if sp:
+            if isinstance(sp, int) and not isinstance(sp, bool) and 1 <= sp <= 65535:
+                info["ssh_url"] = "ssh://git@%s:%d/%s.git" % (host, sp, path)
+        else:
+            info["ssh_url"] = "git@%s:%s.git" % (host, path)
+        return info
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def project_repos(manifest, project):
+    """repo_info for every repo the manifest lists (for /status); repos that give none are left out."""
+    rl = manifest.get("repos") if isinstance(manifest, dict) else None
+    rl = rl if isinstance(rl, list) and rl else ["."]
+    return [dict(i, repo=r) for r in rl if isinstance(r, str) for i in [repo_info(manifest, r, project)] if i]
+
+
 def check_repo(project, repo):
     """A `--repo` that does not exist in the manifest is a silent error at creation time
     that only blows up several steps later, in a different agent: `board task worktree`
@@ -1346,6 +1405,9 @@ def task_show(tid):
     ost, oa = owner_view(t)
     d["owner_status"] = ost
     d["owner_agent"] = oa
+    prow = db.execute("SELECT manifest FROM projects WHERE name=?", (d["project"],)).fetchone()
+    d["repo_info"] = repo_info(jl(prow["manifest"], {}) if prow and prow["manifest"] else {},
+                               d.get("repo"), d["project"])
     return d
 
 
@@ -2550,6 +2612,7 @@ def status(project=None):
             # the event log on every page render, under the global lock.
             "costs": costs,
             "name": name, "phase": p["phase"], "goal": p["goal"], "paused": p["paused"],
+            "repos": project_repos(jl(p["manifest"], {}) if p["manifest"] else {}, name),
             "wip": wip_limit(name), "unreviewed": unreviewed(name),
             "ribbon": ribbon_events(name),
             "agents": agents,
