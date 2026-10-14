@@ -148,7 +148,7 @@ class TestNtfyRetryAndCounter(unittest.TestCase):
         board.ntfy_failures_since_success = 3
         html = board.html_status(None)
         self.assertIn("Push notifications are failing", html)
-        self.assertIn("3", html)
+        self.assertIn("failing:</b> 3 pushes have not gone out", html)
 
     def test_status_html_no_warning_when_counter_zero(self):
         board.ntfy_failures_since_success = 0

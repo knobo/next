@@ -208,7 +208,7 @@ class TestGrants(unittest.TestCase):
         # Human: add-grant form and pause button visible
         html_human = board.html_status("demo", token="human-token", human=True)
         self.assertIn(f"action='/agents/{aid}/grants'", html_human)
-        self.assertIn("aria-pressed=", html_human)  # grant chips replaced the datalist form
+        self.assertIn("chip chip-off' aria-pressed='false' title='give merge'", html_human)
         self.assertIn("action='/projects/demo/pause'", html_human)
         self.assertIn(">Pause<", html_human)
 
@@ -217,7 +217,8 @@ class TestGrants(unittest.TestCase):
                                                {"grant": "merge", "project": "demo"},
                                                token="agent-token")
         self.assertEqual(status, 403)
-        self.assertIn("signed in as an agent", body)  # not_human_page, not JSON
+        self.assertIn("text/html", hdrs.get("Content-Type", ""))
+        self.assertNotIn("needs_human_token", body)  # a page for a person, not the API's JSON
 
         # 3. Form POST to add grant with human-token -> 302 Redirect to /status?project=demo
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants",
@@ -241,7 +242,8 @@ class TestGrants(unittest.TestCase):
                                                {"grant": "merge", "project": "demo"},
                                                token="agent-token")
         self.assertEqual(status, 403)
-        self.assertIn("signed in as an agent", body)  # not_human_page, not JSON
+        self.assertIn("text/html", hdrs.get("Content-Type", ""))
+        self.assertNotIn("needs_human_token", body)  # a page for a person, not the API's JSON
 
         # 5. Form POST to revoke grant with human-token -> 302 Redirect to /status?project=demo
         status, hdrs, body = self.form_request("POST", f"/agents/{aid}/grants/revoke",
