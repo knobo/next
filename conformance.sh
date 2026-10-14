@@ -2917,6 +2917,10 @@ E868=$(cd "$M868" && BOARD_TOKEN="$TOKEN" board register --cap merge --model cla
   && ok "register with a mismatched phase still exits 0 and prints the stderr line" || no "T-868 register" "rc=$RC868 $E868"
 E868=$(cd "$M868" && BOARD_URL=http://127.0.0.1:9 BOARD_CACHE="$TMP/m868c" board project sync 2>&1 >/dev/null)
 [ -z "$E868" ] && ok "a down board stays silent (outbox)" || no "T-868 offline noise" "$E868"
+for M in '"[1]"' '"5"' '"\"x\""' '[1]' '5' '{"routines":[1]}' '{"routines":{"a":5}}' '"{\"routines\":{\"a\":5}}"'; do
+  [ "$(tok "$TOKEN" POST /projects '{"project":"t867","manifest":'"$M"'}')" = 400 ] \
+    && ok "manifest $M is a 400, not a 500 (T-868)" || no "T-868 manifest shape $M" ""
+done
 [ "$(tok "$TOKEN" POST /projects '{"project":"t867","manifest":"{not json"}')" = 400 ] \
   && ok "invalid manifest JSON on an existing project is a 400, not a 500" || no "T-868 bad json" ""
 [ "$(tok "$PT" POST "/tokens/$PTID/revoke" '{}')" = 403 ] \

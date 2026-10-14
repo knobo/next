@@ -792,6 +792,12 @@ def ensure_project(name, phase=None, goal=None, manifest=None, host=None, path=N
             manifest = json.loads(manifest)
         except ValueError:
             raise Err(400, "manifest is not valid JSON")
+    if manifest not in (None, "") and not isinstance(manifest, dict):
+        raise Err(400, "manifest must be a JSON object")
+    if manifest:
+        rt = manifest.get("routines", {})
+        if not isinstance(rt, dict) or not all(isinstance(v, dict) for v in rt.values()):
+            raise Err(400, "manifest.routines must be an object of objects")
     row = db.execute("SELECT * FROM projects WHERE name=?", (name,)).fetchone()
     if row and not human:
         # T-867: on an EXISTING project, the phase (merge gate, prod deploy) and the forge

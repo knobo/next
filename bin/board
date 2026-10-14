@@ -244,7 +244,7 @@ flush_outbox() {
 mirror_manifest() {
   local r; MIRROR_R=; r=$(req POST /projects "$(jq -c --arg h "$(hostname -s)" \
     '{project:.project, phase:.phase, goal:(.goal//""), manifest:., host:$h, path:(.root+"/project.yaml")}' <<<"$1")") && { MIRROR_R=$r; return 0; }
-  echo "board: project.yaml was not mirrored: $(jq -r '.error // .message // "rejected"' <<<"$r" 2>/dev/null)$(jq -e '.needs_human_token' >/dev/null 2>&1 <<<"$r" && echo " — the human must run \`board project sync\` with the human token")" >&2
+  echo "board: project.yaml was not mirrored: $(jq -r '(.error? // .message? // empty) | strings' <<<"$r" 2>/dev/null | head -1 | grep . || echo rejected)$(jq -e '.needs_human_token' >/dev/null 2>&1 <<<"$r" && echo " — the human must run \`board project sync\` with the human token")" >&2
   return 1
 }
 
