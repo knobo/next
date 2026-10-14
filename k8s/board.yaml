@@ -97,6 +97,12 @@ spec:
             # status (T-638). Absent = private repos are unreadable and the gate skips CI.
             - name: FORGE_TOKEN
               valueFrom: { secretKeyRef: { name: board, key: forge_token, optional: true } }
+            # The one host FORGE_TOKEN may be sent to, over https (T-865). forge.url comes
+            # from an agent-posted manifest; without this pin any agent could point it at
+            # itself and collect the token. Empty = the token is never sent (fail closed).
+            # Set it in board.env, for example: FORGE_TOKEN_HOST=git.knobo.no
+            - name: FORGE_TOKEN_HOST
+              value: "${FORGE_TOKEN_HOST}"
           ports: [{ containerPort: 8080 }]
           securityContext:
             allowPrivilegeEscalation: false
