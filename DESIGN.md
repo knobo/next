@@ -231,6 +231,33 @@ the default workspace only. And as with the human token (§3.7), a token in `pas
 agent runs on is a token the agent can read: at a customer, put only that workspace's tokens on
 the machine.
 
+### 3.2d Harness accounts — which login a session runs on
+
+Quota is per vendor ACCOUNT, and the board used to read that as per harness: every
+`claude-code` agent shared one MAX. With two Claude logins, one at 95 % stopped the agents on the
+other at 10 %. And a customer's code must run on the customer's login, not the owner's.
+
+- **The machine names its logins** in `~/.config/next/accounts.yaml` (or `$NEXT_ACCOUNTS`): a name,
+  the harness, and the environment that selects the login (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, …),
+  optionally `cmd:`. Nothing about accounts is on the board or in a repo: which directory holds
+  which login is a fact about one machine. `bin/accounts.py` reads it.
+- **A session says which account it is**: `BOARD_ACCOUNT`, or the entry whose environment the
+  session matches (`default: true` = also when the variable is unset). It is sent at register and
+  stored on the agent row.
+- **The quota key is the account** (`acct_key`: the account, else the harness — exactly what an
+  agent from before accounts meant). `agent_stop`, the runway and `GET /accounts` all use it.
+- **A project can name its accounts**: `accounts: [claude-kunde]` in `project.yaml`. `board
+  start`/`register` refuses any other login before anything reaches the board.
+- **Switching is a new session.** A running harness cannot change login. `next-run <account>`
+  starts one with that account's environment; `next-run --auto` takes the first account the
+  project allows that `GET /accounts` does not report over the project's ceilings. The work moves
+  over as it does for any session that ends (lease, orphan, pick-up). Started by the human — no
+  daemon restarts sessions on its own.
+
+The readings live in each workspace's database (§3.2c), so `--auto` in a workspace sees only the
+readings of agents that ran there. A session that starts on an account that is in fact over the
+ceiling learns it at its first heartbeat and stops then.
+
 ### 3.3 (b) Technology choice — an honest assessment
 
 The requirements, weighted: **(K1)** append-only events with streams, **(K2)** frequent small

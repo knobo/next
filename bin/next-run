@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# next-run — start a harness on a named account (bin/accounts.py, DESIGN.md §3.2d).
+#   next-run <account> [args...]   that account's harness, here, with its environment
+#   next-run --auto [args...]      the first account project.yaml allows (accounts:) that the
+#                                  board does not report over this project's ceilings
+#   next-run --list                the accounts on this machine
+# A running session cannot change login; switching accounts is a new session. The board
+# hands the work over as it does for any session that ends (lease, orphan, pick-up).
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "$0")")"
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+  --list) "$HERE/accounts.py" list | jq -r 'to_entries[] | "\(.key)\t\(.value.harness)"'; exit 0 ;;
+  --auto)
+    shift
+    m=$("$HERE/manifest.py" 2>/dev/null || echo '{}')
+    cands=$(jq -r '.accounts // [] | .[]' <<<"$m")
+    [ -n "$cands" ] || cands=$("$HERE/accounts.py" list | jq -r 'keys[]')
+    q=$("$HERE/board" accounts --project "$(jq -r '.project // empty' <<<"$m")" 2>/dev/null || echo '{}')
+    acct=""
+    for c in $cands; do
+      jq -e --arg c "$c" '.accounts[$c].stop // empty' >/dev/null <<<"$q" || { acct=$c; break; }
+      echo "next-run: $c is over the ceiling ($(jq -r --arg c "$c" '.accounts[$c].stop' <<<"$q"))" >&2
+    done
+    [ -n "$acct" ] || { echo "next-run: every allowed account is over the ceiling" >&2; exit 1; } ;;
+  *) acct="$1"; shift ;;
+esac
+s=$("$HERE/accounts.py" env "$acct") || exit 2
+eval "$s"
+echo "next-run: $acct ($BOARD_HARNESS)" >&2
+exec "${NEXT_CMD[@]}" "$@"

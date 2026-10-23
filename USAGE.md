@@ -214,6 +214,34 @@ project uses the workspace and its own token, and refuses rather than falling ba
 - **At the customer** put only that workspace's tokens on the machine. An agent can read
   whatever `pass` holds.
 
+## Several logins: Claude, Codex, Antigravity
+
+Name each login once per machine, in `~/.config/next/accounts.yaml` (DESIGN.md §3.2d):
+
+```yaml
+claude-privat: {harness: claude-code, env: {CLAUDE_CONFIG_DIR: ~/.claude}, default: true}
+claude-kunde:  {harness: claude-code, env: {CLAUDE_CONFIG_DIR: ~/.claude-kunde}}
+codex-privat:  {harness: codex, env: {CODEX_HOME: ~/.codex}}
+gemini-privat: {harness: antigravity, cmd: [antigravity, --user-data-dir, ~/.antigravity-privat]}
+```
+
+Log in once inside each one (`CLAUDE_CONFIG_DIR=~/.claude-kunde claude`, then `/login`). After that:
+
+```bash
+next-run claude-kunde          # start Claude on that login, here
+next-run --auto                # the first allowed login that is not over the ceiling
+next-run --list
+board accounts --project kproj # quota per login, and which are over
+```
+
+Each login has its own quota on the board. A customer project pins its logins with
+`accounts: [claude-kunde]` in `project.yaml`; a session on any other login is refused at
+`board start`. A running session cannot change login: when one runs dry, end it and start the
+next with `next-run --auto`. The board hands the work over.
+
+Check `cmd:` for Antigravity against your own install: which flag picks the profile depends on
+the version.
+
 ## What you have to do yourself (agents cannot)
 
 - **Branch protection** on the forge. The agent's token is not an admin token. Without branch

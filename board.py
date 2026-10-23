@@ -140,7 +140,9 @@ def open_db(path):
                               ("tasks", "milestone", "TEXT"),
                               ("questions", "cmds", "TEXT"),
                           # 'owner' = the human inside ONE workspace (workspace login).
-                          ("agent_tokens", "kind", "TEXT")):
+                          ("agent_tokens", "kind", "TEXT"),
+                          # Which LOGIN at the vendor: two Claude accounts are two quotas.
+                          ("agents", "account", "TEXT")):
 
         try:                                # database from before the column existed
             db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
@@ -507,6 +509,15 @@ def effective_ceilings(a, ceilings):
     return out
 
 
+ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def acct_key(a):
+    """Whose quota an agent burns: its account when it names one (BOARD_ACCOUNT), the
+    harness otherwise — which is exactly what an agent from before accounts meant."""
+    return a["account"] or a["harness"] or "claude-code"
+
+
 def quota_max(harness="claude-code"):
     """Quota is per account, not per session: two `/next` sessions on different machines
     or in different projects share the same windows. The stop rules must therefore read
@@ -523,14 +534,34 @@ def quota_max(harness="claude-code"):
     Anthropic's windows with the Claude agents, and taking the MAX across them let a
     foreign (or a test registration's) reading stop the entire Claude fleet for up to
     seven days, with no self-correction. Window names can collide too: "7d" does not mean
-    the same thing at two vendors."""
+    the same thing at two vendors.
+
+    And the same holds one level down: two Claude LOGINS are two quotas. `harness` is
+    therefore the account key (acct_key) — the account name when the agent has one."""
     out = {}
     for a in db.execute("SELECT budget, last_seen, harness FROM agents "
-                        "WHERE budget IS NOT NULL AND harness=?", (harness,)):
+                        "WHERE budget IS NOT NULL AND COALESCE(account, harness)=?", (harness,)):
         for name, pct in windows_of(a).items():
             if mins_since(a["last_seen"]) <= window_minutes(name):
                 out[name] = max(out.get(name, 0.0), pct)
     return out
+
+
+def accounts(project):
+    """Every account the board has a live reading for, and whether it is over this
+    project's ceilings — what `next-run --auto` picks the next login from when the one in
+    use has run dry. The fixed ceilings, not the ramp: the ramp belongs to one agent's
+    reset time, and a fresh session has none yet."""
+    ceil = {win_name(k): v for k, v in budget(project)["ceilings"].items()} if project else {}
+    keys = sorted({r[0] for r in db.execute(
+        "SELECT DISTINCT COALESCE(account, harness) FROM agents WHERE budget IS NOT NULL") if r[0]})
+    out = {}
+    for k in keys:
+        w = quota_max(k)
+        over = ["%s %g%% ≥ %g%%" % (n, pct, ceil[n]) for n, pct in sorted(w.items())
+                if n in ceil and pct >= float(ceil[n])]
+        out[k] = {"windows": w, "stop": "; ".join(over) or None}
+    return {"accounts": out}
 
 
 def agent_stop(a, project):
@@ -547,7 +578,7 @@ def agent_stop(a, project):
     ceiling applies, counted in something the agent actually can count. Coarse, but
     honest."""
     # Same harness as the agent itself: quota is per vendor account, not per machine.
-    b, acct = budget(project), quota_max(a["harness"] or "claude-code")
+    b, acct = budget(project), quota_max(acct_key(a))
     ceilings = {win_name(k): v for k, v in b["ceilings"].items()}
     # The ramp uses this agent's own resets_at against the account-wide max: same account
     # means same reset time, and a missing/past resets_at falls back to the fixed ceiling.
@@ -849,20 +880,24 @@ def register(b):
     project, session = b.get("project"), b.get("session")
     if not project:
         raise Err(400, "project is missing")
+    account = b.get("account") or None
+    if account is not None and not (isinstance(account, str) and ACCOUNT_RE.match(account)):
+        raise Err(400, "account must match %s" % ACCOUNT_RE.pattern)
     old = db.execute("SELECT * FROM agents WHERE session=?", (session,)).fetchone() if session else None
     aid = old["id"] if old else "%s-%s-%s" % (
         {"claude-code": "cc", "codex": "cx", "grok": "gk", "antigravity": "ag"}.get(harness, harness[:2]),
         host, secrets.token_hex(2))
     db.execute("""INSERT INTO agents (id,harness,host,model,session,current_project,capabilities,
-                    preference,last_seen,status,registered) VALUES (?,?,?,?,?,?,?,?,?,'alive',?)
+                    preference,last_seen,status,registered,account) VALUES (?,?,?,?,?,?,?,?,?,'alive',?,?)
                   ON CONFLICT(id) DO UPDATE SET harness=excluded.harness, host=excluded.host,
+                    account=excluded.account,
                     model=COALESCE(excluded.model, agents.model),
                     current_project=excluded.current_project,
                     capabilities=CASE WHEN excluded.capabilities='[]' THEN agents.capabilities
                                  ELSE excluded.capabilities END,
                     last_seen=excluded.last_seen, status='alive'""",
                (aid, harness, host, b.get("model"), session, project,
-                json.dumps(b.get("capabilities", [])), b.get("preference"), now(), now()))
+                json.dumps(b.get("capabilities", [])), b.get("preference"), now(), now(), account))
     ensure_project(project)
     db.execute("DELETE FROM grants WHERE agent=? AND project=? AND (source='policy' OR source IS NULL)", (aid, project))
     g = grants_for(harness, host, project)
@@ -3504,8 +3539,7 @@ def fleet_runway(s):
             w, c = win_name(w), float(c or 0)
             eff = max([a.get("effective_ceilings", {}).get(w, c) for a in p["agents"]] or [c])
             ceil[w] = min(ceil.get(w, eff), eff)
-    harnesses = sorted({(a.get("harness") or "claude-code")
-                        for p in s["projects"] for a in p["agents"]})
+    harnesses = sorted({acct_key(a) for p in s["projects"] for a in p["agents"]})
     rows = []
     for h in harnesses:
         ws = quota_max(h)
@@ -4828,6 +4862,7 @@ ROUTES = [
     ("POST",   r"/projects/([^/]+)/resume$",   lambda h, m, b, q: set_paused(m[0], b, False)),
     ("POST",   r"/projects/([^/]+)/ceilings$", lambda h, m, b, q: set_ceilings(m[0], b)),
     ("POST",   r"/projects/([^/]+)/phase$",    lambda h, m, b, q: set_phase(m[0], b)),
+    ("GET",    r"/accounts$",                   lambda h, m, b, q: accounts(q.get("project", [None])[0])),
     ("GET",    r"/status$",                     lambda h, m, b, q: status(q.get("project", [None])[0])),
     ("GET",    r"/events$",                     lambda h, m, b, q: events(q)),
     ("POST",   r"/tokens$",                     lambda h, m, b, q: token_issue(b)),

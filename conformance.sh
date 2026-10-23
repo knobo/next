@@ -3027,6 +3027,44 @@ check "a workspace: in project.yaml does NOT borrow the inherited BOARD_TOKEN (n
 fi
 
 if [ "$OWN_SERVER" = 1 ]; then
+echo "== harness accounts: two logins are two quotas (§3.2d) =="
+RA=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"acc","session":"acc-a","account":"acc-a"}' | jq -r .id)
+RB=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"acc","session":"acc-b","account":"acc-b"}' | jq -r .id)
+api POST "/agents/$RA/heartbeat" '{"budget":[{"window":"5h","used_pct":95}]}' >/dev/null
+api POST "/agents/$RB/heartbeat" '{"budget":[{"window":"5h","used_pct":10}]}' >/dev/null
+ST=$(api GET '/status?project=demo')
+check "an account over the ceiling stops its own agent" "$ST" "[.projects[0].agents[]|select(.id==\"$RA\")][0].stop|test(\"5h\")"
+check "… and not an agent on another account of the same harness" "$ST" "[.projects[0].agents[]|select(.id==\"$RB\")][0].stop==null"
+check "the agent row carries its account" "$ST" "[.projects[0].agents[]|select(.id==\"$RB\")][0].account==\"acc-b\""
+check "/accounts names which account is over this project's ceilings" "$(api GET '/accounts?project=demo')" \
+  '(.accounts["acc-a"].stop|test("5h")) and .accounts["acc-b"].stop==null'
+check "an account name is a slug" \
+  "$(api POST /agents '{"project":"demo","harness":"claude-code","host":"acc","session":"acc-c","account":"A B"}')" '.error|test("account")'
+api POST "/agents/$RA/finished" '{}' >/dev/null; api POST "/agents/$RB/finished" '{}' >/dev/null
+# The local side: accounts.yaml, detection, and a project that allows only some accounts.
+AY="$TMP/accounts.yaml"
+printf 'acc-x:\n  harness: claude-code\n  env: {CLAUDE_CONFIG_DIR: %s/cx}\n  default: true\nacc-y:\n  harness: claude-code\n  env: {CLAUDE_CONFIG_DIR: %s/cy}\n  cmd: [echo, ran]\n' "$TMP" "$TMP" > "$AY"
+[ "$(NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/cy/" bin/accounts.py detect claude-code)" = acc-y ] \
+  && ok "accounts.py detects the account from the environment (trailing slash and all)" || no "detect" ""
+[ "$(env -u CLAUDE_CONFIG_DIR NEXT_ACCOUNTS="$AY" bin/accounts.py detect claude-code)" = acc-x ] \
+  && ok "… and the default: account when the variable is not set" || no "detect default" ""
+[ -z "$(NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/other" bin/accounts.py detect claude-code)" ] \
+  && ok "… and nothing for a login it does not know" || no "detect unknown" ""
+NR=$(NEXT_ACCOUNTS="$AY" bin/next-run acc-y hello 2>&1)
+grep -q "^ran hello$" <<<"$NR" && ok "next-run starts the account's command with its arguments" || no "next-run" "$NR"
+NE=$(NEXT_ACCOUNTS="$AY" bash -c 'eval "$(bin/accounts.py env acc-y)"; echo "$CLAUDE_CONFIG_DIR $BOARD_ACCOUNT $BOARD_HARNESS"')
+[ "$NE" = "$TMP/cy acc-y claude-code" ] && ok "next-run's environment: config dir, BOARD_ACCOUNT, BOARD_HARNESS" || no "accounts env" "$NE"
+AD="$TMP/accproj"; mkdir -p "$AD"; printf 'project: accproj\nphase: build\naccounts: [acc-y]\n' > "$AD/project.yaml"
+AR=$(cd "$AD" && NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/cx" board register 2>&1)
+grep -q "runs on the accounts: acc-y — this session is acc-x" <<<"$AR" \
+  && ok "a project with accounts: refuses a session on another login" || no "account refuse" "$AR"
+check "… before anything reached the board" "$(api GET /status)" '[.projects[].name]|index("accproj")|not'
+AR=$(cd "$AD" && NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/cy" BOARD_SESSION=acc-ok board register 2>/dev/null)
+check "… and registers one on an allowed login, with the account" "$AR" '.id'
+check "the registered agent's account is acc-y" "$(api GET '/status?project=accproj')" '.projects[0].agents[0].account=="acc-y"'
+fi
+
+if [ "$OWN_SERVER" = 1 ]; then
 echo "== MCP endpoint /mcp (T-859) =="
 # mcp <token> <json-rpc body> [extra curl args...] → the body, then the status on its own line
 mcp() { local t="$1" b="$2"; shift 2

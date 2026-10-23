@@ -134,6 +134,19 @@ command -v jq >/dev/null || die "jq is missing"
 # share an id. Keyed on the session when it is known (DESIGN.md §3.5), with the
 # per-machine file as a fallback.
 MANIFEST="$(dirname "$(readlink -f "$0")")/manifest.py"
+ACCOUNTS="$(dirname "$(readlink -f "$0")")/accounts.py"
+
+# Which harness LOGIN this session runs on (DESIGN.md §3.2d): BOARD_ACCOUNT (next-run sets
+# it), or the entry in ~/.config/next/accounts.yaml the environment matches. A project
+# with `accounts:` in its manifest runs on those and no other — a customer's code on the
+# owner's private login is the mix-up this refuses. Before registering, so nothing lands.
+account_check() {  # account_check <manifest json>
+  [ -n "${BOARD_ACCOUNT:-}" ] || BOARD_ACCOUNT=$("$ACCOUNTS" detect "${BOARD_HARNESS:-}" 2>/dev/null)
+  local allowed; allowed=$(jq -r '.accounts // [] | join(" ")' <<<"${1:-"{}"}" 2>/dev/null)
+  [ -z "$allowed" ] && return 0
+  [ -n "$BOARD_ACCOUNT" ] && [[ " $allowed " == *" $BOARD_ACCOUNT "* ]] && return 0
+  die "this project runs on the accounts: $allowed — this session is ${BOARD_ACCOUNT:-an account not in ~/.config/next/accounts.yaml}. Start it with: next-run <account>"
+}
 
 agent_id() {
   local f="$CACHE/session-${BOARD_SESSION:-}"
@@ -330,6 +343,7 @@ inbox::board inbox [--as <role>]::List this agent's pending questions and messag
 grant::board grant <agent> <grant> [--project <p>] [--json]::Grant a capability to an agent.
 revoke::board revoke <agent> <grant> [--project <p>] [--json]::Revoke a capability from an agent.
 token|tokens::board token issue <harness@host-glob> [--note <n>] | owner [--note <n>] | list | revoke <id>::Per-agent tokens bound to an identity, or the owner login for the current workspace (human token).
+accounts::board accounts [--project <p>]::Quota per harness account, and which are over this project's ceilings (next-run --auto).
 workspace|workspaces::board workspace list | create <name>::Workspaces: one database per customer; create needs the admin token.
 grants::board grants [agent] [--project <p>] [--json]::List an agent's grants.
 agent|agents::board agent cleanup [--older-than <dur>] [--project <p>] [--all]::Agent maintenance (cleanup dead agents).
@@ -417,12 +431,14 @@ start)
     esac
   fi
 
-  m=$("$MANIFEST" 2>/dev/null) && [ -n "$m" ] && \
-    mirror_manifest "$m"
+  m=$("$MANIFEST" 2>/dev/null) || m=
+  account_check "$m"
+  [ -n "$m" ] && mirror_manifest "$m"
 
   caps_str=$("$0" probe)
   b=$(body harness "$BOARD_HARNESS" host "$(hostname -s)" \
-           session "${BOARD_SESSION:-}" project "$proj" model "$model" cap "$caps_str")
+           session "${BOARD_SESSION:-}" project "$proj" model "$model" cap "$caps_str" \
+           account "${BOARD_ACCOUNT:-}")
   r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
   aid=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
   echo "$aid" > "$CACHE/agent"
@@ -480,12 +496,13 @@ start)
 register)
   parse "$@"
   [ -n "${BOARD_HARNESS:-}" ] || die "could not work out which harness this is — set BOARD_HARNESS (claude-code|antigravity|grok|codex). We do not guess: the policy grants per harness."
+  m=$("$MANIFEST" 2>/dev/null) || m=
+  account_check "$m"
   b=$(body harness "$BOARD_HARNESS" host "$(hostname -s)" \
-           session "${BOARD_SESSION:-}" project "$(project_name "")")
+           session "${BOARD_SESSION:-}" project "$(project_name "")" account "${BOARD_ACCOUNT:-}")
   # Mirror the manifest BEFORE registering: the phase drives the merge gate, and a board
   # that does not know the project defaults to `build` — a slacker gate than the truth.
-  m=$("$MANIFEST" 2>/dev/null) && [ -n "$m" ] && \
-    mirror_manifest "$m"
+  [ -n "$m" ] && mirror_manifest "$m"
   r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
   id=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
   echo "$id" > "$CACHE/agent"
@@ -586,6 +603,10 @@ token|tokens)
             req POST "/tokens/${POS[0]}/revoke" '{}' ;;
     *) die "board token issue <harness@host-glob> [--note <n>] | owner [--note <n>] | list | revoke <id>" ;;
   esac ;;
+
+accounts)
+  parse "$@"; proj=$(jq -r '.project // empty' <<<"$(body)")
+  req GET "/accounts${proj:+?project=$proj}" ;;
 
 workspace|workspaces)
   # BOARD_WORKSPACE=<name> board token issue|owner ... issues INTO that workspace.
