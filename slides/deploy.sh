@@ -5,8 +5,6 @@ cd "$(dirname "$0")"
 K=(kubectl --context "${KUBE_CONTEXT:-default}")
 TAG=$(date -u +%Y%m%d%H%M%S)
 IMAGE=git.knobo.no/knobo/next-slides:$TAG
-npm ci --no-audit --no-fund >/dev/null
-npm run build >/dev/null
 docker build -q -t "$IMAGE" . >/dev/null
 docker push -q "$IMAGE" >/dev/null
 # The registry pull secret, copied once from a namespace that already has it.

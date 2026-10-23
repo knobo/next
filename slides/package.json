@@ -10,5 +10,10 @@
     "@slidev/cli": "^53.0.0",
     "@slidev/theme-default": "^0.25.0",
     "vue": "^3.5.0"
+  },
+  "overrides": {
+    "dompurify": "^3.4.17",
+    "image-size": "^2.0.4",
+    "monaco-editor": "^0.57.0"
   }
 }
