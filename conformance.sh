@@ -2945,6 +2945,126 @@ jq -e '[.questions[].text] | (index("ob-mine") != null) and (index("ob-theirs") 
 fi
 
 if [ "$OWN_SERVER" = 1 ]; then
+echo "== workspaces: one database per customer, tokens bound to one (§3.2c) =="
+# ws <token> <workspace|""> <method> <path> [json] → body, then the status on its own line
+ws() { local t="$1" w="$2" m="$3" p="$4"; shift 4
+  curl -sS -m 5 -w '\n%{http_code}' -X "$m" -H "Authorization: Bearer $t" -H 'Content-Type: application/json' \
+    ${w:+-H "X-Board-Workspace: $w"} ${1:+-d "$1"} "$BOARD_URL/api/v1$p"; }
+wcode() { tail -1 <<<"$1"; }
+wbody() { sed '$d' <<<"$1"; }
+[ "$(wcode "$(ws "$TOKEN" "" POST /workspaces '{"name":"kunde","_admin":true}')")" = 403 ] \
+  && ok "the shared token can NOT create a workspace, not even with _admin in the body" || no "agent creates workspace" ""
+check "the admin creates a workspace" "$(hum POST /workspaces '{"name":"kunde"}')" '.workspace=="kunde"'
+[ -f "$TMP/ws-kunde.db" ] && ok "the workspace is its own database file next to BOARD_DB" || no "no ws-kunde.db" "$(ls "$TMP")"
+[ "$(wcode "$(ws "$HUMAN_TOKEN" "" POST /workspaces '{"name":"kunde"}')")" = 409 ] \
+  && ok "creating it twice is a 409" || no "dup workspace" ""
+[ "$(wcode "$(ws "$HUMAN_TOKEN" "" POST /workspaces '{"name":"../x"}')")" = 400 ] \
+  && ok "a workspace name is a slug, not a path" || no "ws name path" ""
+[ "$(wcode "$(ws "$HUMAN_TOKEN" nosuch GET /status)")" = 404 ] \
+  && ok "an unknown workspace is a 404, never a new empty board" || no "unknown ws" ""
+[ ! -f "$TMP/ws-nosuch.db" ] && ok "… and no file was created for it" || no "nosuch created" ""
+check "the admin lists every workspace" "$(hum GET /workspaces)" '.workspaces==["default","kunde"]'
+R=$(ws "$HUMAN_TOKEN" kunde POST /tasks '{"project":"kproj","title":"customer work"}')
+KT=$(wbody "$R" | jq -r .id)
+check "the admin creates a task in the workspace" "$(wbody "$R")" '.id'
+check "the task is in the workspace" "$(wbody "$(ws "$HUMAN_TOKEN" kunde GET '/tasks?project=kproj')")" \
+  '[.tasks[]|select(.title=="customer work")]|length==1'
+check "… and not on the default board" "$(api GET '/status')" '[.projects[].name]|index("kproj")|not'
+R=$(ws "$HUMAN_TOKEN" kunde POST /tokens '{"pattern":"codex@kunde-*","note":"ws agent"}')
+check "the admin issues an agent token into the workspace" "$(wbody "$R")" '.workspace=="kunde" and .kind=="agent"'
+WAT=$(wbody "$R" | jq -r .token)
+R=$(ws "$WAT" "" POST /agents '{"project":"kproj","harness":"codex","host":"kunde-1","session":"ws-s1"}')
+check "the workspace token registers there without naming it" "$(wbody "$R")" '.id'
+WAID=$(wbody "$R" | jq -r .id)
+check "the workspace token sees the workspace's projects only" "$(wbody "$(ws "$WAT" "" GET /status)")" \
+  '([.projects[].name]|index("kproj")) and ([.projects[].name]|index("demo")|not)'
+[ "$(wcode "$(ws "$WAT" default GET /status)")" = 403 ] \
+  && ok "the workspace token naming another workspace is a 403" || no "ws token crosses" ""
+[ "$(wcode "$(ws "$WAT" "" GET "/tasks/$CT")")" = 404 ] \
+  && ok "a default-board task id does not exist for the workspace token" || no "ws token reads default task" ""
+[ "$(wcode "$(ws "$TOKEN" kunde GET /status)")" = 403 ] \
+  && ok "the shared token is the default board only" || no "shared token in ws" ""
+check "the workspace token is not in the default board's token table" "$(hum GET /tokens)" \
+  '[.tokens[]|select(.note=="ws agent")]|length==0'
+R=$(ws "$HUMAN_TOKEN" kunde POST /tokens '{"kind":"owner","note":"ws owner"}')
+WOT=$(wbody "$R" | jq -r .token)
+check "the admin issues an owner login for the workspace" "$(wbody "$R")" '.kind=="owner" and .workspace=="kunde"'
+check "the owner login acts as the human inside it" \
+  "$(wbody "$(ws "$WOT" "" POST /projects/kproj/phase '{"phase":"launch"}')")" '.phase=="launch"'
+[ "$(wcode "$(ws "$WOT" default GET /status)")" = 403 ] \
+  && ok "the owner login can NOT enter another workspace" || no "owner crosses" ""
+[ "$(wcode "$(ws "$WOT" "" POST /workspaces '{"name":"other"}')")" = 403 ] \
+  && ok "the owner login can NOT create workspaces" || no "owner creates ws" ""
+check "the owner login lists only its own workspace" "$(wbody "$(ws "$WOT" "" GET /workspaces)")" '.workspaces==["kunde"]'
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $WOT" -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BOARD_URL/mcp")" = 403 ] \
+  && ok "the owner login is refused on /mcp, like the human token" || no "owner on mcp" ""
+WP=$(curl -s -H "Authorization: Bearer $WOT" "$BOARD_URL/status")
+grep -q "kproj" <<<"$WP" && ! grep -q ">demo<" <<<"$WP" && grep -q "title='workspace'>kunde<" <<<"$WP" \
+  && ok "the owner's /status page shows the workspace and nothing of the default board" || no "owner page" ""
+! grep -q "ws=default" <<<"$WP" && ok "… and no link to the other workspaces" || no "owner sees ws links" ""
+AP=$(curl -s -H "Authorization: Bearer $HUMAN_TOKEN" -H "Cookie: board_ws=kunde" "$BOARD_URL/status")
+grep -q "kproj" <<<"$AP" && grep -q "href='/status?ws=default'" <<<"$AP" \
+  && ok "the admin's board_ws cookie picks the workspace, with links to the others" || no "admin cookie ws" ""
+AH=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/status?ws=kunde")
+grep -qi "^location: /status" <<<"$AH" && grep -qi "set-cookie: board_ws=kunde" <<<"$AH" \
+  && ok "?ws= sets the admin's cookie and redirects to a clean URL" || no "ws redirect" "$AH"
+OH=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $WOT" "$BOARD_URL/status?ws=default")
+grep -q "^HTTP/1.1 403" <<<"$OH" && ok "?ws= naming another workspace is a 403 for a workspace login" || no "owner ?ws" "$OH"
+WQ=$(wbody "$(ws "$WAT" "" POST /questions "{\"agent\":\"$WAID\",\"project\":\"kproj\",\"text\":\"ws q\",\"default\":\"x\",\"deadline\":\"2020-01-01T00:00:00Z\"}")" | jq -r .id)
+ws_defaulted() { [ "$(wbody "$(ws "$WAT" "" GET /questions)" | jq -r --arg q "$WQ" '.questions[]|select(.id==$q)|.status')" = defaulted ]; }
+ws "$WAT" "" POST /reap >/dev/null
+poll_until 10 .2 ws_defaulted && ok "reap runs in the caller's workspace (past deadline → defaulted)" || no "reaper skips ws" "$WQ"
+poll_until 30 .2 grep -q "^CLICK: .*ws=kunde" "$TMP/ntfy" \
+  && ok "a push from a workspace links into it and names it" || no "ws push link" "$(tail -4 "$TMP/ntfy")"
+grep -q "^TITLE: \[kunde\]" "$TMP/ntfy" && ok "… and the title says which workspace" || no "ws push title" ""
+# The CLI: BOARD_WORKSPACE sends the header and keys the GET cache and outbox.
+check "the CLI with BOARD_WORKSPACE reaches the workspace" \
+  "$(BOARD_WORKSPACE=kunde BOARD_TOKEN="$HUMAN_TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" board workspace list 2>/dev/null)" '.current=="kunde"'
+WD="$TMP/wsproj"; mkdir -p "$WD"; printf 'project: kproj\nphase: build\nworkspace: kunde\n' > "$WD/project.yaml"
+WT=$(cd "$WD" && env -u BOARD_HUMAN_TOKEN BOARD_TOKEN="$TOKEN" PASSWORD_STORE_DIR="$TMP/nopass" board workspace list 2>&1)
+check "a workspace: in project.yaml does NOT borrow the inherited BOARD_TOKEN (no pass entry → 401)" "$WT" '.error=="invalid token"'
+fi
+
+if [ "$OWN_SERVER" = 1 ]; then
+echo "== harness accounts: two logins are two quotas (§3.2d) =="
+RA=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"acc","session":"acc-a","account":"acc-a"}' | jq -r .id)
+RB=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"acc","session":"acc-b","account":"acc-b"}' | jq -r .id)
+api POST "/agents/$RA/heartbeat" '{"budget":[{"window":"5h","used_pct":95}]}' >/dev/null
+api POST "/agents/$RB/heartbeat" '{"budget":[{"window":"5h","used_pct":10}]}' >/dev/null
+ST=$(api GET '/status?project=demo')
+check "an account over the ceiling stops its own agent" "$ST" "[.projects[0].agents[]|select(.id==\"$RA\")][0].stop|test(\"5h\")"
+check "… and not an agent on another account of the same harness" "$ST" "[.projects[0].agents[]|select(.id==\"$RB\")][0].stop==null"
+check "the agent row carries its account" "$ST" "[.projects[0].agents[]|select(.id==\"$RB\")][0].account==\"acc-b\""
+check "/accounts names which account is over this project's ceilings" "$(api GET '/accounts?project=demo')" \
+  '(.accounts["acc-a"].stop|test("5h")) and .accounts["acc-b"].stop==null'
+check "an account name is a slug" \
+  "$(api POST /agents '{"project":"demo","harness":"claude-code","host":"acc","session":"acc-c","account":"A B"}')" '.error|test("account")'
+api POST "/agents/$RA/finished" '{}' >/dev/null; api POST "/agents/$RB/finished" '{}' >/dev/null
+# The local side: accounts.yaml, detection, and a project that allows only some accounts.
+AY="$TMP/accounts.yaml"
+printf 'acc-x:\n  harness: claude-code\n  env: {CLAUDE_CONFIG_DIR: %s/cx}\n  default: true\nacc-y:\n  harness: claude-code\n  env: {CLAUDE_CONFIG_DIR: %s/cy}\n  cmd: [echo, ran]\n' "$TMP" "$TMP" > "$AY"
+[ "$(NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/cy/" bin/accounts.py detect claude-code)" = acc-y ] \
+  && ok "accounts.py detects the account from the environment (trailing slash and all)" || no "detect" ""
+[ "$(env -u CLAUDE_CONFIG_DIR NEXT_ACCOUNTS="$AY" bin/accounts.py detect claude-code)" = acc-x ] \
+  && ok "… and the default: account when the variable is not set" || no "detect default" ""
+[ -z "$(NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/other" bin/accounts.py detect claude-code)" ] \
+  && ok "… and nothing for a login it does not know" || no "detect unknown" ""
+NR=$(NEXT_ACCOUNTS="$AY" bin/next-run acc-y hello 2>&1)
+grep -q "^ran hello$" <<<"$NR" && ok "next-run starts the account's command with its arguments" || no "next-run" "$NR"
+NE=$(NEXT_ACCOUNTS="$AY" bash -c 'eval "$(bin/accounts.py env acc-y)"; echo "$CLAUDE_CONFIG_DIR $BOARD_ACCOUNT $BOARD_HARNESS"')
+[ "$NE" = "$TMP/cy acc-y claude-code" ] && ok "next-run's environment: config dir, BOARD_ACCOUNT, BOARD_HARNESS" || no "accounts env" "$NE"
+AD="$TMP/accproj"; mkdir -p "$AD"; printf 'project: accproj\nphase: build\naccounts: [acc-y]\n' > "$AD/project.yaml"
+AR=$(cd "$AD" && NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/cx" board register 2>&1)
+grep -q "runs on the accounts: acc-y — this session is acc-x" <<<"$AR" \
+  && ok "a project with accounts: refuses a session on another login" || no "account refuse" "$AR"
+check "… before anything reached the board" "$(api GET /status)" '[.projects[].name]|index("accproj")|not'
+AR=$(cd "$AD" && NEXT_ACCOUNTS="$AY" CLAUDE_CONFIG_DIR="$TMP/cy" BOARD_SESSION=acc-ok board register 2>/dev/null)
+check "… and registers one on an allowed login, with the account" "$AR" '.id'
+check "the registered agent's account is acc-y" "$(api GET '/status?project=accproj')" '.projects[0].agents[0].account=="acc-y"'
+fi
+
+if [ "$OWN_SERVER" = 1 ]; then
 echo "== MCP endpoint /mcp (T-859) =="
 # mcp <token> <json-rpc body> [extra curl args...] → the body, then the status on its own line
 mcp() { local t="$1" b="$2"; shift 2

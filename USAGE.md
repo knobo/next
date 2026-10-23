@@ -191,6 +191,57 @@ After that `/next` works in that project. If the phase is `launch` or `live` wit
 `onboarding:` pointing at a file, the skill refuses to start — a project with users must not be
 run on the general rules alone (§10).
 
+## Workspaces: a customer, a demo, your private projects
+
+One board, one database per workspace (DESIGN.md §3.2c). Your private projects are the `default`
+workspace. A customer gets its own, and nothing in it can see or touch the others.
+
+```bash
+board workspace create kunde                     # admin (your human token)
+BOARD_WORKSPACE=kunde board token issue 'claude-code@kunde-*' --note "laptop at the customer"
+BOARD_WORKSPACE=kunde board token owner --note "browser login"
+pass insert board/ws/kunde/token                 # the agent token printed above
+pass insert board/ws/kunde/owner-token           # the owner login printed above
+```
+
+Then put `workspace: kunde` in the customer project's `project.yaml`. Every `board` call from that
+project uses the workspace and its own token, and refuses rather than falling back to another.
+
+- **Browser.** `board open --qr` from the customer project logs a device in with the owner login:
+  it sees that workspace and nothing else — the right login for a demo. With the admin token
+  every page shows the workspace as a badge and links to the others.
+- **Admin.** Your human token reaches every workspace; `board workspace list` shows them.
+- **At the customer** put only that workspace's tokens on the machine. An agent can read
+  whatever `pass` holds.
+
+## Several logins: Claude, Codex, Antigravity
+
+Name each login once per machine, in `~/.config/next/accounts.yaml` (DESIGN.md §3.2d):
+
+```yaml
+claude-privat: {harness: claude-code, env: {CLAUDE_CONFIG_DIR: ~/.claude}, default: true}
+claude-kunde:  {harness: claude-code, env: {CLAUDE_CONFIG_DIR: ~/.claude-kunde}}
+codex-privat:  {harness: codex, env: {CODEX_HOME: ~/.codex}}
+gemini-privat: {harness: antigravity, cmd: [antigravity, --user-data-dir, ~/.antigravity-privat]}
+```
+
+Log in once inside each one (`CLAUDE_CONFIG_DIR=~/.claude-kunde claude`, then `/login`). After that:
+
+```bash
+next-run claude-kunde          # start Claude on that login, here
+next-run --auto                # the first allowed login that is not over the ceiling
+next-run --list
+board accounts --project kproj # quota per login, and which are over
+```
+
+Each login has its own quota on the board. A customer project pins its logins with
+`accounts: [claude-kunde]` in `project.yaml`; a session on any other login is refused at
+`board start`. A running session cannot change login: when one runs dry, end it and start the
+next with `next-run --auto`. The board hands the work over.
+
+Check `cmd:` for Antigravity against your own install: which flag picks the profile depends on
+the version.
+
 ## What you have to do yourself (agents cannot)
 
 - **Branch protection** on the forge. The agent's token is not an admin token. Without branch

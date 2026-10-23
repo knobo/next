@@ -299,6 +299,9 @@ code), and the human tests in dev or prod after deploy.
   `ui/build.sh` fails if the stylesheet ever fetches anything over the network.
 - Pod: `runAsNonRoot`, `readOnlyRootFilesystem`, all capabilities dropped. A Traefik rate limit of
   20/s in front of the ingress.
+- **Workspaces** (DESIGN.md §3.2c): one SQLite file per customer. A token reaches only the
+  workspace it was issued in; the human token is the admin over all of them. A demo or a customer
+  sees its own workspace and nothing of the owner's private projects.
 - Grants come from `board-policy.json` on the board — an agent cannot give itself merge or prod
   rights (DESIGN.md §3.7).
 - The same holds for everything the owner decides: the quota ceiling, the review limit, the phase,
