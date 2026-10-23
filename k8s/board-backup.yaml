@@ -25,13 +25,16 @@ spec:
                 - |
                   set -e
                   D=$(date -u +%Y%m%d)
+                  # Every workspace is its own file (ws-<name>.db, DESIGN.md §3.2c).
                   python3 -c "
-                  import sqlite3, sys
-                  s = sqlite3.connect('/data/board.db')
-                  d = sqlite3.connect('/backup/board-$D.db')
-                  s.backup(d); d.close(); s.close()
+                  import glob, os, sqlite3
+                  for f in ['/data/board.db'] + sorted(glob.glob('/data/ws-*.db')):
+                      n = os.path.basename(f)[:-3].replace('ws-', 'board-ws-', 1)
+                      s = sqlite3.connect(f)
+                      d = sqlite3.connect('/backup/%s-$D.db' % n)
+                      s.backup(d); d.close(); s.close()
                   "
-                  gzip -f "/backup/board-$D.db"
+                  gzip -f /backup/board*-$D.db
                   # 14 days. The board is small files; it is lost HISTORY that costs.
                   find /backup -name 'board-*.db.gz' -mtime +14 -delete
                   ls -la /backup | tail -5

@@ -191,6 +191,29 @@ After that `/next` works in that project. If the phase is `launch` or `live` wit
 `onboarding:` pointing at a file, the skill refuses to start — a project with users must not be
 run on the general rules alone (§10).
 
+## Workspaces: a customer, a demo, your private projects
+
+One board, one database per workspace (DESIGN.md §3.2c). Your private projects are the `default`
+workspace. A customer gets its own, and nothing in it can see or touch the others.
+
+```bash
+board workspace create kunde                     # admin (your human token)
+BOARD_WORKSPACE=kunde board token issue 'claude-code@kunde-*' --note "laptop at the customer"
+BOARD_WORKSPACE=kunde board token owner --note "browser login"
+pass insert board/ws/kunde/token                 # the agent token printed above
+pass insert board/ws/kunde/owner-token           # the owner login printed above
+```
+
+Then put `workspace: kunde` in the customer project's `project.yaml`. Every `board` call from that
+project uses the workspace and its own token, and refuses rather than falling back to another.
+
+- **Browser.** `board open --qr` from the customer project logs a device in with the owner login:
+  it sees that workspace and nothing else — the right login for a demo. With the admin token
+  every page shows the workspace as a badge and links to the others.
+- **Admin.** Your human token reaches every workspace; `board workspace list` shows them.
+- **At the customer** put only that workspace's tokens on the machine. An agent can read
+  whatever `pass` holds.
+
 ## What you have to do yourself (agents cannot)
 
 - **Branch protection** on the forge. The agent's token is not an admin token. Without branch

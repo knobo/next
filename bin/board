@@ -5,6 +5,28 @@
 set -uo pipefail
 
 : "${BOARD_URL:=http://localhost:8080}"
+# The workspace (one database per customer on the board, DESIGN.md §3.2c). Named in the
+# environment, or by `workspace:` in the nearest project.yaml. A workspace taken from the
+# manifest never borrows an inherited BOARD_TOKEN: that token belongs to whatever shell
+# started the agent, and sending it here is exactly the mix-up workspaces exist to stop.
+# Its own token comes from `pass board/ws/<name>/token`; none = 401, never a fallback.
+if [ -n "${BOARD_WORKSPACE:-}" ]; then
+  WS_FROM=env
+else
+  WS_FROM=manifest; _d="${BOARD_PROJECT_ROOT:-$PWD}"
+  while :; do
+    if [ -f "$_d/project.yaml" ]; then
+      BOARD_WORKSPACE=$(sed -n 's/^workspace:[[:space:]]*["'"'"']\{0,1\}\([a-z0-9-]*\).*/\1/p' "$_d/project.yaml" | head -1)
+      break
+    fi
+    { [ "$_d" = "$HOME" ] || [ "$_d" = / ]; } && break
+    _d=$(dirname "$_d")
+  done
+fi
+[ "${BOARD_WORKSPACE:-}" = default ] && BOARD_WORKSPACE=
+if [ -n "${BOARD_WORKSPACE:-}" ] && [ "$WS_FROM" = manifest ]; then
+  BOARD_TOKEN=$(pass "board/ws/$BOARD_WORKSPACE/token" 2>/dev/null | head -1)
+fi
 # The token is fetched from `pass` when it is not in the environment — that spares every
 # session the env plumbing.
 : "${BOARD_TOKEN:=$(pass board/token 2>/dev/null | head -1)}"
@@ -58,7 +80,10 @@ fi
 # is how the conformance suite and a deliberate caller pass it in.
 : "${BOARD_HUMAN_TOKEN:=}"
 if [ -z "$BOARD_HUMAN_TOKEN" ] && { [ -z "$AGENT_SESSION" ] || [ -n "${BOARD_AS_HUMAN:-}" ]; }; then
-  BOARD_HUMAN_TOKEN=$(pass board/human-token 2>/dev/null | head -1)
+  # In a workspace the owner login for it first (least privilege: it reaches nothing
+  # else), the admin token only when this machine has no workspace login.
+  [ -n "${BOARD_WORKSPACE:-}" ] && BOARD_HUMAN_TOKEN=$(pass "board/ws/$BOARD_WORKSPACE/owner-token" 2>/dev/null | head -1)
+  [ -n "$BOARD_HUMAN_TOKEN" ] || BOARD_HUMAN_TOKEN=$(pass board/human-token 2>/dev/null | head -1)
 fi
 [ -n "$BOARD_HUMAN_TOKEN" ] && BOARD_TOKEN="$BOARD_HUMAN_TOKEN"
 
@@ -83,6 +108,11 @@ OUTBOX="$CACHE/outbox.jsonl"
 mkdir -p "$CACHE/cache"
 
 die() { echo "board: $*" >&2; exit 2; }
+# The statusline hook heartbeats with curl, not through this CLI: it reads the session's
+# workspace from here, or it heartbeats a workspace agent into the default board (404)
+# and the reaper calls it dead.
+ws_mark() { if [ -n "${BOARD_WORKSPACE:-}" ]; then echo "$BOARD_WORKSPACE" > "$CACHE/session-$1.ws"
+            else rm -f "$CACHE/session-$1.ws"; fi; }
 
 # Reads the file argument of --spec-file. `-` means stdin, and it MUST be
 # read into a variable first: otherwise jq shares fd 0 with the here-string that is the
@@ -157,7 +187,7 @@ req() {  # req METHOD PATH [JSON] [--nocache]
   flush_outbox
   out=$(curl -sS -m 5 -w '\n%{http_code}' -X "$method" \
         -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \
-        ${data:+-d "$data"} "$BOARD_URL/api/v1$path" 2>/dev/null)
+        ${BOARD_WORKSPACE:+-H "X-Board-Workspace: $BOARD_WORKSPACE"} ${data:+-d "$data"} "$BOARD_URL/api/v1$path" 2>/dev/null)
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   # A 5xx is the board being down just as much as a broken TCP call: during `rollout
   # restart` Traefik answers 503 with "no available server" in plain text. Without this
@@ -174,7 +204,7 @@ req() {  # req METHOD PATH [JSON] [--nocache]
   # JSON only in the cache. An error page written here would have poisoned every
   # subsequent offline answer, long after the board was back up.
   if [ "$method" = GET ] && jq -e . >/dev/null 2>&1 <<<"$out"; then
-    echo "$out" > "$CACHE/cache/$(echo "$path" | md5sum | cut -c1-16).json"
+    echo "$out" > "$CACHE/cache/$(echo "${BOARD_WORKSPACE:+$BOARD_WORKSPACE:}$path" | md5sum | cut -c1-16).json"
   fi
   echo "$out"
   [ "$code" -lt 300 ] && return 0
@@ -193,7 +223,7 @@ fresh_or_die() {
 offline() {  # the board is not answering
   local method="$1" path="$2" data="${3:-}"
   if [ "$method" = GET ]; then
-    local f="$CACHE/cache/$(echo "$path" | md5sum | cut -c1-16).json"
+    local f="$CACHE/cache/$(echo "${BOARD_WORKSPACE:+$BOARD_WORKSPACE:}$path" | md5sum | cut -c1-16).json"
     if [ -s "$f" ]; then jq -c '. + {stale:true}' "$f"; return 0; fi
     echo '{"stale":true,"error":"the board is down and there is no cache"}'; return 0
   fi
@@ -201,9 +231,10 @@ offline() {  # the board is not answering
     /roles/*/claim) echo '{"error":"board down — a role claim is never queued (DESIGN §3.8)"}' >&2; return 1;;
     /agents/*/grants*) echo '{"error":"board down — grant/revoke is never queued"}' >&2; return 1;;
     /tokens*) echo '{"error":"board down — token issue/revoke is never queued"}' >&2; return 1;;
+    /workspaces*) echo '{"error":"board down — workspace create is never queued"}' >&2; return 1;;
   esac
   jq -nc --arg m "$method" --arg p "$path" --arg d "$data" --arg f "$(token_fp)" \
-    '{method:$m,path:$p,body:$d,fp:$f}' >> "$OUTBOX"
+    --arg w "${BOARD_WORKSPACE:-}" '{method:$m,path:$p,body:$d,fp:$f,ws:$w}' >> "$OUTBOX"
   echo '{"queued":true}'
 }
 
@@ -228,10 +259,13 @@ flush_outbox() {
     # No fp = queued before T-858, when there was only the shared token: replay as before.
     f=$(jq -r '.fp // empty' <<<"$line")
     [ -n "$f" ] && [ "$f" != "$myfp" ] && { echo "$line" >> "$OUTBOX"; continue; }
+    # The admin token is the same in every workspace: the fp alone does not keep a write
+    # queued in one from being replayed into another.
+    [ "$(jq -r '.ws // ""' <<<"$line")" != "${BOARD_WORKSPACE:-}" ] && { echo "$line" >> "$OUTBOX"; continue; }
     m=$(jq -r .method <<<"$line"); p=$(jq -r .path <<<"$line"); d=$(jq -r .body <<<"$line")
     code=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X "$m" \
       -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \
-      ${d:+-d "$d"} "$BOARD_URL/api/v1$p" 2>/dev/null)
+      ${BOARD_WORKSPACE:+-H "X-Board-Workspace: $BOARD_WORKSPACE"} ${d:+-d "$d"} "$BOARD_URL/api/v1$p" 2>/dev/null)
     # 000 = never arrived → try again. Everything else is ANSWERED, including 409: a lost
     # claim must not be replayed forever.
     [ "$code" = 000 ] && echo "$line" >> "$OUTBOX"
@@ -295,7 +329,8 @@ finished::board finished::Mark this agent's session finished.
 inbox::board inbox [--as <role>]::List this agent's pending questions and messages.
 grant::board grant <agent> <grant> [--project <p>] [--json]::Grant a capability to an agent.
 revoke::board revoke <agent> <grant> [--project <p>] [--json]::Revoke a capability from an agent.
-token|tokens::board token issue <harness@host-glob> [--note <n>] | list | revoke <id>::Per-agent tokens bound to an identity (human token).
+token|tokens::board token issue <harness@host-glob> [--note <n>] | owner [--note <n>] | list | revoke <id>::Per-agent tokens bound to an identity, or the owner login for the current workspace (human token).
+workspace|workspaces::board workspace list | create <name>::Workspaces: one database per customer; create needs the admin token.
 grants::board grants [agent] [--project <p>] [--json]::List an agent's grants.
 agent|agents::board agent cleanup [--older-than <dur>] [--project <p>] [--all]::Agent maintenance (cleanup dead agents).
 project::board project detect|show|init|sync|set::Project manifest operations.
@@ -391,7 +426,7 @@ start)
   r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
   aid=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
   echo "$aid" > "$CACHE/agent"
-  [ -n "$sess" ] && echo "$aid" > "$CACHE/session-$sess"
+  [ -n "$sess" ] && echo "$aid" > "$CACHE/session-$sess" && ws_mark "$sess"
 
   actual_role="$role"
   if [ "$role" = "coordinator" ]; then
@@ -454,7 +489,7 @@ register)
   r=$(req POST /agents "$b") || { echo "$r"; exit 1; }
   id=$(jq -r .id <<<"$r"); sess=$(jq -r '.session // empty' <<<"$b")
   echo "$id" > "$CACHE/agent"
-  [ -n "$sess" ] && echo "$id" > "$CACHE/session-$sess"
+  [ -n "$sess" ] && echo "$id" > "$CACHE/session-$sess" && ws_mark "$sess"
   echo "$r" ;;
 
 heartbeat)
@@ -545,10 +580,21 @@ token|tokens)
   case "$sub" in
     issue)  [ -n "${POS[0]:-}" ] || die "board token issue <harness@host-glob> [--note <n>]"
             req POST /tokens "$(jq -c --arg p "${POS[0]}" '{pattern:$p, note:.note}' <<<"$b")" ;;
+    owner)  req POST /tokens "$(jq -c '{kind:"owner", note:.note}' <<<"$b")" ;;
     list)   req GET /tokens ;;
     revoke) [ -n "${POS[0]:-}" ] || die "board token revoke <id>"
             req POST "/tokens/${POS[0]}/revoke" '{}' ;;
-    *) die "board token issue <harness@host-glob> [--note <n>] | list | revoke <id>" ;;
+    *) die "board token issue <harness@host-glob> [--note <n>] | owner [--note <n>] | list | revoke <id>" ;;
+  esac ;;
+
+workspace|workspaces)
+  # BOARD_WORKSPACE=<name> board token issue|owner ... issues INTO that workspace.
+  sub="${1:-list}"; shift || true; parse "$@"
+  case "$sub" in
+    list)   req GET /workspaces ;;
+    create) [ -n "${POS[0]:-}" ] || die "board workspace create <name>"
+            req POST /workspaces "$(jq -nc --arg n "${POS[0]}" '{name:$n}')" ;;
+    *) die "board workspace list | create <name>" ;;
   esac ;;
 
 agent|agents)
@@ -1114,6 +1160,7 @@ so once — do not put it in a shell profile, an agent started from that profile
   fi
   url="$BOARD_URL/${what#/}"
   case "$url" in *\?*) url="$url&t=$BOARD_TOKEN";; *) url="$url?t=$BOARD_TOKEN";; esac
+  [ -n "${BOARD_WORKSPACE:-}" ] && url="$url&ws=$BOARD_WORKSPACE"
   # The token is 43 characters — impossible to type on a phone. With qrencode installed
   # the phone scans the one-time link and gets the cookie for 90 days.
   if $qr || ! command -v xdg-open >/dev/null; then

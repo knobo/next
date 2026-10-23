@@ -22,6 +22,13 @@ if [ -n "$BOARD_SESS" ]; then
   CACHE="$CACHE_ROOT/$(printf '%s' "${BOARD_URL#*://}" | tr -c 'A-Za-z0-9._-' '_')"
   AGENT_ID=""
   [ -s "$CACHE/session-$BOARD_SESS" ] && AGENT_ID=$(cat "$CACHE/session-$BOARD_SESS")
+  # A session registered in a workspace (bin/board ws_mark) heartbeats there, with that
+  # workspace's token — the inherited one belongs to another workspace, unless the
+  # environment names this workspace itself.
+  WS=$(cat "$CACHE/session-$BOARD_SESS.ws" 2>/dev/null)
+  if [ -n "$WS" ] && [ "${BOARD_WORKSPACE:-}" != "$WS" ]; then
+    BOARD_TOKEN=$(pass "board/ws/$WS/token" 2>/dev/null | head -1)
+  fi
 else
   AGENT_ID=$(cat "$CACHE_ROOT/agent" 2>/dev/null)
 fi
@@ -33,4 +40,5 @@ fi
             resets_at:.rate_limits.seven_day.resets_at}]
            | map(select(.used_pct != null))}' <<<"$input" \
  | curl -s -m 1 -H "Authorization: Bearer $BOARD_TOKEN" -H 'Content-Type: application/json' \
+     ${WS:+-H "X-Board-Workspace: $WS"} \
      -d @- "$BOARD_URL/api/v1/agents/$AGENT_ID/heartbeat" >/dev/null 2>&1 & )

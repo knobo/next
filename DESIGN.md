@@ -191,6 +191,46 @@ with the project, it works without a network, and a human changes the phase by e
 The board keeps a *copy* (`projects.manifest` as JSON) so that an agent on another machine that
 does not have the project checked out can still see the phase and the repos.
 
+### 3.2c Workspaces — one database per customer
+
+§3.2(a) says one board for everything, and that holds for one person's own projects. It stops
+holding the moment the board is used at a customer, or shown in a demo: a customer's agent must
+not see, or be able to reach, the owner's private projects, and a demo must not show them.
+`current_project` (§3.2) separates projects *by accident*; it is not a boundary — any token can
+name any project.
+
+**A workspace is a database file, not a column.** `default` is `BOARD_DB` itself (so a board from
+before workspaces is simply the default workspace); every other workspace is `ws-<name>.db` next
+to it. Tasks, questions, agents, roles, grants, events and tokens all live inside the file. A
+query that forgets a filter cannot leak across, because the other workspace's rows are not there.
+Per request the handler points the global `db` at the caller's workspace, under the same global
+lock every handler already runs under; the reaper walks every workspace in turn.
+
+**The token decides the workspace:**
+
+| Token | Reaches |
+|---|---|
+| `BOARD_HUMAN_TOKEN` | **admin**: every workspace. Names one with `X-Board-Workspace`, `?ws=` (sticks as the `board_ws` cookie in a browser) — default otherwise. The only token that creates workspaces. |
+| `BOARD_TOKEN` (shared) | the default workspace only |
+| `bat_…` agent token | the workspace it was issued in, bound to `harness@host` as before (T-858) |
+| `bat_…` owner token (`board token owner`) | the human, inside the workspace it was issued in — the browser login for a customer or a demo |
+
+Naming a workspace the token is not bound to is a **403**, never a quiet fallback to its own: the
+caller believes it is somewhere it is not. An unknown workspace is a 404, never a new empty file.
+
+**The CLI** takes the workspace from `BOARD_WORKSPACE`, or from `workspace: <name>` in
+`project.yaml`. A workspace that comes from the manifest uses `pass board/ws/<name>/token` and
+**never** an inherited `BOARD_TOKEN` — that token belongs to whatever shell started the agent. The
+human side uses `board/ws/<name>/owner-token` first and the admin token only as a fallback. The
+GET cache and the outbox are keyed on the workspace, so an offline answer or a queued write from
+one is never replayed into another.
+
+**Not isolated:** `board-policy.json` is one file, keyed on project name — a project called `web`
+in two workspaces gets the same grants and ceilings. `/metrics` has no token and therefore shows
+the default workspace only. And as with the human token (§3.7), a token in `pass` on a machine an
+agent runs on is a token the agent can read: at a customer, put only that workspace's tokens on
+the machine.
+
 ### 3.3 (b) Technology choice — an honest assessment
 
 The requirements, weighted: **(K1)** append-only events with streams, **(K2)** frequent small

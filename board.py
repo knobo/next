@@ -105,101 +105,182 @@ CREATE TABLE IF NOT EXISTS messages (
 # Simplification: one global lock around every handler. SQLite serializes writes
 # anyway and the load is 5 agents; per-table locking if it ever becomes a bottleneck.
 LOCK = threading.Lock()
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
-# SQLite's own LOWER() is ASCII-only — LOWER('ÅPEN') yields 'Åpen'. A non-ASCII
-# default answer is then read as confirmation one way and as an override the other.
-# One normalization, Python's, on both sides.
-db.create_function("ulower", 1, lambda v: v.lower() if isinstance(v, str) else v)
-db.executescript(SCHEMA)
-for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
-                          ("agents", "budget", "TEXT"),
-                          ("tasks", "routine", "TEXT"),
-                          ("grants", "source", "TEXT DEFAULT 'policy'"),
-                          # The estimate is a RELATIVE size, not hours, and the point of
-                          # keeping who/what estimated is that the board can then answer
-                          # "which model estimates well" — the model on the agent row is
-                          # not enough, because agents are cleaned up and a session can
-                          # change model. Snapshot both at the moment the number is given.
-                          ("tasks", "estimate", "INTEGER"),
-                          ("tasks", "estimate_by", "TEXT"),
-                          ("tasks", "estimate_model", "TEXT"),
-                          ("projects", "ceilings", "TEXT"),
-                          ("projects", "wip", "INTEGER"),
-                          # Planning (see PLAN_FIELDS). `after` held in the title before
-                          # this — "[ETTER T-586 merget]" — where no agent could see it and
-                          # nothing stopped the task being picked first. `human` marks work
-                          # only the owner can do; agents claimed those and let them orphan.
-                          ("tasks", "after", "TEXT"),
-                          ("tasks", "human", "INTEGER"),
-                          ("tasks", "kind", "TEXT"),
-                          ("tasks", "milestone", "TEXT"),
-                          ("questions", "cmds", "TEXT")):
+def open_db(path):
+    """One workspace's database, schema and migrations applied. Sets the global `db`
+    too: everything below the request layer reads that one name (see use_ws)."""
+    global db
+    db = sqlite3.connect(path, check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    # SQLite's own LOWER() is ASCII-only — LOWER('ÅPEN') yields 'Åpen'. A non-ASCII
+    # default answer is then read as confirmation one way and as an override the other.
+    # One normalization, Python's, on both sides.
+    db.create_function("ulower", 1, lambda v: v.lower() if isinstance(v, str) else v)
+    db.executescript(SCHEMA)
+    for _tbl, _col, _decl in (("projects", "paused", "TEXT"),
+                              ("agents", "budget", "TEXT"),
+                              ("tasks", "routine", "TEXT"),
+                              ("grants", "source", "TEXT DEFAULT 'policy'"),
+                              # The estimate is a RELATIVE size, not hours, and the point of
+                              # keeping who/what estimated is that the board can then answer
+                              # "which model estimates well" — the model on the agent row is
+                              # not enough, because agents are cleaned up and a session can
+                              # change model. Snapshot both at the moment the number is given.
+                              ("tasks", "estimate", "INTEGER"),
+                              ("tasks", "estimate_by", "TEXT"),
+                              ("tasks", "estimate_model", "TEXT"),
+                              ("projects", "ceilings", "TEXT"),
+                              ("projects", "wip", "INTEGER"),
+                              # Planning (see PLAN_FIELDS). `after` held in the title before
+                              # this — "[ETTER T-586 merget]" — where no agent could see it and
+                              # nothing stopped the task being picked first. `human` marks work
+                              # only the owner can do; agents claimed those and let them orphan.
+                              ("tasks", "after", "TEXT"),
+                              ("tasks", "human", "INTEGER"),
+                              ("tasks", "kind", "TEXT"),
+                              ("tasks", "milestone", "TEXT"),
+                              ("questions", "cmds", "TEXT"),
+                          # 'owner' = the human inside ONE workspace (workspace login).
+                          ("agent_tokens", "kind", "TEXT")):
 
-    try:                                # database from before the column existed
-        db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
-    except sqlite3.OperationalError:
-        pass
-# Reading the log BY TYPE: the cost of a task is folded out of its task.progress events,
-# and both /status and /metrics do it — /metrics under the global lock, where every agent
-# call waits behind it. Measured against the live board's own database: /status 726 ms →
-# 214 ms, /metrics 95 ms → 24 ms.
+        try:                                # database from before the column existed
+            db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (_tbl, _col, _decl))
+        except sqlite3.OperationalError:
+            pass
+    # Reading the log BY TYPE: the cost of a task is folded out of its task.progress events,
+    # and both /status and /metrics do it — /metrics under the global lock, where every agent
+    # call waits behind it. Measured against the live board's own database: /status 726 ms →
+    # 214 ms, /metrics 95 ms → 24 ms.
+    #
+    # OUT of SCHEMA and into a try, deliberately. An index is an optimisation: the board ran
+    # without this one for its whole life and merely scanned more rows. Inside executescript()
+    # it was load-bearing instead — the first deploy of it met a `disk I/O error` on the live
+    # volume, which I have not been able to reproduce anywhere since (same code against a copy
+    # of that database, same securityContext with no writable temp directory, a concurrent
+    # writer: all fine), and because the statement sat in the fatal block the board did not
+    # start at all. Four restarts, CrashLoopBackOff, the board 503 until it was rolled back.
+    # Whatever that I/O error was, the fault worth fixing is that a slower query was allowed
+    # to become an outage.
+    try:
+        db.execute("CREATE INDEX IF NOT EXISTS events_type ON events(type, project, id)")
+    except sqlite3.Error as _e:
+        # The EXTENDED code, not just "disk I/O error". SQLITE_IOERR is a family — _WRITE,
+        # _FSYNC, _SHMOPEN, _GETTEMPPATH and a dozen more — and they have entirely different
+        # causes. The plain message is what this failure has offered so far, and it is not
+        # enough to act on. sqlite_errorcode/sqlite_errorname are Python 3.11+, hence getattr.
+        print("could not create the events(type) index — the board runs, reading the log by "
+              "type is slower: %s (%s/%s)" % (
+                  _e, getattr(_e, "sqlite_errorname", "?"),
+                  getattr(_e, "sqlite_errorcode", "?")), file=sys.stderr, flush=True)
+
+    _cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
+    if {"rl5_pct", "rl7_pct"} <= _cols:      # T-164: existing database, old columns still there
+        for _r in db.execute("SELECT id,rl5_pct,rl5_reset,rl7_pct FROM agents WHERE budget IS NULL "
+                             "AND (rl5_pct IS NOT NULL OR rl7_pct IS NOT NULL)").fetchall():
+            _ws = ([{"window": "5h", "used_pct": _r["rl5_pct"], "resets_at": _r["rl5_reset"]}]
+                   if _r["rl5_pct"] is not None else [])
+            if _r["rl7_pct"] is not None:
+                _ws.append({"window": "7d", "used_pct": _r["rl7_pct"]})
+            db.execute("UPDATE agents SET budget=? WHERE id=?", (json.dumps(_ws), _r["id"]))
+    # T-352: the human test stage is gone, and nothing moves a task out of `awaiting_human`
+    # any more. These rows are not fresh work: a PR means the task is `in_review`, a
+    # worktree/branch with no PR means it was `orphaned` (matches how the reaper and
+    # task_claim already treat existing work — see agents_cleanup and task_next). Only a
+    # row with neither goes back to `open`. Idempotent: a second boot finds no rows.
+    _NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+    for _r in db.execute("SELECT id, project, pr, branch, worktree FROM tasks "
+                         "WHERE status='awaiting_human'").fetchall():
+        if _r["pr"]:
+            _status = "in_review"
+        elif _r["branch"] or _r["worktree"]:
+            _status = "orphaned"
+        else:
+            _status = "open"
+        db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=%s "
+                   "WHERE id=?" % _NOW, (_status, _r["id"]))
+        db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (_r["id"],))
+        db.execute("INSERT INTO events (ts,project,stream,type,actor,body) VALUES (%s,?,?,?,?,?)" % _NOW,
+                   (_r["project"] or "_global", "task/" + _r["id"],
+                    "task.orphaned" if _status == "orphaned" else "task.released", "board",
+                    json.dumps({"note": "human test stage removed (T-352)", "status": _status})))
+    db.execute("UPDATE questions SET status='answered', answered_by='board', read=1, answered=%s, "
+               "answer='withdrawn: human test stage removed (T-352)' "
+               "WHERE kind='test' AND status='open'" % _NOW)
+    db.commit()
+    return db
+
+
+# ---------- workspaces ----------------------------------------------------
+# A workspace is a DATABASE, not a column: one SQLite file per customer (or private
+# area), next to BOARD_DB. Isolation is then structural — a query that forgets to filter
+# cannot leak another workspace's tasks, because they are not in the file. "default" is
+# BOARD_DB itself, so a board from before workspaces is simply the default workspace.
 #
-# OUT of SCHEMA and into a try, deliberately. An index is an optimisation: the board ran
-# without this one for its whole life and merely scanned more rows. Inside executescript()
-# it was load-bearing instead — the first deploy of it met a `disk I/O error` on the live
-# volume, which I have not been able to reproduce anywhere since (same code against a copy
-# of that database, same securityContext with no writable temp directory, a concurrent
-# writer: all fine), and because the statement sat in the fatal block the board did not
-# start at all. Four restarts, CrashLoopBackOff, the board 503 until it was rolled back.
-# Whatever that I/O error was, the fault worth fixing is that a slower query was allowed
-# to become an outage.
-try:
-    db.execute("CREATE INDEX IF NOT EXISTS events_type ON events(type, project, id)")
-except sqlite3.Error as _e:
-    # The EXTENDED code, not just "disk I/O error". SQLITE_IOERR is a family — _WRITE,
-    # _FSYNC, _SHMOPEN, _GETTEMPPATH and a dozen more — and they have entirely different
-    # causes. The plain message is what this failure has offered so far, and it is not
-    # enough to act on. sqlite_errorcode/sqlite_errorname are Python 3.11+, hence getattr.
-    print("could not create the events(type) index — the board runs, reading the log by "
-          "type is slower: %s (%s/%s)" % (
-              _e, getattr(_e, "sqlite_errorname", "?"),
-              getattr(_e, "sqlite_errorcode", "?")), file=sys.stderr, flush=True)
+# Who reaches which workspace is the TOKEN's to say:
+#   BOARD_HUMAN_TOKEN  admin: every workspace, picked per request (?ws=, X-Board-Workspace,
+#                      the board_ws cookie); default when none is named
+#   BOARD_TOKEN        the shared agent token: default only
+#   bat_ agent token   the workspace whose database holds its hash, nothing else
+#   bat_ owner token   the human inside that one workspace (kind='owner')
+WS_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+WS_DIR = os.path.dirname(os.path.abspath(DB_PATH))
+DBS = {"default": open_db(DB_PATH)}
+CUR_WS, CUR_ADMIN = "default", False
 
-_cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
-if {"rl5_pct", "rl7_pct"} <= _cols:      # T-164: existing database, old columns still there
-    for _r in db.execute("SELECT id,rl5_pct,rl5_reset,rl7_pct FROM agents WHERE budget IS NULL "
-                         "AND (rl5_pct IS NOT NULL OR rl7_pct IS NOT NULL)").fetchall():
-        _ws = ([{"window": "5h", "used_pct": _r["rl5_pct"], "resets_at": _r["rl5_reset"]}]
-               if _r["rl5_pct"] is not None else [])
-        if _r["rl7_pct"] is not None:
-            _ws.append({"window": "7d", "used_pct": _r["rl7_pct"]})
-        db.execute("UPDATE agents SET budget=? WHERE id=?", (json.dumps(_ws), _r["id"]))
-# T-352: the human test stage is gone, and nothing moves a task out of `awaiting_human`
-# any more. These rows are not fresh work: a PR means the task is `in_review`, a
-# worktree/branch with no PR means it was `orphaned` (matches how the reaper and
-# task_claim already treat existing work — see agents_cleanup and task_next). Only a
-# row with neither goes back to `open`. Idempotent: a second boot finds no rows.
-_NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
-for _r in db.execute("SELECT id, project, pr, branch, worktree FROM tasks "
-                     "WHERE status='awaiting_human'").fetchall():
-    if _r["pr"]:
-        _status = "in_review"
-    elif _r["branch"] or _r["worktree"]:
-        _status = "orphaned"
-    else:
-        _status = "open"
-    db.execute("UPDATE tasks SET status=?, owner=NULL, lease_until=NULL, updated=%s "
-               "WHERE id=?" % _NOW, (_status, _r["id"]))
-    db.execute("UPDATE agents SET current_task=NULL WHERE current_task=?", (_r["id"],))
-    db.execute("INSERT INTO events (ts,project,stream,type,actor,body) VALUES (%s,?,?,?,?,?)" % _NOW,
-               (_r["project"] or "_global", "task/" + _r["id"],
-                "task.orphaned" if _status == "orphaned" else "task.released", "board",
-                json.dumps({"note": "human test stage removed (T-352)", "status": _status})))
-db.execute("UPDATE questions SET status='answered', answered_by='board', read=1, answered=%s, "
-           "answer='withdrawn: human test stage removed (T-352)' "
-           "WHERE kind='test' AND status='open'" % _NOW)
-db.commit()
+
+def ws_names():
+    names = {f[3:-3] for f in os.listdir(WS_DIR) if f.startswith("ws-") and f.endswith(".db")}
+    return ["default"] + sorted(n for n in names if WS_RE.match(n) and n != "default")
+
+
+def ws_db(name):
+    """The open connection for a workspace that EXISTS. Never creates one: a typo in
+    ?ws= must be a 404, not a new empty board."""
+    if name not in DBS:
+        if name not in ws_names():
+            raise Err(404, "unknown workspace %s" % name)
+        ws_open(name)
+    return DBS[name]
+
+
+def ws_open(name):
+    global db
+    prev = db                              # open_db moves the global; the caller's stays
+    DBS[name] = open_db(os.path.join(WS_DIR, "ws-%s.db" % name))
+    db = prev
+
+
+def use_ws(name, admin=False):
+    """Point the global `db` at a workspace. Only ever under LOCK — every handler runs
+    under it, so no other thread can see the switch half-way."""
+    global db, CUR_WS, CUR_ADMIN
+    db, CUR_WS, CUR_ADMIN = ws_db(name), name, admin
+
+
+def ws_url(url):
+    """A link the board sends out (ntfy) names its workspace, or an admin whose browser
+    sits in another workspace opens the wrong T-5."""
+    if CUR_WS == "default" and len(ws_names()) == 1:
+        return url
+    return url + ("&" if "?" in url else "?") + "ws=" + CUR_WS
+
+
+def workspace_create(b):
+    if not b.get("_admin"):
+        raise Err(403, "creating a workspace requires the admin (BOARD_HUMAN_TOKEN)",
+                  needs_human_token=True, action="creating a workspace")
+    name = (b.get("name") or "").strip()
+    if not WS_RE.match(name):
+        raise Err(400, "workspace name must match %s" % WS_RE.pattern)
+    if name in ws_names():
+        raise Err(409, "workspace %s exists" % name)
+    ws_open(name)
+    return {"workspace": name}
+
+
+def workspace_list(b):
+    if b.get("_admin"):
+        return {"workspaces": ws_names(), "current": CUR_WS}
+    return {"workspaces": [CUR_WS], "current": CUR_WS}
 
 
 class Err(Exception):
@@ -528,6 +609,9 @@ def ntfy(title, message, click=""):
     since last success in ntfy_failures_since_success."""
     if not NTFY_URL:
         return None
+    click = ws_url(click) if click else click
+    if CUR_WS != "default":
+        title = "[%s] %s" % (CUR_WS, title)
 
     def send():
         global ntfy_failures_since_success
@@ -686,20 +770,26 @@ def token_hash(tok):
 def token_issue(b):
     """T-858: a token bound to the identities `pattern` matches (glob over harness@host)."""
     human_only(b, "issuing an agent token")
-    pattern = (b.get("pattern") or "").strip()
-    if "@" not in pattern:
+    # kind=owner: the human's login for THIS workspace — the browser at a customer, or a
+    # demo that must not show the private projects. Issued into the current workspace.
+    kind = b.get("kind") or "agent"
+    if kind not in ("agent", "owner"):
+        raise Err(400, "kind must be agent or owner")
+    pattern = "*" if kind == "owner" else (b.get("pattern") or "").strip()
+    if kind == "agent" and "@" not in pattern:
         raise Err(400, "pattern must be harness@host (glob), e.g. codex@build-*")
     tok = "bat_" + secrets.token_urlsafe(32)
     tid = next_id("AT-", "agent_tokens")
-    db.execute("INSERT INTO agent_tokens (id,hash,pattern,note,created) VALUES (?,?,?,?,?)",
-               (tid, token_hash(tok), pattern, b.get("note"), now()))
-    return {"id": tid, "token": tok, "pattern": pattern, "note": b.get("note")}
+    db.execute("INSERT INTO agent_tokens (id,hash,pattern,note,created,kind) VALUES (?,?,?,?,?,?)",
+               (tid, token_hash(tok), pattern, b.get("note"), now(), kind))
+    return {"id": tid, "token": tok, "pattern": pattern, "kind": kind, "note": b.get("note"),
+            "workspace": CUR_WS}
 
 
 def token_list(b):
     human_only(b, "listing agent tokens")
     return {"tokens": [dict(r) for r in db.execute(
-        "SELECT id, pattern, note, created, revoked FROM agent_tokens ORDER BY created")]}
+        "SELECT id, pattern, kind, note, created, revoked FROM agent_tokens ORDER BY created")]}
 
 
 def token_revoke(tid, b):
@@ -2548,12 +2638,19 @@ def reap():
     return {"ok": True}
 
 
+def reap_all():
+    """Every workspace, one after the other — each is its own board with its own leases."""
+    for name in ws_names():
+        use_ws(name)
+        reap()
+
+
 def reaper_loop():
     while True:
         time.sleep(REAP_INTERVAL)
         try:
             with LOCK:
-                reap()
+                reap_all()
         except Exception as e:                       # the board must never die of the reaper
             print("reaper:", e, flush=True)
 
@@ -3076,12 +3173,24 @@ def whoami(human):
             "title='signed in as an agent: answers will be refused'>agent</span>")
 
 
+def ws_nav():
+    """Which workspace this page is, always, once there is more than one — a demo must
+    be able to see at a glance that it is not on the private board. The admin also gets
+    the others as links; a workspace login sees only its own name."""
+    names = ws_names()
+    if len(names) == 1:
+        return ""
+    others = "".join("<a class='%s' href='/status?ws=%s'>%s</a>" % (LINK, escape(n), escape(n))
+                     for n in names if n != CUR_WS) if CUR_ADMIN else ""
+    return "<span class='badge badge-sm badge-primary' title='workspace'>%s</span>%s" % (escape(CUR_WS), others)
+
+
 def head(title, right="", nav=(("/status", "board"),), human=False):
     return ("<header class='flex flex-wrap items-baseline gap-x-3 gap-y-1 "
             "border-b-2 border-base-300 pb-3'>"
             "<h1 class='text-xl font-semibold tracking-tight sm:text-2xl'>%s</h1>%s"
-            "<nav class='ml-auto flex items-center gap-4 text-sm'>%s%s%s</nav></header>" % (
-                escape(title), right,
+            "<nav class='ml-auto flex items-center gap-4 text-sm'>%s%s%s%s</nav></header>" % (
+                escape(title), right, ws_nav(),
                 "".join("<a class='%s' href='%s'>%s</a>" % (LINK, u, escape(t))
                         for u, t in nav),
                 theme_toggle(),
@@ -4722,6 +4831,8 @@ ROUTES = [
     ("GET",    r"/status$",                     lambda h, m, b, q: status(q.get("project", [None])[0])),
     ("GET",    r"/events$",                     lambda h, m, b, q: events(q)),
     ("POST",   r"/tokens$",                     lambda h, m, b, q: token_issue(b)),
+    ("POST",   r"/workspaces$",                 lambda h, m, b, q: workspace_create(b)),
+    ("GET",    r"/workspaces$",                 lambda h, m, b, q: workspace_list(b)),
     ("GET",    r"/tokens$",                     lambda h, m, b, q: token_list(b)),
     ("POST",   r"/tokens/([^/]+)/revoke$",      lambda h, m, b, q: token_revoke(m[0], b)),
 ]
@@ -5433,18 +5544,28 @@ class Handler(BaseHTTPRequestHandler):
         given = self.token_given(q)
         # The human token is a SUPERSET: it authenticates like every other token, and in
         # addition sets the flag that lets the call act as the human.
-        self.is_human = bool(HUMAN_TOKEN) and hmac.compare_digest(given, HUMAN_TOKEN)
+        self.is_human = self.is_admin = bool(HUMAN_TOKEN) and hmac.compare_digest(given, HUMAN_TOKEN)
         self.agent_pattern = None
+        self.ws = "default"                   # the workspace this token is bound to
         if self.is_human:
             return True
         # A per-agent token (T-858): looked up by hash, so the stored value is useless
-        # to whoever reads the database. Revoked = 401, same as a wrong token.
+        # to whoever reads the database. Revoked = 401, same as a wrong token. The
+        # workspace whose database holds the hash is the only one the token reaches.
         if given.startswith("bat_"):
+            row = None
             with LOCK:
-                row = db.execute("SELECT pattern, revoked FROM agent_tokens WHERE hash=?",
-                                 (token_hash(given),)).fetchone()
+                for name in ws_names():
+                    row = ws_db(name).execute("SELECT pattern, revoked, kind FROM agent_tokens "
+                                              "WHERE hash=?", (token_hash(given),)).fetchone()
+                    if row:
+                        self.ws = name
+                        break
             if row and not row["revoked"]:
-                self.agent_pattern = row["pattern"]
+                if row["kind"] == "owner":
+                    self.is_human = True
+                else:
+                    self.agent_pattern = row["pattern"]
                 return True
             time.sleep(0.5)          # outside LOCK: a wrong guess must not stall the board
             return False
@@ -5454,6 +5575,22 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             time.sleep(0.5)          # slows guessing; the board has no other users to starve
         return ok
+
+    def pick_ws(self, q, cookie=True):
+        """The workspace this request acts in. The admin names one (or gets default); any
+        other token is bound, and naming a different workspace is a 403 rather than a
+        quiet fallback to its own — the caller believes it is somewhere it is not."""
+        asked = (q.get("ws") or [None])[0] or self.headers.get("X-Board-Workspace")
+        if not asked and cookie and self.is_admin:
+            m = re.search(r"board_ws=([^;]+)", self.headers.get("Cookie", "") or "")
+            asked = m and urllib.parse.unquote(m.group(1))
+        if not self.is_admin:
+            if asked and asked != self.ws:
+                raise Err(403, "this token belongs to workspace %s, not %s" % (self.ws, asked))
+            return
+        with LOCK:
+            ws_db(asked or "default")          # 404 on an unknown name
+        self.ws = asked or "default"
 
     def send_response(self, code, message=None):
         """Every reply goes through here. A request whose body was never read (the 401 that
@@ -5558,7 +5695,10 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/healthz":            # kubelet probe: no token, no data
             return self.send(200, {"ok": True})
         if url.path == "/metrics" and method == "GET":
+            # ponytail: default workspace only — /metrics has no token, and a customer's
+            # project names do not belong on an open endpoint. Per-workspace scrape if needed.
             with LOCK:
+                use_ws("default")
                 text = prometheus_metrics()
             return self.send(200, text, "text/plain; version=0.0.4; charset=utf-8")
         if url.path == "/mcp":
@@ -5566,18 +5706,28 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authed(q):                # BEFORE the body is read — an
             return self.send(401, {"error": "invalid token"})   # unauthenticated client
         try:                                                    # must not make us allocate
+            self.pick_ws(q)
             body = self.body()
             if isinstance(body, dict):
                 body["_human"] = getattr(self, "is_human", False)
+                body["_admin"] = self.is_admin
         except Err as e:
             return self.send(e.code, e.body)
         except ValueError:
             return self.send(400, {"error": "invalid JSON"})
         # ?t=<token> in a link from ntfy: move it into an HttpOnly cookie and redirect to
         # a clean URL, so the token is not left in history or logs.
-        if q.get("t") and method == "GET" and not url.path.startswith(API):
-            clean = urllib.parse.urlencode({k: v[0] for k, v in q.items() if k != "t"})
-            return self.send(302, "", "text/html", extra=[
+        if (q.get("t") or (q.get("ws") and self.is_admin)) and method == "GET" \
+                and not url.path.startswith(API):
+            clean = urllib.parse.urlencode({k: v[0] for k, v in q.items() if k not in ("t", "ws")})
+            # The admin's choice of workspace sticks to the browser, so the board's own
+            # links (/t/T-5) stay in it.
+            wsc = [("Set-Cookie", "board_ws=%s; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=7776000"
+                    % urllib.parse.quote(self.ws, safe=""))] if self.is_admin and q.get("ws") else []
+            if not q.get("t"):
+                return self.send(302, "", "text/html", extra=[
+                    ("Location", url.path + ("?" + clean if clean else ""))] + wsc)
+            return self.send(302, "", "text/html", extra=wsc + [
                 ("Location", url.path + ("?" + clean if clean else "")),
                 # Lax, not Strict: a link opened from a QR scanner, ntfy or a messenger
                 # has no initiator page, so Strict holds the cookie back on the redirect
@@ -5611,6 +5761,7 @@ class Handler(BaseHTTPRequestHandler):
         agent believes it owns a task the board considers free."""
         with LOCK:
             try:
+                use_ws(self.ws, self.is_admin)
                 if self.agent_pattern:
                     token_identity_check(self.agent_pattern, method, path, body, q)
                 r = self.route(method, path, body, q, "")
@@ -5634,6 +5785,10 @@ class Handler(BaseHTTPRequestHandler):
         challenge = [("WWW-Authenticate", 'Bearer realm="board"')]
         if not self.headers.get("Authorization", "").startswith("Bearer ") or not self.authed({}):
             return self.send(401, {"error": "invalid token"}, extra=challenge)
+        try:
+            self.pick_ws({}, cookie=False)
+        except Err as e:
+            return self.send(e.code, e.body)
         # An MCP client is an external model: the owner's token must never end up in one.
         if self.is_human:
             return self.send(403, rpc_err(None, -32600, "the human token is not accepted on /mcp — "
@@ -5715,6 +5870,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             body, q = args, {}
         body["_human"] = self.is_human
+        body["_admin"] = False                 # the admin is refused on /mcp above
         try:
             return 200, rpc_ok(mid, tool_result(self.dispatch(verb, API + path, body, q)))
         except Err as e:
