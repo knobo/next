@@ -1455,6 +1455,10 @@ grep -qi "text/plain" <<<"$M_CT" && ok "GET /metrics has text/plain content-type
 M_BODY=$(curl -s "$BOARD_URL/metrics")
 grep -q "^board_up 1" <<<"$M_BODY" && ok "/metrics contains board_up 1" || no "/metrics contains board_up 1" "$M_BODY"
 grep -q "board_tasks_total" <<<"$M_BODY" && ok "/metrics contains board_tasks_total" || no "/metrics contains board_tasks_total" "$M_BODY"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 1.2.3.4' "$BOARD_URL/metrics")" = 401 ] \
+  && ok "/metrics through the ingress (X-Forwarded-For) needs a token" || no "/metrics open via ingress" ""
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 1.2.3.4' "$BOARD_URL/healthz")" = 401 ] \
+  && ok "/healthz through the ingress needs a token" || no "/healthz open via ingress" ""
 
 # Ordering by last activity: a project whose last event was "task went done" must still sort
 # above an older project that merely has an open task lying around.
@@ -3037,6 +3041,24 @@ check "the CLI with BOARD_WORKSPACE reaches the workspace" \
 WD="$TMP/wsproj"; mkdir -p "$WD"; printf 'project: kproj\nphase: build\nworkspace: kunde\n' > "$WD/project.yaml"
 WT=$(cd "$WD" && env -u BOARD_HUMAN_TOKEN BOARD_TOKEN="$TOKEN" PASSWORD_STORE_DIR="$TMP/nopass" board workspace list 2>&1)
 check "a workspace: in project.yaml does NOT borrow the inherited BOARD_TOKEN (no pass entry → 401)" "$WT" '.error=="invalid token"'
+# /ws: the admin's page for workspaces, from a phone. Forms, so plain urlencoded posts.
+wsp() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" "${@:3}" "$BOARD_URL$2"; }
+[ "$(wsp "$WOT" /ws)" = 403 ] && ok "/ws is refused to a workspace login" || no "owner on /ws" ""
+[ "$(wsp "$TOKEN" /ws)" = 403 ] && ok "/ws is refused to the shared agent token" || no "agent on /ws" ""
+WSP=$(curl -s -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/ws")
+grep -q "href='/status?ws=kunde'" <<<"$WSP" && grep -q "kproj" <<<"$WSP" \
+  && ok "/ws lists every workspace with its projects" || no "/ws list" ""
+[ "$(wsp "$HUMAN_TOKEN" /ws -d name=web-ws)" = 302 ] && [ -f "$TMP/ws-web-ws.db" ] \
+  && ok "/ws creates a workspace from the form" || no "/ws create" "$(ls "$TMP")"
+WL=$(curl -s -X POST -H "Authorization: Bearer $HUMAN_TOKEN" "$BOARD_URL/ws/web-ws/owner")
+WLT=$(grep -o 'status?t=bat_[A-Za-z0-9_-]*' <<<"$WL" | head -1 | sed 's/.*t=//')
+[ -n "$WLT" ] && [ "$(wbody "$(ws "$WLT" "" GET /workspaces)" | jq -c .workspaces)" = '["web-ws"]' ] \
+  && ok "/ws issues a login link that reaches that workspace only" || no "/ws owner link" "$WL"
+WLID=$(wbody "$(ws "$HUMAN_TOKEN" web-ws GET /tokens)" | jq -r '.tokens[0].id')
+[ "$(wsp "$HUMAN_TOKEN" /ws/web-ws/revoke -d "id=$WLID")" = 302 ] && [ "$(wcode "$(ws "$WLT" "" GET /workspaces)")" = 401 ] \
+  && ok "/ws revokes it again" || no "/ws revoke" "$WLID"
+grep -q "href='/ws'" <<<"$AP" && ! grep -q "href='/ws'" <<<"$WP" \
+  && ok "the admin's pages link to /ws, a workspace login's do not" || no "/ws nav" ""
 fi
 
 if [ "$OWN_SERVER" = 1 ]; then

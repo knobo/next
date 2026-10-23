@@ -279,6 +279,18 @@ def workspace_create(b):
     return {"workspace": name}
 
 
+def in_ws(name, fn):
+    """Run fn() against another workspace and come back: the admin page acts on every
+    workspace from one request."""
+    global db, CUR_WS
+    prev = db, CUR_WS
+    try:
+        db, CUR_WS = ws_db(name), name
+        return fn()
+    finally:
+        db, CUR_WS = prev
+
+
 def workspace_list(b):
     if b.get("_admin"):
         return {"workspaces": ws_names(), "current": CUR_WS}
@@ -3213,11 +3225,12 @@ def ws_nav():
     be able to see at a glance that it is not on the private board. The admin also gets
     the others as links; a workspace login sees only its own name."""
     names = ws_names()
+    admin = "<a class='%s' href='/ws'>workspaces</a>" % LINK if CUR_ADMIN else ""
     if len(names) == 1:
-        return ""
+        return admin
     others = "".join("<a class='%s' href='/status?ws=%s'>%s</a>" % (LINK, escape(n), escape(n))
                      for n in names if n != CUR_WS) if CUR_ADMIN else ""
-    return "<span class='badge badge-sm badge-primary' title='workspace'>%s</span>%s" % (escape(CUR_WS), others)
+    return "<span class='badge badge-sm badge-primary' title='workspace'>%s</span>%s%s" % (escape(CUR_WS), others, admin)
 
 
 def head(title, right="", nav=(("/status", "board"),), human=False):
@@ -3230,6 +3243,52 @@ def head(title, right="", nav=(("/status", "board"),), human=False):
                         for u, t in nav),
                 theme_toggle(),
                 whoami(human)))
+
+
+def html_workspaces(issued=None):
+    """The admin's page for workspaces: what exists, a new one, and the logins in each.
+    A token issued here is shown once, on the page that issued it, and never again."""
+    shown = ""
+    if issued:
+        url = "%s/status?t=%s" % (BASE_URL, issued["token"])
+        what = ("Login for <b>%s</b>. Open it on the device that should see this workspace, "
+                "and nothing else." % escape(issued["workspace"]) if issued["kind"] == "owner" else
+                "Agent token for <b>%s</b>, bound to <code>%s</code>. Put it in "
+                "<code>pass board/ws/%s/token</code>." % (
+                    escape(issued["workspace"]), escape(issued["pattern"]), escape(issued["workspace"])))
+        shown = ("<div class='mt-5 rounded-box border border-base-300 border-l-4 border-l-warning "
+                 "bg-base-200 p-4'><p>%s Shown once.</p>"
+                 "<p class='mt-2 break-all font-mono text-sm'>%s</p>%s</div>" % (
+                     what, escape(url if issued["kind"] == "owner" else issued["token"]),
+                     "<p class='mt-2'><a class='btn btn-outline' href='%s'>Open the login here</a></p>"
+                     % escape(url) if issued["kind"] == "owner" else ""))
+    rows = []
+    for n in ws_names():
+        projects = in_ws(n, lambda: [r[0] for r in db.execute("SELECT name FROM projects ORDER BY name")])
+        toks = in_ws(n, lambda: db.execute("SELECT id, pattern, kind, note, created FROM agent_tokens "
+                                           "WHERE revoked IS NULL ORDER BY created").fetchall())
+        tok_html = "".join(
+            "<li class='flex flex-wrap items-center gap-2'><span class='font-mono'>%s</span> %s "
+            "<span class='%s'>%s</span><form method=post action='/ws/%s/revoke'>"
+            "<input type=hidden name=id value='%s'><button class='btn btn-xs btn-ghost'>revoke</button>"
+            "</form></li>" % (escape(t["id"]), escape(t["kind"] or "agent") + " " + escape(t["pattern"]),
+                              DIM, escape(t["note"] or ""), escape(n), escape(t["id"])) for t in toks)
+        rows.append(
+            "<section class='mt-6 border-t border-base-300 pt-4'>"
+            "<h2 class='text-lg font-semibold'><a class='%s' href='/status?ws=%s'>%s</a></h2>"
+            "<p class='%s text-sm'>%s</p><ul class='mt-2 space-y-1 text-sm'>%s</ul>"
+            "<div class='mt-3 flex flex-wrap gap-2'>"
+            "<form method=post action='/ws/%s/owner'><button class='btn btn-sm'>new login</button></form>"
+            "<form method=post action='/ws/%s/agent' class='flex gap-2'>"
+            "<input name=pattern required placeholder='claude-code@host-*' "
+            "class='input input-sm input-bordered w-48'><button class='btn btn-sm'>new agent token</button>"
+            "</form></div></section>" % (
+                LINK, escape(n), escape(n), DIM,
+                escape(", ".join(projects)) or "no projects", tok_html, escape(n), escape(n)))
+    form = ("<form method=post action='/ws' class='mt-5 flex gap-2'>"
+            "<input name=name required pattern='[a-z0-9][a-z0-9-]{0,31}' placeholder='kunde' "
+            "class='input input-bordered'><button class='btn btn-primary'>create workspace</button></form>")
+    return page("workspaces", head("workspaces", human=True) + shown + form + "".join(rows))
 
 
 def answer_saved_page(qid, human):
@@ -5727,9 +5786,13 @@ class Handler(BaseHTTPRequestHandler):
         self.body_read = False                # per request: keep-alive reuses this handler
         url = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(url.query)
-        if url.path == "/healthz":            # kubelet probe: no token, no data
+        # Open only to callers inside the cluster (kubelet, Prometheus scrape the pod IP).
+        # Through the ingress Traefik always sets X-Forwarded-For, and there these need a
+        # token like everything else: /metrics names every project.
+        inside = "X-Forwarded-For" not in self.headers
+        if url.path == "/healthz" and inside:  # kubelet probe: no token, no data
             return self.send(200, {"ok": True})
-        if url.path == "/metrics" and method == "GET":
+        if url.path == "/metrics" and method == "GET" and inside:
             # ponytail: default workspace only — /metrics has no token, and a customer's
             # project names do not belong on an open endpoint. Per-workspace scrape if needed.
             with LOCK:
@@ -5974,6 +6037,22 @@ class Handler(BaseHTTPRequestHandler):
                                  "text/html")
             question_answer(m.group(1), ans, HUMAN, body.get("note", ""), body)
             return answer_saved_page(m.group(1), human)
+        m = re.match(r"^/ws(?:/([^/]+)/(owner|agent|revoke))?$", path)
+        if m and not self.headers.get("accept") == "application/json":
+            if not self.is_admin:
+                return self.send(403, not_human_page("managing workspaces"), "text/html")
+            if method == "GET" and not m.group(1):
+                return html_workspaces()
+            if method == "POST" and not m.group(1):
+                workspace_create(body)
+                return self.send(302, "", "text/html", extra=[("Location", "/ws")])
+            if method == "POST":
+                n, act = m.group(1), m.group(2)
+                if act == "revoke":
+                    in_ws(n, lambda: token_revoke(body.get("id", ""), body))
+                    return self.send(302, "", "text/html", extra=[("Location", "/ws")])
+                b = dict(body, kind=act, note=body.get("note") or "issued on /ws")
+                return html_workspaces(in_ws(n, lambda: token_issue(b)))
         for mth, pat, fn in ROUTES:
             mm = pat.match(path)
             if mm and mth == method:
