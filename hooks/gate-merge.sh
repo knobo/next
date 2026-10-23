@@ -15,13 +15,17 @@ esac
 
 # The same session keying as bin/board, otherwise the hook reads another session's task.
 SESS="${BOARD_SESSION:-${CLAUDE_CODE_SESSION_ID:-}}"
-CACHE="${BOARD_CACHE:-$HOME/.cache/board}"
+# Keyed on the board URL, exactly as bin/board's $CACHE. This read the cache ROOT, where the
+# CLI stopped writing when the cache was keyed on the board: no task was ever found, and the
+# gate let every merge through (it fails open on "no task").
+ROOT="${BOARD_CACHE:-$HOME/.cache/board}"
+CACHE="$ROOT/$(printf '%s' "${BOARD_URL:-http://localhost:8080}" | sed 's|^[^:]*://||' | tr -c 'A-Za-z0-9._-' '_')"
 T=$(cat "$CACHE/current-task${SESS:+-$SESS}" 2>/dev/null)
 [ -n "$T" ] || exit 0                       # no claimed task: none of our business
 
 # If the task is finished, the file is stale. Without this an old task id blocks work in
 # an entirely different repo, forever.
-ST=$(board task show "$T" 2>/dev/null | jq -r '.status // empty' 2>/dev/null)
+ST=$(board task show "$T" --json 2>/dev/null | jq -r '.status // empty' 2>/dev/null)
 case "$ST" in claimed|in_review|merging) ;; *) exit 0 ;; esac
 
 OUT=$(board gate merge "$T" 2>/dev/null) || {

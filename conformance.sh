@@ -1509,6 +1509,19 @@ repos: [web, missing]
 YML
 export BOARD_URL BOARD_TOKEN="$TOKEN" BOARD_CACHE="$TMP/cli-cache" BOARD_SESSION="conf-$$" BOARD_HARNESS=claude-code
 export PATH="$PWD/bin:$PATH"
+# hooks/gate-merge.sh finds the session's task where the CLI writes it — the cache keyed on
+# the board URL. It read the cache root, found nothing, and failed open on every merge.
+HGA=$(api POST /agents '{"project":"demo","harness":"claude-code","host":"hookh","session":"hook-s"}' | jq -r .id)
+GH=$(api POST /tasks "{\"agent\":\"$HGA\",\"project\":\"demo\",\"repo\":\"web\",\"title\":\"hook gate\"}" | jq -r .id)
+api POST "/tasks/$GH/claim" "{\"agent\":\"$HGA\"}" >/dev/null
+GHC="$TMP/hook-cache/$(printf '%s' "${BOARD_URL#*://}" | tr -c 'A-Za-z0-9._-' '_')"; mkdir -p "$GHC"
+echo "$GH" > "$GHC/current-task-hooksess"
+GHO=$(BOARD_CACHE="$TMP/hook-cache" BOARD_SESSION=hooksess BOARD_AGENT_ID="$HGA" \
+      hooks/gate-merge.sh <<<'{"tool_input":{"command":"gh pr merge 7 --squash"}}')
+check "the merge hook finds the task in the keyed cache and denies an unreviewed merge" "$GHO" \
+  '.hookSpecificOutput.permissionDecision=="deny"'
+api POST "/tasks/$GH/done" "{\"agent\":\"$HGA\",\"no_merge\":true}" >/dev/null
+api POST "/agents/$HGA/finished" '{}' >/dev/null
 cli() { (cd "$CLIDIR" && board "$@" 2>/dev/null); }
 
 R=$(cli register --cap merge,browser-test --model claude-sonnet-5)
