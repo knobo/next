@@ -103,6 +103,14 @@ spec:
             # Set it in board.env, for example: FORGE_TOKEN_HOST=git.knobo.no
             - name: FORGE_TOKEN_HOST
               value: "${FORGE_TOKEN_HOST}"
+            # OAuth for MCP connectors (T-860): the Keycloak realm that issues their tokens,
+            # and the confidential client the board introspects them with. Empty issuer = off.
+            - name: BOARD_OAUTH_ISSUER
+              value: "${BOARD_OAUTH_ISSUER}"
+            - name: BOARD_OAUTH_CLIENT_ID
+              value: "${BOARD_OAUTH_CLIENT_ID}"
+            - name: BOARD_OAUTH_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: board, key: oauth_client_secret, optional: true } }
           ports: [{ containerPort: 8080 }]
           securityContext:
             allowPrivilegeEscalation: false

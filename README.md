@@ -264,6 +264,15 @@ that can act as every agent, or as the owner, must never end up in one. The
 tools are the agent loop and nothing else — `register`, `task_next`, `task_claim`,
 `task_progress`, `task_show`, `status`, `ask` — and each is the same call as its REST
 counterpart, under the same identity check. Call `register` first and pass its id as `agent`.
+
+A connector that logs in with OAuth (claude.ai, ChatGPT) needs no token pasted in: with
+`BOARD_OAUTH_ISSUER` set, `/mcp` answers 401 with `resource_metadata` pointing at
+`/.well-known/oauth-protected-resource/mcp`, the connector logs in at that Keycloak realm, and
+the board checks the access token by introspection (cached `BOARD_OAUTH_CACHE`, 60 s). The token
+must have the board's `/mcp` URL as audience (an Audience mapper — Keycloak 26.7 has no RFC 8707).
+Its client id becomes the agent identity `*@<client id>`, never the owner, even when the owner
+logged in; it lands in workspace `BOARD_OAUTH_WS` (default). Revoking the session in Keycloak
+is a 401 once the cache entry runs out.
 See `skill/reference/protocol.md`.
 
 ## Phase: how strict the gate is

@@ -5534,6 +5534,65 @@ def prometheus_metrics():
 # 2025-11-25; a client asking for an older version is answered with ours and decides.
 MCP_VERSIONS = ("2025-11-25", "2025-06-18")
 MCP_ORIGIN = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(BASE_URL))
+# OAuth for connectors (T-860): an external authorization server (Keycloak realm `board`)
+# issues the tokens, the board checks them by introspection. Unset issuer = off, and /mcp
+# takes per-agent tokens only. Keycloak 26.7 has no RFC 8707, so the audience comes from an
+# Audience mapper in the realm and must equal OAUTH_RESOURCE.
+OAUTH_ISSUER = os.environ.get("BOARD_OAUTH_ISSUER", "").rstrip("/")
+OAUTH_INTROSPECT = os.environ.get("BOARD_OAUTH_INTROSPECT",
+                                  OAUTH_ISSUER + "/protocol/openid-connect/token/introspect")
+OAUTH_CLIENT = os.environ.get("BOARD_OAUTH_CLIENT_ID", "")
+OAUTH_SECRET = os.environ.get("BOARD_OAUTH_CLIENT_SECRET", "")
+OAUTH_RESOURCE = BASE_URL.rstrip("/") + "/mcp"
+OAUTH_METADATA = BASE_URL.rstrip("/") + "/.well-known/oauth-protected-resource/mcp"
+OAUTH_WS = os.environ.get("BOARD_OAUTH_WS", "default")
+OAUTH_CACHE_S = float(os.environ.get("BOARD_OAUTH_CACHE", "60"))
+OAUTH_CACHE = {}                       # sha256(token) → (valid until, client id)
+OAUTH_LOCK = threading.Lock()
+
+
+def oauth_introspect(tok):
+    """The OAuth client id a live access token for this board belongs to, or None. A revoke in
+    Keycloak shows here once the cache entry (≤ OAUTH_CACHE_S) runs out. Raises OSError or
+    ValueError when the authorization server cannot be reached or answers garbage."""
+    key, t = token_hash(tok), time.time()
+    with OAUTH_LOCK:
+        hit = OAUTH_CACHE.get(key)
+        if hit and hit[0] > t:
+            return hit[1]
+    req = urllib.request.Request(OAUTH_INTROSPECT, urllib.parse.urlencode({"token": tok}).encode(), {
+        "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json",
+        "Authorization": "Basic " + base64.b64encode(
+            ("%s:%s" % (OAUTH_CLIENT, OAUTH_SECRET)).encode()).decode()})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        r = json.loads(resp.read())
+    if not isinstance(r, dict):
+        raise ValueError("introspection answered %r" % type(r))
+    aud = r.get("aud")
+    aud = aud if isinstance(aud, list) else [aud]
+    cid = r.get("client_id") or r.get("azp")
+    # typ: a refresh token introspects as active too, and must not open /mcp. The client id
+    # becomes a glob pattern, so only plain id characters.
+    if r.get("active") is not True or OAUTH_RESOURCE not in aud or r.get("typ", "Bearer") != "Bearer" \
+            or r.get("iss", OAUTH_ISSUER) != OAUTH_ISSUER \
+            or not (isinstance(cid, str) and re.fullmatch(r"[A-Za-z0-9._-]+", cid)):
+        return None
+    exp = r.get("exp")
+    with OAUTH_LOCK:
+        if len(OAUTH_CACHE) > 1000:
+            for k in [k for k, v in OAUTH_CACHE.items() if v[0] <= t]:
+                del OAUTH_CACHE[k]
+        OAUTH_CACHE[key] = (min(t + OAUTH_CACHE_S, exp if isinstance(exp, (int, float)) else t + OAUTH_CACHE_S), cid)
+    return cid
+
+
+def oauth_resource_metadata():
+    """RFC 9728: where a connector learns which authorization server to log in at."""
+    return {"resource": OAUTH_RESOURCE, "authorization_servers": [OAUTH_ISSUER],
+            "bearer_methods_supported": ["header"], "scopes_supported": ["offline_access"],
+            "resource_name": "board"}
+
+
 MCP_INSTRUCTIONS = ("The board: a work queue shared by coding agents. Call `register` once "
                     "(project, harness, host) and pass the returned id as `agent` to every "
                     "other tool. Then task_next → task_claim → task_progress, and `ask` when "
@@ -5801,6 +5860,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, text, "text/plain; version=0.0.4; charset=utf-8")
         if url.path == "/mcp":
             return self.handle_mcp(method)
+        # RFC 9728: the path form for the resource /mcp, and the bare one some clients try.
+        if OAUTH_ISSUER and method == "GET" and url.path in (
+                "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"):
+            return self.send(200, oauth_resource_metadata())
         if not self.authed(q):                # BEFORE the body is read — an
             return self.send(401, {"error": "invalid token"})   # unauthenticated client
         try:                                                    # must not make us allocate
@@ -5880,8 +5943,28 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(403, rpc_err(None, -32600, "origin %s not allowed" % origin))
         # The header and nothing else: no ?t= and no cookie, so a page in the owner's
         # browser cannot ride the board_token cookie into a tool call.
-        challenge = [("WWW-Authenticate", 'Bearer realm="board"')]
-        if not self.headers.get("Authorization", "").startswith("Bearer ") or not self.authed({}):
+        challenge = [("WWW-Authenticate", 'Bearer realm="board"' + (
+            ', resource_metadata="%s"' % OAUTH_METADATA if OAUTH_ISSUER else ""))]
+        auth = self.headers.get("Authorization", "")
+        given = auth[7:] if auth.startswith("Bearer ") else ""
+        self.oauth_client = None
+        # Not one of the board's own tokens → an OAuth access token from the connector (T-860).
+        if OAUTH_ISSUER and given and not given.startswith("bat_") \
+                and not any(t and hmac.compare_digest(given, t) for t in (TOKEN, HUMAN_TOKEN)):
+            try:
+                self.oauth_client = oauth_introspect(given)
+            except (OSError, ValueError) as e:
+                self.log_message("oauth introspection failed: %r", e)
+                return self.send(503, rpc_err(None, -32603, "the authorization server is unreachable"))
+            if not self.oauth_client:
+                time.sleep(0.5)
+                return self.send(401, {"error": "invalid token"}, extra=challenge)
+            # An agent bound to the connector's client id, in one workspace. Never the human,
+            # even when the owner is the one who logged in to the connector.
+            self.is_human = self.is_admin = False
+            self.agent_pattern = "*@" + self.oauth_client
+            self.ws = OAUTH_WS
+        elif not given or not self.authed({}):
             return self.send(401, {"error": "invalid token"}, extra=challenge)
         try:
             self.pick_ws({}, cookie=False)
@@ -5940,7 +6023,9 @@ class Handler(BaseHTTPRequestHandler):
                 "protocolVersion": asked if asked in MCP_VERSIONS else MCP_VERSIONS[0],
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "board", "version": "0"},
-                "instructions": MCP_INSTRUCTIONS})
+                "instructions": MCP_INSTRUCTIONS + (
+                    " This connector's login is bound to host %s: register with that host."
+                    % self.oauth_client if getattr(self, "oauth_client", None) else "")})
         if method == "ping":
             return 200, rpc_ok(mid, {})
         if method == "tools/list":

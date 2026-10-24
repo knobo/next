@@ -3349,6 +3349,79 @@ check "Content-Length '+41', ' 41 ', '4_0' and a non-ASCII digit are a 400" "$HH
   '.plus==400 and .space==400 and .under==400 and .arabic==400'
 check "two Content-Length headers are a 400 and the connection is closed" "$HH" '.dup.status==400 and .dup.closed'
 check "a stalled client is hung up on by the socket timeout" "$HH" '.stall.closed and .stall.secs<6'
+
+echo "== OAuth for connectors on /mcp (T-860) =="
+# A mocked Keycloak introspection endpoint: $TMP/kc.json maps token → introspection answer,
+# and the resource-server client must authenticate with Basic rs:rs-secret.
+free() { python3 -c "import socket;s=socket.socket();s.bind((\"\",0));print(s.getsockname()[1]);s.close()"; }
+KP=$(free); P3=$(free); U3="http://localhost:$P3"; ISS="http://127.0.0.1:$KP/realms/board"
+good() { echo "{\"active\":$2,\"aud\":[\"$U3/mcp\",\"account\"],\"client_id\":\"$1\",\"typ\":\"Bearer\",\"iss\":\"$ISS\",\"sub\":\"owner\"}"; }
+cat > "$TMP/kc.json" <<JSON
+{"tok-good": $(good conn-a true), "tok-revoke": $(good conn-b true),
+ "tok-aud": {"active":true,"aud":"https://elsewhere/mcp","client_id":"conn-a","typ":"Bearer"},
+ "tok-refresh": {"active":true,"aud":"$U3/mcp","client_id":"conn-a","typ":"Refresh"},
+ "tok-iss": {"active":true,"aud":"$U3/mcp","client_id":"conn-a","typ":"Bearer","iss":"https://evil/realms/board"},
+ "tok-glob": {"active":true,"aud":"$U3/mcp","client_id":"*","typ":"Bearer"}}
+JSON
+KC_DB="$TMP/kc.json" python3 - "$KP" > "$TMP/kc-log" 2>&1 <<'PY' &
+import base64, json, os, sys, urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode())
+        ok = self.headers.get("Authorization") == "Basic " + base64.b64encode(b"rs:rs-secret").decode()
+        r = json.load(open(os.environ["KC_DB"])).get(body.get("token", [""])[0], {"active": False})
+        self.send_response(200 if ok else 401); self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(json.dumps(r if ok else {"error": "invalid_client"}).encode())
+    def log_message(self, *a): pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+KCPID=$!
+mkdir -p "$TMP/b3"   # own dir: WS_DIR is the db's dir, and the main board holds ws-*.db in $TMP
+BOARD_DB="$TMP/b3/board.db" BOARD_TOKEN="$TOKEN" BOARD_HUMAN_TOKEN="$HUMAN_TOKEN" BOARD_POLICY="$TMP/policy.json" \
+  BOARD_PORT="$P3" BOARD_BASE_URL="$U3" BOARD_OAUTH_ISSUER="$ISS" BOARD_OAUTH_CLIENT_ID=rs \
+  BOARD_OAUTH_CLIENT_SECRET=rs-secret BOARD_OAUTH_CACHE=1 python3 board.py > "$TMP/log3" 2>&1 &
+P3PID=$!
+for _ in $(seq 50); do curl -sf "$U3/healthz" >/dev/null && break; sleep .1; done
+m3() { curl -sS -m 5 -w '\n%{http_code}' -X POST ${1:+-H "Authorization: Bearer $1"} \
+  -H 'Content-Type: application/json' -d "$2" "$U3/mcp"; }
+c3() { m3 "$1" "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":$3}}"; }
+check "/.well-known/oauth-protected-resource/mcp names the resource and the Keycloak realm" \
+  "$(curl -sS -m 5 "$U3/.well-known/oauth-protected-resource/mcp")" \
+  ".resource==\"$U3/mcp\" and .authorization_servers==[\"$ISS\"] and (.bearer_methods_supported|index(\"header\"))"
+R=$(curl -sS -m 5 -i -X POST -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$U3/mcp")
+grep -q '^HTTP/1.1 401' <<<"$R" && grep -qi "^WWW-Authenticate: Bearer .*resource_metadata=\"$U3/.well-known/oauth-protected-resource/mcp\"" <<<"$R" \
+  && ok "/mcp 401 points at the protected-resource metadata" || no "oauth 401 challenge" "$R"
+[ "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$BOARD_URL/.well-known/oauth-protected-resource")" = 401 ] \
+  && ok "without BOARD_OAUTH_ISSUER there is no metadata (OAuth is off)" || no "oauth off" ""
+R=$(c3 tok-good status '{}')
+[ "$(code "$R")" = 200 ] && jq -e '.result.isError==false' >/dev/null <<<"$(body "$R")" \
+  && ok "an active Keycloak token calls status" || no "oauth status" "$R"
+check "initialize tells the connector which host its login is bound to" \
+  "$(body "$(m3 tok-good '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')")" '.result.instructions|test("host conn-a")'
+R=$(c3 tok-good register '{"project":"demo","harness":"claude-ai","host":"conn-a"}')
+check "the connector registers as an agent on host = its client id" "$(body "$R")" '.result.isError==false and (.result.structuredContent.id|type=="string")'
+check "and cannot register as any other host" \
+  "$(body "$(c3 tok-good register '{"project":"demo","harness":"claude-code","host":"laptop"}')")" \
+  '.result.isError and .result.structuredContent.status==403'
+for t in tok-aud tok-refresh tok-iss tok-glob tok-unknown; do
+  [ "$(code "$(m3 $t '{"jsonrpc":"2.0","id":1,"method":"ping"}')")" = 401 ] || { no "oauth $t is not a 401" ""; continue; }
+  ok "$t (wrong audience / refresh token / foreign issuer / glob client id / inactive) is a 401"
+done
+[ "$(code "$(m3 tok-revoke '{"jsonrpc":"2.0","id":1,"method":"ping"}')")" = 200 ] || no "oauth tok-revoke before revoke" ""
+python3 - "$TMP/kc.json" <<'PY'
+import json, sys; d = json.load(open(sys.argv[1])); d["tok-revoke"]["active"] = False; json.dump(d, open(sys.argv[1], "w"))
+PY
+A=$(code "$(m3 tok-revoke '{"jsonrpc":"2.0","id":1,"method":"ping"}')"); sleep 1.2
+B=$(code "$(m3 tok-revoke '{"jsonrpc":"2.0","id":1,"method":"ping"}')")
+[ "$A" = 200 ] && [ "$B" = 401 ] && ok "a revoke in Keycloak is a 401 once the cache entry runs out (cached $A, then $B)" \
+  || no "oauth revoke" "cached=$A after=$B"
+kill $KCPID 2>/dev/null; wait $KCPID 2>/dev/null
+[ "$(code "$(m3 tok-new '{"jsonrpc":"2.0","id":1,"method":"ping"}')")" = 503 ] \
+  && ok "Keycloak down is a 503, not a 401 that would make the connector log in again" || no "oauth kc down" ""
+[ "$(code "$(m3 bat_nope '{"jsonrpc":"2.0","id":1,"method":"ping"}')")" = 401 ] \
+  && ok "a bat_ token is still checked by the board, not sent to Keycloak" || no "oauth bat_" ""
+kill $P3PID 2>/dev/null
 fi
 
 printf 'PASS %d  FAIL %d\n' "$PASS" "$FAIL"
