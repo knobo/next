@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directories: ["/slides", "/ui"]
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /slides
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
+        update-types: [minor, patch]
